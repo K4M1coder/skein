@@ -37,6 +37,14 @@ Dependencies are version-bounded, reviewed before upgrades, and never loaded dir
 - Large framework migrations are split into reviewable stages; no untested big-bang rewrite.
 - Every dependency addition records its purpose and upgrade/removal path in this file or an architecture decision record.
 
+## Code and localization policy
+
+- Source code, identifiers, comments, commit messages, technical documentation, logs, and API error codes are written in English.
+- The user interface supports English and French through the localization layer; new user-visible text must not be hard-coded in feature logic.
+- Automatic language selection remains the default and falls back to English when the browser language is unsupported.
+- English is the canonical translation key set. French coverage must be tested whenever user-visible text changes.
+- A change is not complete if one supported language exposes untranslated keys or prevents the same workflow from being completed.
+
 ## Definition of done
 
 A feature is complete only when its implementation, authorization checks, error reporting, automated tests, and operator documentation agree. For workflow execution, a mocked response is not an end-to-end success: the selected model or runtime must execute and produce an inspectable result or an explicit actionable error.
