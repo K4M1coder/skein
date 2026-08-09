@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import URLError
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
@@ -1583,10 +1583,11 @@ class Handler(SimpleHTTPRequestHandler):
             return self.json(workflow_template_payload(row,user["id"],"workflow_templates.manage_all" in user["permissions"]))
         if self.path=="/api/stack/status":
             result,status=supervisor_call("status"); return self.json(result,status)
-        if self.path=="/api/workflows":
+        if urlparse(self.path).path=="/api/workflows":
             if not any(p in user["permissions"] for p in ("workflows.read_own","workflows.read_all")): return self.deny(403,"Workflow read permission required")
+            query=parse_qs(urlparse(self.path).query); requested_limit=int((query.get("limit") or [30])[0]); limit=max(1,min(requested_limit,1000))
             with db() as conn:
-                rows=conn.execute("SELECT * FROM workflows ORDER BY created_at DESC LIMIT 30").fetchall() if "workflows.read_all" in user["permissions"] else conn.execute("SELECT * FROM workflows WHERE owner_id=? ORDER BY created_at DESC LIMIT 30",(user["id"],)).fetchall()
+                rows=conn.execute("SELECT * FROM workflows ORDER BY created_at DESC LIMIT ?",(limit,)).fetchall() if "workflows.read_all" in user["permissions"] else conn.execute("SELECT * FROM workflows WHERE owner_id=? ORDER BY created_at DESC LIMIT ?",(user["id"],limit)).fetchall()
             return self.json([dict(r) for r in rows])
         if self.path.startswith("/api/artifacts/"):
             if self.path.endswith("/preview"):

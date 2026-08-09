@@ -166,6 +166,14 @@ python scripts/manual_workflow_matrix.py --run --base-url http://127.0.0.1:8787
 
 Each workflow must finish before the next begins. Results are written as timestamped JSON and Markdown files under `manual-test-results` by default. Use `--timeout`, `--output-dir`, or `--stop-on-failure` when needed. The JSON retains each objective, task status, metrics, final deliverable, and separate execution report. Do not commit result files, as they may contain user-visible generated content.
 
+The output directory is resolved from the Skein project root and created before the first run. `results.partial.json` is replaced atomically after every case, so a later workflow or collection failure does not discard earlier results. Failures continue to the next case by default. Every case receives a `runs/<case>/` directory containing `workflow.json`, `executions.json`, `skein-report.md`, and `deliverables.zip` when artifacts exist. The final `analysis.md` and `results.json` aggregate completion, failures, tokens, throughput, duration, energy, reports, artifacts, logs, and collection anomalies.
+
+If execution completed but a previous script version failed during final export, recover the newest matching runs from Skein history without executing them again:
+
+```powershell
+python scripts/manual_workflow_matrix.py --recover-existing
+```
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
