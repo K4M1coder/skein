@@ -20,6 +20,7 @@ Skein favors mature, actively maintained libraries over custom security, protoco
 - English/French interface with `Automatic`, `English`, and `Français` selection. Automatic follows a French browser locale and falls back to English.
 - Role-aware tab navigation that separates workflow execution, run history, and system administration.
 - Permission-aware history cleanup for the current user or, when authorized, every user.
+- Parallel workflow scheduling with a visible FIFO queue and per-user, per-session workspaces.
 
 ## Navigation
 
@@ -113,6 +114,18 @@ Inference token counts come from the model server response. Tokens/s uses genera
 ## Data
 
 The default SQLite database and artifacts live under `%LOCALAPPDATA%\Skein`. Override the database path with `SKEIN_DB_PATH`. Generated models, databases, workflow artifacts, logs, and local secrets are excluded from version control.
+
+Workflow deliverables are isolated under `users/<user-id>/sessions/<session-id>/workflows/<workflow-id>/artifacts`. Opaque identifiers keep paths stable when usernames change and prevent collisions between concurrent sessions. Existing workflows without session metadata remain readable through the `legacy` session namespace.
+
+Skein runs up to two workflows concurrently by default and keeps additional submissions in a FIFO queue. Configure workflow and task concurrency independently before startup:
+
+```powershell
+$env:SKEIN_MAX_PARALLEL_WORKFLOWS = "2"
+$env:SKEIN_TASK_WORKERS = "4"
+.\run-skein.cmd
+```
+
+Queued workflows expose their queue position through the workflow API and History/Execution interface. A workflow moves from `QUEUED` to `RUNNING` only when a workflow slot is available.
 
 ## Tests
 

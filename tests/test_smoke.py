@@ -57,13 +57,16 @@ class SmokeTest(unittest.TestCase):
         self.assertIn("## Step 4",report)
 
     def test_artifact_persistence_validation_and_download(self):
-        wid=app.create_workflow("Créer un script Python hello world")
+        wid=app.create_workflow("Créer un script Python hello world","owner-test","session-test")
         tid=app.workflow_data(wid)["tasks"][0]["id"]
         saved=app.persist_artifacts(wid,tid,[{"path":"src/hello.py","content":"def hello():\n    return 'Hello'\n"},{"path":"../escape.py","content":"bad"}])
         self.assertEqual(len(saved),1)
         self.assertEqual(saved[0]["validation"]["status"],"PASS")
         data=app.workflow_data(wid)
         self.assertEqual(data["artifacts"][0]["relative_path"],"src/hello.py")
+        with app.db() as conn: artifact_path=Path(conn.execute("SELECT disk_path FROM artifacts WHERE workflow_id=?",(wid,)).fetchone()[0])
+        expected_root=app.DB_PATH.parent/"users"/"owner-test"/"sessions"/"session-test"/"workflows"/wid/"artifacts"
+        self.assertTrue(artifact_path.is_relative_to(expected_root))
         with urlopen(f"http://127.0.0.1:{self.port}{data['artifacts'][0]['download_url']}") as response:
             self.assertIn(b"def hello",response.read())
 
@@ -104,6 +107,27 @@ class SmokeTest(unittest.TestCase):
         _, activation = self.request(f"/api/models/{created['id']}/activate", {"pool_id":"reasoner"})
         self.assertEqual(activation["status"], "CONFIGURED")
         self.assertIn("not found", activation["error"])
+
+    def test_workflow_queue_reports_position_and_runs_fifo(self):
+        previous_limit=app.MAX_PARALLEL_WORKFLOWS; app.MAX_PARALLEL_WORKFLOWS=1
+        try:
+            first=app.create_workflow("First queued scheduling test","queue-owner","queue-session")
+            second=app.create_workflow("Second queued scheduling test","queue-owner","queue-session")
+            self.assertTrue((app.DB_PATH.parent/"users"/"queue-owner"/"sessions"/"queue-session"/"workflows"/first).is_dir())
+            self.assertTrue((app.DB_PATH.parent/"users"/"queue-owner"/"sessions"/"queue-session"/"workflows"/second).is_dir())
+            self.assertTrue(app.start_workflow(first)); self.assertTrue(app.start_workflow(second))
+            second_data=app.workflow_data(second)
+            self.assertEqual(second_data["workflow"]["status"],"QUEUED")
+            self.assertEqual(second_data["workflow"]["queue_position"],1)
+            deadline=time.time()+15
+            while time.time()<deadline:
+                first_data=app.workflow_data(first); second_data=app.workflow_data(second)
+                if first_data["workflow"]["status"]=="COMPLETED" and second_data["workflow"]["status"]=="COMPLETED": break
+                time.sleep(.1)
+            self.assertEqual(first_data["workflow"]["status"],"COMPLETED")
+            self.assertEqual(second_data["workflow"]["status"],"COMPLETED")
+            self.assertLessEqual(first_data["workflow"]["updated_at"],second_data["workflow"]["updated_at"])
+        finally: app.MAX_PARALLEL_WORKFLOWS=previous_limit
 
     def test_real_mode_preflight_is_explicit(self):
         previous = os.environ.pop("SKEIN_ALLOW_SIMULATION", None)

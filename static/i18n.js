@@ -23,6 +23,7 @@
       confirmClearOwnHistory: "Permanently delete all of your workflow history and deliverables?",
       confirmClearAllHistory: "Permanently delete workflow history and deliverables for every user?",
       historyCleared: "Workflow history cleared.",
+      queuePosition: "Queue position",
     },
     fr: {
       language: "Langue",
@@ -47,6 +48,7 @@
       confirmClearOwnHistory: "Supprimer définitivement tout votre historique de workflows et vos livrables ?",
       confirmClearAllHistory: "Supprimer définitivement l’historique et les livrables de tous les utilisateurs ?",
       historyCleared: "Historique des workflows supprimé.",
+      queuePosition: "Position dans la file",
     },
   };
   const pairs = {

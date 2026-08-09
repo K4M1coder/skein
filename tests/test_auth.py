@@ -68,8 +68,10 @@ class AuthTest(unittest.TestCase):
         with app.db() as conn:
             conn.execute("INSERT INTO workflows(id,objective,status,created_at,updated_at,owner_id) VALUES(?,?,?,?,?,?)", (own_workflow,"Owner history","COMPLETED",now,now,owner_id))
             conn.execute("INSERT INTO workflows(id,objective,status,created_at,updated_at,owner_id) VALUES(?,?,?,?,?,?)", (admin_workflow,"Admin history","COMPLETED",now,now,admin_session["user"]["id"]))
-            artifact_path = app.artifact_root(own_workflow) / "result.txt"
-            artifact_path.write_text("history deliverable", encoding="utf-8")
+        artifact_path = app.artifact_root(own_workflow) / "result.txt"
+        artifact_path.write_text("history deliverable", encoding="utf-8")
+        workflow_storage = artifact_path.parents[1]
+        with app.db() as conn:
             conn.execute("INSERT INTO artifacts(id,workflow_id,task_id,relative_path,disk_path,kind,validation,created_at) VALUES(?,?,?,?,?,?,?,?)", ("history-artifact",own_workflow,"task","result.txt",str(artifact_path),"text","{}",now))
 
         with self.assertRaises(HTTPError) as global_denied:
@@ -79,7 +81,7 @@ class AuthTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(own_result["deleted_workflows"], 1)
         self.assertEqual(own_result["deleted_artifacts"], 1)
-        self.assertFalse((app.DB_PATH.parent / "workflows" / own_workflow).exists())
+        self.assertFalse(workflow_storage.exists(),f"{workflow_storage} {own_result}")
         with app.db() as conn:
             self.assertIsNone(conn.execute("SELECT 1 FROM workflows WHERE id=?", (own_workflow,)).fetchone())
             self.assertIsNotNone(conn.execute("SELECT 1 FROM workflows WHERE id=?", (admin_workflow,)).fetchone())

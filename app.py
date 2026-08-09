@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64, csv, ctypes, io, json, mimetypes, os, re, shlex, shutil, sqlite3, subprocess, sys, tempfile, threading, time, uuid, zipfile, hashlib, hmac, secrets, smtplib, ssl
+from collections import deque
 from email.message import EmailMessage
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -73,7 +74,8 @@ def init_db():
           id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
           role TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS sessions(
-          token TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at REAL NOT NULL, created_at REAL NOT NULL);
+          token TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at REAL NOT NULL, created_at REAL NOT NULL,
+          storage_id TEXT);
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS rbac_profiles(
           id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL, system INTEGER NOT NULL DEFAULT 1);
@@ -100,9 +102,14 @@ def init_db():
     with db() as conn:
         columns={r[1] for r in conn.execute("PRAGMA table_info(workflows)")}
         if "owner_id" not in columns: conn.execute("ALTER TABLE workflows ADD COLUMN owner_id TEXT")
+        if "session_id" not in columns: conn.execute("ALTER TABLE workflows ADD COLUMN session_id TEXT")
         user_columns={r[1] for r in conn.execute("PRAGMA table_info(users)")}
         if "email" not in user_columns: conn.execute("ALTER TABLE users ADD COLUMN email TEXT")
         if "verified_at" not in user_columns: conn.execute("ALTER TABLE users ADD COLUMN verified_at REAL")
+        session_columns={r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
+        if "storage_id" not in session_columns: conn.execute("ALTER TABLE sessions ADD COLUMN storage_id TEXT")
+        for session in conn.execute("SELECT token FROM sessions WHERE storage_id IS NULL OR storage_id='' ").fetchall():
+            conn.execute("UPDATE sessions SET storage_id=? WHERE token=?",(str(uuid.uuid4()),session["token"]))
         conn.execute("UPDATE users SET verified_at=created_at WHERE verified_at IS NULL AND email IS NULL")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_email_unique ON users(email) WHERE email IS NOT NULL")
         conn.execute("INSERT OR IGNORE INTO pools VALUES('reasoner','Reasoner','reasoner','#78a7ff')")
@@ -455,18 +462,19 @@ def plan_for(objective):
       ("Deliver the final directly usable answer", "integrator", [0,1], .52, .25, .90)]
 
 
-def create_workflow(objective,owner_id=None):
+def create_workflow(objective,owner_id=None,session_id=None):
     wid, created = str(uuid.uuid4()), stamp()
     specs = plan_for(objective)
     ids = [str(uuid.uuid4()) for _ in specs]
     with db() as conn:
-        conn.execute("INSERT INTO workflows(id,objective,status,created_at,updated_at,owner_id) VALUES(?,?,?,?,?,?)", (wid, objective, "READY", created, created,owner_id))
+        conn.execute("INSERT INTO workflows(id,objective,status,created_at,updated_at,owner_id,session_id) VALUES(?,?,?,?,?,?,?)", (wid, objective, "READY", created, created,owner_id,session_id))
         for pos, spec in enumerate(specs):
             title, role, deps, complexity, risk, criticality = spec
             conn.execute("""INSERT INTO tasks(id,workflow_id,position,title,role,dependencies,
               complexity,risk,criticality,status) VALUES(?,?,?,?,?,?,?,?,?,?)""",
-              (ids[pos], wid, pos, title, role, json.dumps([ids[i] for i in deps]),
+               (ids[pos], wid, pos, title, role, json.dumps([ids[i] for i in deps]),
                complexity, risk, criticality, "READY"))
+    workflow_storage_root(wid,owner_id,session_id).mkdir(parents=True,exist_ok=True)
     emit(wid, "workflow.created", {"objective": objective, "tasks": len(specs)})
     return wid
 
@@ -553,8 +561,9 @@ class ModelClient:
                 "next_actions": ["Validate the produced artifact"], "mode": "simulation"}
 
 
-POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="skein-worker")
-ACTIVE, ACTIVE_LOCK = set(), threading.Lock()
+POOL = ThreadPoolExecutor(max_workers=max(1,int(os.getenv("SKEIN_TASK_WORKERS","4"))), thread_name_prefix="skein-worker")
+MAX_PARALLEL_WORKFLOWS=max(1,int(os.getenv("SKEIN_MAX_PARALLEL_WORKFLOWS","2")))
+ACTIVE, WORKFLOW_QUEUE, ACTIVE_LOCK = set(), deque(), threading.Lock()
 
 
 class PowerSampler:
@@ -577,19 +586,29 @@ class PowerSampler:
           "energy_method":"estimated_nvidia_smi_task_window"}
 
 
+def workflow_storage_root(wid,owner_id=None,session_id=None):
+    if owner_id is None or session_id is None:
+        with db() as conn: row=conn.execute("SELECT owner_id,session_id FROM workflows WHERE id=?",(wid,)).fetchone()
+        owner_id=owner_id or (row["owner_id"] if row else None); session_id=session_id or (row["session_id"] if row else None)
+    owner_folder=owner_id or "system"; session_folder=session_id or "legacy"
+    return DB_PATH.parent/"users"/owner_folder/"sessions"/session_folder/"workflows"/wid
+
+
 def artifact_root(wid):
-    root=DB_PATH.parent/"workflows"/wid/"artifacts"; root.mkdir(parents=True,exist_ok=True); return root
+    root=workflow_storage_root(wid)/"artifacts"; root.mkdir(parents=True,exist_ok=True); return root
 
 
 def delete_workflow_history(user_id,delete_all=False):
     with db() as conn:
-        rows=conn.execute("SELECT id FROM workflows" if delete_all else "SELECT id FROM workflows WHERE owner_id=?",() if delete_all else (user_id,)).fetchall()
+        rows=conn.execute("SELECT id,owner_id,session_id FROM workflows" if delete_all else "SELECT id,owner_id,session_id FROM workflows WHERE owner_id=?",() if delete_all else (user_id,)).fetchall()
     workflow_ids=[row["id"] for row in rows]
     with ACTIVE_LOCK:
         running=[wid for wid in workflow_ids if wid in ACTIVE]
-    if running:
-        return {"error":"Workflow history cannot be deleted while matching workflows are running","running_workflow_ids":running},409
+        queued=[wid for wid in workflow_ids if wid in WORKFLOW_QUEUE]
+    if running or queued:
+        return {"error":"Workflow history cannot be deleted while matching workflows are active or queued","running_workflow_ids":running,"queued_workflow_ids":queued},409
     if not workflow_ids: return {"deleted_workflows":0,"deleted_artifacts":0,"scope":"all" if delete_all else "own","warnings":[]},200
+    storage_by_id={row["id"]:workflow_storage_root(row["id"],row["owner_id"],row["session_id"]) for row in rows}
     placeholders=",".join("?" for _ in workflow_ids)
     with db() as conn:
         artifact_count=conn.execute(f"SELECT COUNT(*) FROM artifacts WHERE workflow_id IN ({placeholders})",workflow_ids).fetchone()[0]
@@ -598,10 +617,10 @@ def delete_workflow_history(user_id,delete_all=False):
         conn.execute(f"DELETE FROM events WHERE workflow_id IN ({placeholders})",workflow_ids)
         conn.execute(f"DELETE FROM tasks WHERE workflow_id IN ({placeholders})",workflow_ids)
         conn.execute(f"DELETE FROM workflows WHERE id IN ({placeholders})",workflow_ids)
-    warnings=[]; workflows_root=(DB_PATH.parent/"workflows").resolve()
+    warnings=[]; users_root=(DB_PATH.parent/"users").resolve()
     for wid in workflow_ids:
-        workflow_path=(workflows_root/wid).resolve()
-        if workflow_path.parent!=workflows_root:
+        workflow_path=storage_by_id[wid].resolve()
+        if users_root not in workflow_path.parents:
             warnings.append(f"Skipped unsafe workflow path for {wid}"); continue
         try: shutil.rmtree(workflow_path) if workflow_path.exists() else None
         except OSError as exc: warnings.append(f"Could not remove files for {wid}: {exc}")
@@ -824,14 +843,32 @@ def orchestrate(wid):
             else: time.sleep(.15)
     finally:
         with ACTIVE_LOCK: ACTIVE.discard(wid)
+        dispatch_workflows()
+
+
+def dispatch_workflows():
+    launches=[]
+    with ACTIVE_LOCK:
+        while WORKFLOW_QUEUE and len(ACTIVE)<MAX_PARALLEL_WORKFLOWS:
+            wid=WORKFLOW_QUEUE.popleft(); ACTIVE.add(wid); launches.append(wid)
+    for wid in launches: threading.Thread(target=orchestrate,args=(wid,),daemon=True).start()
 
 
 def start_workflow(wid):
     with ACTIVE_LOCK:
-        if wid in ACTIVE: return False
-        ACTIVE.add(wid)
-    threading.Thread(target=orchestrate, args=(wid,), daemon=True).start()
-    return True
+        if wid in ACTIVE or wid in WORKFLOW_QUEUE: return False
+        WORKFLOW_QUEUE.append(wid); position=len(WORKFLOW_QUEUE)
+    with db() as conn: conn.execute("UPDATE workflows SET status='QUEUED',updated_at=? WHERE id=?",(stamp(),wid))
+    emit(wid,"workflow.queued",{"position":position,"parallel_limit":MAX_PARALLEL_WORKFLOWS})
+    dispatch_workflows(); return True
+
+
+def recover_pending_workflows():
+    with db() as conn:
+        rows=conn.execute("SELECT id FROM workflows WHERE status IN ('READY','QUEUED','RUNNING') ORDER BY created_at").fetchall()
+        conn.execute("UPDATE tasks SET status='READY' WHERE status='RUNNING'")
+    for row in rows: start_workflow(row["id"])
+    return len(rows)
 
 
 def workflow_data(wid):
@@ -868,7 +905,11 @@ def workflow_data(wid):
       "peak_power_w":round(max([float(m.get("peak_power_w") or 0) for m in task_metrics] or [0]),2),
       "energy_wh":round(sum(float(m.get("energy_wh") or 0) for m in task_metrics),4),
       "energy_note":"Estimated from nvidia-smi samples; simultaneous GPU load may be attributed to more than one task."}
-    return {"workflow":dict(wf),"tasks":out,"events":ev,"final_output":final,"artifacts":artifacts,"summary":summary,
+    workflow=dict(wf)
+    with ACTIVE_LOCK:
+        workflow["queue_position"]=(list(WORKFLOW_QUEUE).index(wid)+1) if wid in WORKFLOW_QUEUE else None
+        workflow["parallel_limit"]=MAX_PARALLEL_WORKFLOWS
+    return {"workflow":workflow,"tasks":out,"events":ev,"final_output":final,"artifacts":artifacts,"summary":summary,
             "deliverable":{"kind":"none" if not artifacts else ("file" if len(artifacts)==1 else "project"),"file_count":len(artifacts),"archive_url":f"/api/workflows/{wid}/deliverable.zip" if artifacts else None},
             "artifact_notice":f"{len(artifacts)} file(s) produced and validated." if artifacts else "No file was required or produced for this request."}
 
@@ -946,11 +987,11 @@ class Handler(SimpleHTTPRequestHandler):
             if sep and key==name: return value
         return None
     def current_user(self):
-        if os.getenv("SKEIN_AUTH_DISABLED","0")=="1": return {"id":"test-admin","username":"test-admin","role":"admin","active":1,"profiles":[{"id":"super_admin","name":"Super Administrator"}],"permissions":["users.manage","settings.manage","models.manage","workflows.execute","workflows.read_own","workflows.read_all","workflows.delete_own","workflows.delete_all","server_stats.read"]}
+        if os.getenv("SKEIN_AUTH_DISABLED","0")=="1": return {"id":"test-admin","session_id":"test-session","username":"test-admin","role":"admin","active":1,"profiles":[{"id":"super_admin","name":"Super Administrator"}],"permissions":["users.manage","settings.manage","models.manage","workflows.execute","workflows.read_own","workflows.read_all","workflows.delete_own","workflows.delete_all","server_stats.read"]}
         token=self.cookie("skein_session")
         if not token: return None
         with db() as conn:
-            row=conn.execute("SELECT u.id,u.username,u.email,u.verified_at,u.role,u.active FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires_at>?",(token,stamp())).fetchone()
+            row=conn.execute("SELECT u.id,u.username,u.email,u.verified_at,u.role,u.active,s.storage_id AS session_id FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires_at>?",(token,stamp())).fetchone()
         if not row or not row["active"]: return None
         user=dict(row); user["verified"]=bool(user.pop("verified_at")); user["profiles"],grants=access_for_user(user["id"]); user["permissions"]=grants if user["verified"] else []; return user
     def deny(self,status=401,message="Authentication required"):
@@ -978,7 +1019,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Set-Cookie",f"skein_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200")
         self.send_header("Content-Length",str(len(raw))); self.end_headers(); self.wfile.write(raw)
     def do_GET(self):
-        if self.path=="/api/health": return self.json({"status":"ok","active":len(ACTIVE),"database":str(DB_PATH),"execution_mode":EXECUTION_MODE,"active_models":ACTIVE_ENDPOINTS,"backends":{"worker":bool(os.getenv("SKEIN_WORKER_URL") or ACTIVE_ENDPOINTS.get("worker")),"reasoner":bool(os.getenv("SKEIN_REASONER_URL") or ACTIVE_ENDPOINTS.get("reasoner"))}})
+        if self.path=="/api/health": return self.json({"status":"ok","active":len(ACTIVE),"queued":len(WORKFLOW_QUEUE),"parallel_workflow_limit":MAX_PARALLEL_WORKFLOWS,"database":str(DB_PATH),"execution_mode":EXECUTION_MODE,"active_models":ACTIVE_ENDPOINTS,"backends":{"worker":bool(os.getenv("SKEIN_WORKER_URL") or ACTIVE_ENDPOINTS.get("worker")),"reasoner":bool(os.getenv("SKEIN_REASONER_URL") or ACTIVE_ENDPOINTS.get("reasoner"))}})
         if self.path=="/api/auth/me":
             user=self.current_user()
             if not user: return self.deny()
@@ -1098,7 +1139,7 @@ class Handler(SimpleHTTPRequestHandler):
             if not row or not row["active"] or not password_valid(password,row["password_hash"]): return self.deny(401,"Invalid credentials")
             token=secrets.token_urlsafe(32)
             with db() as conn:
-                conn.execute("DELETE FROM sessions WHERE expires_at<=?",(stamp(),)); conn.execute("INSERT INTO sessions VALUES(?,?,?,?)",(token,row["id"],stamp()+43200,stamp()))
+                conn.execute("DELETE FROM sessions WHERE expires_at<=?",(stamp(),)); conn.execute("INSERT INTO sessions(token,user_id,expires_at,created_at,storage_id) VALUES(?,?,?,?,?)",(token,row["id"],stamp()+43200,stamp(),str(uuid.uuid4())))
             profiles,permissions=access_for_user(row["id"])
             verified=bool(row["verified_at"])
             return self.send_session({"id":row["id"],"username":row["username"],"email":row["email"],"verified":verified,"role":row["role"],"profiles":profiles,"permissions":permissions if verified else []},token)
@@ -1199,7 +1240,7 @@ class Handler(SimpleHTTPRequestHandler):
                 missing=[role for role in ("reasoner","worker") if not endpoint_ready(ACTIVE_ENDPOINTS.get(role,""))]
                 if missing: return self.json({"error":"Real models are not loaded","missing_roles":missing,
                   "action":"Use Auto-detect and load local models in Model Plane."},409)
-            wid=create_workflow(objective,user["id"]); start_workflow(wid); return self.json({"id":wid},201)
+            wid=create_workflow(objective,user["id"],user.get("session_id")); start_workflow(wid); return self.json({"id":wid},201)
         if self.path=="/api/execution-mode":
             if "settings.manage" not in user["permissions"] and not setting_bool("users_can_choose_execution_mode"): return self.deny(403,"Execution mode selection is disabled by the administrator")
             mode=str(body.get("mode","")).lower()
@@ -1257,7 +1298,7 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 if __name__=="__main__":
-    init_db(); server=ThreadingHTTPServer(("127.0.0.1",int(os.getenv("SKEIN_PORT","8787"))),Handler)
+    init_db(); recover_pending_workflows(); server=ThreadingHTTPServer(("127.0.0.1",int(os.getenv("SKEIN_PORT","8787"))),Handler)
     print(f"Skein disponible sur http://127.0.0.1:{server.server_port}")
     try: server.serve_forever()
     except KeyboardInterrupt: pass
