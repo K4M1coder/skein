@@ -1,0 +1,11 @@
+#rbac-users,#rbac-settings,#privacy-stats{border-top:1px solid var(--line);margin-top:20px;padding-top:18px}
+.permission-hidden{display:none!important}
+.rbac-create{display:grid;grid-template-columns:1fr 1fr 2fr auto;gap:10px;align-items:start}
+.rbac-user{display:grid;grid-template-columns:1fr 2fr 90px 1fr auto;gap:10px;align-items:center;border:1px solid var(--line);padding:12px}
+.rbac-user>div:first-child small{display:block;color:var(--muted);font:9px monospace;margin-top:5px}
+.profile-picker{display:grid;grid-template-columns:repeat(2,minmax(160px,1fr));gap:5px}
+.profile-option{display:grid;grid-template-columns:auto 1fr;column-gap:5px;border:1px solid var(--line);padding:7px;font:10px monospace}
+.profile-option input{grid-row:1/3}.profile-option small{color:var(--muted)}
+.privacy-notice{border-left:3px solid var(--lime);padding:10px;background:#b9f45c08;color:var(--muted)}
+.stats-table{display:grid;gap:4px;max-height:420px;overflow:auto}.stats-table>div{display:grid;grid-template-columns:1.4fr .8fr 1.2fr repeat(4,.7fr);gap:8px;padding:8px;border-bottom:1px solid var(--line);font:10px monospace}.stats-table code{color:var(--lime)}
+@media(max-width:900px){.rbac-create,.rbac-user{grid-template-columns:1fr}.profile-picker{grid-template-columns:1fr}.stats-table>div{grid-template-columns:1fr 1fr}}

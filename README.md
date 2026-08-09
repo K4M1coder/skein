@@ -22,7 +22,20 @@ Skein is a local, GPU-aware multi-agent workflow orchestrator. It separates reas
 - **History** contains recent runs and the event stream. Selecting a run displays its complete report and artifacts without returning to the workflow launcher.
 - **Administration** contains access control, execution policy, GPU pools, telemetry, model selection, and runtime controls. This tab is rendered only for administrators.
 
-## Access control
+## RBAC access control
+
+Skein uses composable RBAC profiles rather than a single hard-coded administrator flag. A user can hold multiple profiles.
+
+| Default profile | Granted capabilities |
+|---|---|
+| Super Administrator | Every permission, including cross-user workflow reads |
+| User Manager | Create/update users, reset passwords, activate accounts, assign profiles |
+| Settings Manager | Execution policy, GPU pools, assignments, and stack controls |
+| Model Manager | Model registry/runtimes and privacy-safe server statistics |
+| Workflow Operator | Execute workflows and read only owned workflows |
+| Statistics Auditor | Read privacy-safe operational statistics only |
+
+Backend permissions are `users.manage`, `settings.manage`, `models.manage`, `workflows.execute`, `workflows.read_own`, `workflows.read_all`, and `server_stats.read`. UI visibility follows the same server-issued permission list; hiding a control is never the authorization boundary.
 
 Administrators can:
 
@@ -32,6 +45,8 @@ Administrators can:
 - choose whether standard users may switch between Sandbox and Local execution.
 
 Standard users can create and inspect only their own workflows. They cannot change models or system settings. Local/Sandbox selection is available only when enabled by an administrator.
+
+The server statistics endpoint (`GET /api/server-stats`) exposes dated request-step metadata: anonymized request reference, model, role, status, token counts, tokens/s, duration, average/peak watts, and estimated Wh. It deliberately excludes objectives, prompts, usernames, user IDs, results, deliverables, and artifacts. The request reference is a truncated SHA-256 digest and cannot be used to retrieve workflow content through the statistics API.
 
 On the first start, Skein creates a bootstrap administrator. Configure it before that first start:
 

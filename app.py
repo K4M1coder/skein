@@ -74,6 +74,14 @@ def init_db():
         CREATE TABLE IF NOT EXISTS sessions(
           token TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at REAL NOT NULL, created_at REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS rbac_profiles(
+          id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL, system INTEGER NOT NULL DEFAULT 1);
+        CREATE TABLE IF NOT EXISTS rbac_permissions(
+          id TEXT PRIMARY KEY, description TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS rbac_profile_permissions(
+          profile_id TEXT NOT NULL, permission_id TEXT NOT NULL, PRIMARY KEY(profile_id,permission_id));
+        CREATE TABLE IF NOT EXISTS user_profiles(
+          user_id TEXT NOT NULL, profile_id TEXT NOT NULL, PRIMARY KEY(user_id,profile_id));
         """
     try:
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -93,6 +101,30 @@ def init_db():
         if not conn.execute("SELECT 1 FROM users").fetchone():
             username=os.getenv("SKEIN_ADMIN_USER","admin"); password=os.getenv("SKEIN_ADMIN_PASSWORD","admin")
             conn.execute("INSERT INTO users VALUES(?,?,?,?,?,?)",(str(uuid.uuid4()),username,password_hash(password),"admin",1,stamp()))
+        permissions={
+          "users.manage":"Create, update, activate, and assign profiles to users",
+          "settings.manage":"Manage execution policy, GPU pools, and the application stack",
+          "models.manage":"Register, load, stop, and assign models",
+          "workflows.execute":"Create workflows and execute their artifacts or commands",
+          "workflows.read_own":"Read workflows owned by the current user",
+          "workflows.read_all":"Read all workflow reports and deliverables",
+          "server_stats.read":"Read privacy-preserving server and inference statistics",
+        }
+        for pid,description in permissions.items(): conn.execute("INSERT OR IGNORE INTO rbac_permissions VALUES(?,?)",(pid,description))
+        profiles={
+          "super_admin":("Super Administrator","Full access to all Skein capabilities",list(permissions)),
+          "user_manager":("User Manager","Manage users and RBAC profile assignments",["users.manage"]),
+          "settings_manager":("Settings Manager","Manage execution policy, GPU pools, and stack controls",["settings.manage"]),
+          "model_manager":("Model Manager","Manage model registry and runtimes",["models.manage","server_stats.read"]),
+          "workflow_operator":("Workflow Operator","Execute and inspect owned workflows",["workflows.execute","workflows.read_own"]),
+          "stats_auditor":("Statistics Auditor","Read anonymized operational statistics only",["server_stats.read"]),
+        }
+        for profile_id,(name,description,grants) in profiles.items():
+            conn.execute("INSERT OR IGNORE INTO rbac_profiles VALUES(?,?,?,1)",(profile_id,name,description))
+            for permission in grants: conn.execute("INSERT OR IGNORE INTO rbac_profile_permissions VALUES(?,?)",(profile_id,permission))
+        for user in conn.execute("SELECT id,role FROM users").fetchall():
+            if not conn.execute("SELECT 1 FROM user_profiles WHERE user_id=?",(user["id"],)).fetchone():
+                conn.execute("INSERT OR IGNORE INTO user_profiles VALUES(?,?)",(user["id"],"super_admin" if user["role"]=="admin" else "workflow_operator"))
     discover_local_models()
 
 
@@ -112,6 +144,13 @@ def password_valid(password,encoded):
 def setting_bool(key,default=False):
     with db() as conn: row=conn.execute("SELECT value FROM settings WHERE key=?",(key,)).fetchone()
     return (row["value"].lower()=="true") if row else default
+
+
+def access_for_user(user_id):
+    with db() as conn:
+        profiles=[dict(r) for r in conn.execute("SELECT p.id,p.name,p.description FROM rbac_profiles p JOIN user_profiles up ON up.profile_id=p.id WHERE up.user_id=? ORDER BY p.name",(user_id,)).fetchall()]
+        permissions=[r[0] for r in conn.execute("SELECT DISTINCT pp.permission_id FROM rbac_profile_permissions pp JOIN user_profiles up ON up.profile_id=pp.profile_id WHERE up.user_id=? ORDER BY pp.permission_id",(user_id,)).fetchall()]
+    return profiles,permissions
 
 
 def discover_local_models():
@@ -719,6 +758,30 @@ def workflow_report(wid):
     return "\n".join(lines)
 
 
+def privacy_safe_server_stats(limit=200):
+    """Return operational metadata only; never expose prompts, objectives, outputs, artifacts, or usernames."""
+    with db() as conn:
+        rows=conn.execute("SELECT t.workflow_id,t.position,t.role,t.model,t.status,t.started_at,t.finished_at,t.result FROM tasks t WHERE t.started_at IS NOT NULL ORDER BY t.started_at DESC LIMIT ?",(max(1,min(limit,1000)),)).fetchall()
+    requests=[]
+    for row in rows:
+        result=json.loads(row["result"]) if row["result"] else {}; metrics=result.get("metrics",{})
+        requests.append({
+          "request_ref":hashlib.sha256(row["workflow_id"].encode()).hexdigest()[:12],
+          "step":row["position"]+1,"role":row["role"],"model":row["model"],"status":row["status"],
+          "started_at":row["started_at"],"finished_at":row["finished_at"],
+          "prompt_tokens":int(metrics.get("prompt_tokens") or 0),"completion_tokens":int(metrics.get("completion_tokens") or 0),
+          "total_tokens":int(metrics.get("total_tokens") or 0),"tokens_per_second":float(metrics.get("tokens_per_second") or 0),
+          "duration_seconds":float(metrics.get("execution_seconds") or 0),"average_power_w":float(metrics.get("average_power_w") or 0),
+          "peak_power_w":float(metrics.get("peak_power_w") or 0),"energy_wh":float(metrics.get("energy_wh") or 0),
+        })
+    total_duration=sum(r["duration_seconds"] for r in requests); total_completion=sum(r["completion_tokens"] for r in requests)
+    return {"privacy":{"content_excluded":True,"excluded_fields":["objective","prompt","result","deliverable","artifacts","username","user_id"],"request_reference":"SHA-256 workflow identifier truncated to 12 characters"},
+      "summary":{"request_steps":len(requests),"total_tokens":sum(r["total_tokens"] for r in requests),"total_duration_seconds":round(total_duration,3),
+        "average_tokens_per_second":round(total_completion/total_duration,2) if total_duration else 0,"energy_wh":round(sum(r["energy_wh"] for r in requests),4),
+        "average_power_w":round(sum(r["average_power_w"]*r["duration_seconds"] for r in requests)/total_duration,2) if total_duration else 0},
+      "requests":requests}
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self,*args,**kwargs): super().__init__(*args,directory=str(STATIC),**kwargs)
     def log_message(self,fmt,*args): pass
@@ -741,21 +804,28 @@ class Handler(SimpleHTTPRequestHandler):
             if sep and key==name: return value
         return None
     def current_user(self):
-        if os.getenv("SKEIN_AUTH_DISABLED","0")=="1": return {"id":"test-admin","username":"test-admin","role":"admin","active":1}
+        if os.getenv("SKEIN_AUTH_DISABLED","0")=="1": return {"id":"test-admin","username":"test-admin","role":"admin","active":1,"profiles":[{"id":"super_admin","name":"Super Administrator"}],"permissions":["users.manage","settings.manage","models.manage","workflows.execute","workflows.read_own","workflows.read_all","server_stats.read"]}
         token=self.cookie("skein_session")
         if not token: return None
         with db() as conn:
             row=conn.execute("SELECT u.id,u.username,u.role,u.active FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires_at>?",(token,stamp())).fetchone()
-        return dict(row) if row and row["active"] else None
+        if not row or not row["active"]: return None
+        user=dict(row); user["profiles"],user["permissions"]=access_for_user(user["id"]); return user
     def deny(self,status=401,message="Authentication required"):
         return self.json({"error":message,"action":"Sign in with an authorized account."},status)
-    def authorize(self,admin=False):
+    def authorize(self,permission=None):
         user=self.current_user()
         if not user: self.deny(); return None
-        if admin and user["role"]!="admin": self.deny(403,"Administrator access required"); return None
+        if permission and permission not in user["permissions"]: self.deny(403,f"Permission required: {permission}"); return None
+        return user
+    def authorize_any(self,*permissions):
+        user=self.current_user()
+        if not user: self.deny(); return None
+        if permissions and not any(permission in user["permissions"] for permission in permissions):
+            self.deny(403,"One of these permissions is required: "+", ".join(permissions)); return None
         return user
     def workflow_allowed(self,user,wid):
-        if user["role"]=="admin": return True
+        if "workflows.read_all" in user["permissions"]: return True
         with db() as conn: row=conn.execute("SELECT owner_id FROM workflows WHERE id=?",(wid,)).fetchone()
         return bool(row and row["owner_id"]==user["id"])
     def send_session(self,user,token):
@@ -769,20 +839,36 @@ class Handler(SimpleHTTPRequestHandler):
             user=self.authorize()
             return self.json({"user":user,"policy":{"users_can_choose_execution_mode":setting_bool("users_can_choose_execution_mode")}}) if user else None
         if self.path.startswith("/api/"):
-            admin=self.path in ("/api/users","/api/admin/settings")
-            user=self.authorize(admin)
+            if self.path in ("/api/users","/api/rbac/profiles"): user=self.authorize("users.manage")
+            elif self.path=="/api/admin/settings": user=self.authorize("settings.manage")
+            elif self.path=="/api/models": user=self.authorize("models.manage")
+            elif self.path=="/api/hardware": user=self.authorize_any("server_stats.read","settings.manage","models.manage")
+            elif self.path=="/api/server-stats": user=self.authorize("server_stats.read")
+            else: user=self.authorize()
             if not user: return
             if self.path.startswith("/api/workflows/"):
+                if not any(p in user["permissions"] for p in ("workflows.read_own","workflows.read_all")): return self.deny(403,"Workflow read permission required")
                 wid=self.path.split("/")[3]
                 if not self.workflow_allowed(user,wid): return self.deny(403,"This workflow belongs to another user")
             if self.path.startswith("/api/artifacts/") and user["role"]!="admin":
+                if not any(p in user["permissions"] for p in ("workflows.read_own","workflows.read_all")): return self.deny(403,"Workflow read permission required")
                 aid=self.path.split("/")[3]
                 with db() as conn: row=conn.execute("SELECT workflow_id FROM artifacts WHERE id=?",(aid,)).fetchone()
                 if not row or not self.workflow_allowed(user,row["workflow_id"]): return self.deny(403,"Artifact access denied")
         if self.path=="/api/users":
             with db() as conn: rows=conn.execute("SELECT id,username,role,active,created_at FROM users ORDER BY username").fetchall()
-            return self.json([dict(r) for r in rows])
+            result=[]
+            for row in rows:
+                item=dict(row); item["profiles"],item["permissions"]=access_for_user(item["id"]); result.append(item)
+            return self.json(result)
+        if self.path=="/api/rbac/profiles":
+            with db() as conn:
+                rows=conn.execute("SELECT * FROM rbac_profiles ORDER BY name").fetchall(); grants=conn.execute("SELECT * FROM rbac_profile_permissions ORDER BY permission_id").fetchall()
+            by_profile={r["id"]:[] for r in rows}
+            for grant in grants: by_profile.setdefault(grant["profile_id"],[]).append(grant["permission_id"])
+            return self.json([{**dict(row),"permissions":by_profile.get(row["id"],[])} for row in rows])
         if self.path=="/api/admin/settings": return self.json({"users_can_choose_execution_mode":setting_bool("users_can_choose_execution_mode")})
+        if self.path=="/api/server-stats": return self.json(privacy_safe_server_stats())
         if self.path=="/api/sandbox/capabilities": return self.json({"mode":EXECUTION_MODE,"runtimes":sandbox_capabilities()})
         if self.path=="/api/execution-mode": return self.json({"mode":EXECUTION_MODE,"warning":"Local mode runs on the host without isolation." if EXECUTION_MODE=="local" else None})
         if self.path=="/api/hardware": return self.json(hardware_snapshot())
@@ -801,8 +887,9 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path=="/api/stack/status":
             result,status=supervisor_call("status"); return self.json(result,status)
         if self.path=="/api/workflows":
+            if not any(p in user["permissions"] for p in ("workflows.read_own","workflows.read_all")): return self.deny(403,"Workflow read permission required")
             with db() as conn:
-                rows=conn.execute("SELECT * FROM workflows ORDER BY created_at DESC LIMIT 30").fetchall() if user["role"]=="admin" else conn.execute("SELECT * FROM workflows WHERE owner_id=? ORDER BY created_at DESC LIMIT 30",(user["id"],)).fetchall()
+                rows=conn.execute("SELECT * FROM workflows ORDER BY created_at DESC LIMIT 30").fetchall() if "workflows.read_all" in user["permissions"] else conn.execute("SELECT * FROM workflows WHERE owner_id=? ORDER BY created_at DESC LIMIT 30",(user["id"],)).fetchall()
             return self.json([dict(r) for r in rows])
         if self.path.startswith("/api/artifacts/"):
             if self.path.endswith("/preview"):
@@ -848,14 +935,18 @@ class Handler(SimpleHTTPRequestHandler):
             token=secrets.token_urlsafe(32)
             with db() as conn:
                 conn.execute("DELETE FROM sessions WHERE expires_at<=?",(stamp(),)); conn.execute("INSERT INTO sessions VALUES(?,?,?,?)",(token,row["id"],stamp()+43200,stamp()))
-            return self.send_session({"id":row["id"],"username":row["username"],"role":row["role"]},token)
+            profiles,permissions=access_for_user(row["id"])
+            return self.send_session({"id":row["id"],"username":row["username"],"role":row["role"],"profiles":profiles,"permissions":permissions},token)
         if self.path=="/api/auth/logout":
             token=self.cookie("skein_session")
             if token:
                 with db() as conn: conn.execute("DELETE FROM sessions WHERE token=?",(token,))
             raw=b'{"ok":true}'; self.send_response(200); self.send_header("Content-Type","application/json"); self.send_header("Set-Cookie","skein_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"); self.send_header("Content-Length",str(len(raw))); self.end_headers(); return self.wfile.write(raw)
-        admin=self.path.startswith(("/api/models","/api/pools","/api/gpus","/api/stack","/api/users","/api/admin"))
-        user=self.authorize(admin)
+        if self.path.startswith("/api/models"): user=self.authorize("models.manage")
+        elif self.path.startswith("/api/users") or self.path.startswith("/api/rbac"): user=self.authorize("users.manage")
+        elif self.path.startswith(("/api/pools","/api/gpus","/api/stack","/api/admin")): user=self.authorize("settings.manage")
+        elif self.path=="/api/workflows" or self.path.endswith("/run") or self.path.endswith("/execute") or self.path.endswith("/command"): user=self.authorize("workflows.execute")
+        else: user=self.authorize()
         if not user: return
         if self.path.startswith("/api/workflows/"):
             wid=self.path.split("/")[3]
@@ -865,28 +956,44 @@ class Handler(SimpleHTTPRequestHandler):
             with db() as conn: artifact_owner=conn.execute("SELECT workflow_id FROM artifacts WHERE id=?",(aid,)).fetchone()
             if not artifact_owner or not self.workflow_allowed(user,artifact_owner["workflow_id"]): return self.deny(403,"Artifact access denied")
         if self.path=="/api/users":
-            username=str(body.get("username","")).strip(); password=str(body.get("password","")); role=str(body.get("role","user"))
-            if len(username)<3 or len(password)<8 or role not in ("admin","user"): return self.json({"error":"Username must be at least 3 characters, password at least 8, and role admin or user"},400)
+            username=str(body.get("username","")).strip(); password=str(body.get("password","")); profiles=body.get("profiles") or ["workflow_operator"]
+            if not isinstance(profiles,list) or not profiles: return self.json({"error":"At least one RBAC profile is required"},400)
+            with db() as conn: valid={r[0] for r in conn.execute("SELECT id FROM rbac_profiles WHERE id IN (%s)"%",".join("?"*len(profiles)),profiles).fetchall()}
+            if set(profiles)!=valid: return self.json({"error":"Unknown RBAC profile"},400)
+            role="admin" if "super_admin" in profiles else "user"
+            if len(username)<3 or len(password)<8: return self.json({"error":"Username must be at least 3 characters and password at least 8"},400)
             try:
                 uid=str(uuid.uuid4())
-                with db() as conn: conn.execute("INSERT INTO users VALUES(?,?,?,?,?,?)",(uid,username,password_hash(password),role,1,stamp()))
-                return self.json({"id":uid,"username":username,"role":role,"active":1},201)
+                with db() as conn:
+                    conn.execute("INSERT INTO users VALUES(?,?,?,?,?,?)",(uid,username,password_hash(password),role,1,stamp()))
+                    for profile in profiles: conn.execute("INSERT INTO user_profiles VALUES(?,?)",(uid,profile))
+                assigned,_=access_for_user(uid); return self.json({"id":uid,"username":username,"role":role,"active":1,"profiles":assigned},201)
             except sqlite3.IntegrityError: return self.json({"error":"This username already exists"},409)
         if self.path.startswith("/api/users/"):
             uid=self.path.rsplit("/",1)[-1]; fields=[]; values=[]
             with db() as conn: existing=conn.execute("SELECT role,active FROM users WHERE id=?",(uid,)).fetchone()
             if not existing: return self.json({"error":"User not found"},404)
-            resulting_role=body.get("role",existing["role"]); resulting_active=(1 if body["active"] else 0) if "active" in body else existing["active"]
-            if existing["role"]=="admin" and existing["active"] and (resulting_role!="admin" or not resulting_active):
-                with db() as conn: remaining=conn.execute("SELECT COUNT(*) FROM users WHERE role='admin' AND active=1 AND id<>?",(uid,)).fetchone()[0]
-                if remaining==0: return self.json({"error":"At least one active administrator is required"},409)
-            if body.get("role") in ("admin","user"): fields.append("role=?"); values.append(body["role"])
+            current_profiles,_=access_for_user(uid); current_ids={p["id"] for p in current_profiles}; requested_profiles=body.get("profiles")
+            resulting_profiles=set(requested_profiles) if isinstance(requested_profiles,list) else current_ids
+            resulting_active=(1 if body["active"] else 0) if "active" in body else existing["active"]
+            if "super_admin" in current_ids and existing["active"] and ("super_admin" not in resulting_profiles or not resulting_active):
+                with db() as conn: remaining=conn.execute("SELECT COUNT(DISTINCT u.id) FROM users u JOIN user_profiles up ON up.user_id=u.id WHERE up.profile_id='super_admin' AND u.active=1 AND u.id<>?",(uid,)).fetchone()[0]
+                if remaining==0: return self.json({"error":"At least one active Super Administrator is required"},409)
+            if requested_profiles is not None:
+                if not resulting_profiles: return self.json({"error":"At least one RBAC profile is required"},400)
+                with db() as conn: valid={r[0] for r in conn.execute("SELECT id FROM rbac_profiles WHERE id IN (%s)"%",".join("?"*len(resulting_profiles)),tuple(resulting_profiles)).fetchall()}
+                if valid!=resulting_profiles: return self.json({"error":"Unknown RBAC profile"},400)
+                fields.append("role=?"); values.append("admin" if "super_admin" in resulting_profiles else "user")
             if "active" in body: fields.append("active=?"); values.append(1 if body["active"] else 0)
             if body.get("password"):
                 if len(str(body["password"]))<8: return self.json({"error":"Password is too short"},400)
                 fields.append("password_hash=?"); values.append(password_hash(str(body["password"])))
-            if not fields: return self.json({"error":"No changes supplied"},400)
-            with db() as conn: conn.execute(f"UPDATE users SET {','.join(fields)} WHERE id=?",(*values,uid))
+            if not fields and requested_profiles is None: return self.json({"error":"No changes supplied"},400)
+            with db() as conn:
+                if fields: conn.execute(f"UPDATE users SET {','.join(fields)} WHERE id=?",(*values,uid))
+                if requested_profiles is not None:
+                    conn.execute("DELETE FROM user_profiles WHERE user_id=?",(uid,))
+                    for profile in resulting_profiles: conn.execute("INSERT INTO user_profiles VALUES(?,?)",(uid,profile))
             return self.json({"ok":True})
         if self.path=="/api/admin/settings":
             allowed=bool(body.get("users_can_choose_execution_mode"))
@@ -901,7 +1008,7 @@ class Handler(SimpleHTTPRequestHandler):
                   "action":"Use Auto-detect and load local models in Model Plane."},409)
             wid=create_workflow(objective,user["id"]); start_workflow(wid); return self.json({"id":wid},201)
         if self.path=="/api/execution-mode":
-            if user["role"]!="admin" and not setting_bool("users_can_choose_execution_mode"): return self.deny(403,"Execution mode selection is disabled by the administrator")
+            if "settings.manage" not in user["permissions"] and not setting_bool("users_can_choose_execution_mode"): return self.deny(403,"Execution mode selection is disabled by the administrator")
             mode=str(body.get("mode","")).lower()
             if mode not in ("sandbox","local"): return self.json({"error":"Invalid mode"},400)
             EXECUTION_MODE=mode; return self.json({"mode":mode,"warning":"Unisolated local execution" if mode=="local" else None})

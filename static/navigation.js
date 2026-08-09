@@ -26,7 +26,9 @@
   const language = () => window.skeinI18n?.language === "fr" ? "fr" : "en";
   const text = key => labels[language()][key];
   let activeView = "execution";
-  let role = "user";
+  let administrationAccess = false;
+  let executionAccess = false;
+  let historyAccess = false;
   let activeWorkflowSection;
   let lowerSection;
   let intro;
@@ -37,7 +39,9 @@
     administration: [document.querySelector(".admin-panel"), document.querySelector(".runtime-gate"), document.querySelector(".hardware"), document.querySelector(".model-control")],
   });
   const activate = view => {
-    if (view === "administration" && role !== "admin") view = "execution";
+    if (view === "administration" && !administrationAccess) view = executionAccess ? "execution" : "history";
+    if (view === "execution" && !executionAccess) view = historyAccess ? "history" : "administration";
+    if (view === "history" && !historyAccess) view = executionAccess ? "execution" : "administration";
     activeView = view;
     document.body.classList.toggle("history-view", view === "history");
     Object.values(sections()).flat().filter(Boolean).forEach(section => section.classList.add("view-section-hidden"));
@@ -49,18 +53,20 @@
   };
   window.skeinNavigation = {
     init(session) {
-      role = session.user.role;
+      administrationAccess = session.user.permissions.some(permission => ["users.manage","settings.manage","models.manage","server_stats.read"].includes(permission));
+      executionAccess = session.user.permissions.includes("workflows.execute");
+      historyAccess = session.user.permissions.some(permission => ["workflows.read_own","workflows.read_all"].includes(permission));
       activeWorkflowSection = document.querySelector("#title")?.closest(".workspace");
       lowerSection = document.querySelector(".lower");
       const navigation = document.createElement("nav");
       navigation.className = "main-navigation";
-      navigation.innerHTML = `<button data-main-view="execution">${text("execution")}</button><button data-main-view="history">${text("history")}</button>${role === "admin" ? `<button data-main-view="administration">${text("administration")}</button>` : ""}`;
+      navigation.innerHTML = `${executionAccess?`<button data-main-view="execution">${text("execution")}</button>`:""}${historyAccess?`<button data-main-view="history">${text("history")}</button>`:""}${administrationAccess ? `<button data-main-view="administration">${text("administration")}</button>` : ""}`;
       document.querySelector("header").after(navigation);
       intro = document.createElement("section"); intro.className = "view-intro"; document.querySelector("main").prepend(intro);
       navigation.querySelectorAll("button").forEach(button => button.onclick = () => activate(button.dataset.mainView));
       lowerSection?.addEventListener("click", event => { if (event.target.closest(".run")) setTimeout(() => activate("history"), 0); });
       const requested = location.hash.slice(1);
-      activate(["execution", "history", "administration"].includes(requested) ? requested : "execution");
+      activate(["execution", "history", "administration"].includes(requested) ? requested : (executionAccess?"execution":historyAccess?"history":"administration"));
     },
     show(view) { activate(view); },
   };
