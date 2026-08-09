@@ -29,6 +29,7 @@ Development commits are protected by the checks documented in [CONTRIBUTING.md](
 ## Navigation
 
 - **Execution** contains workflow creation, the sandbox/local tool plane, the active DAG, step outputs, metrics, and deliverables.
+- The workflow library in **Execution** supports validated defaults, owned workflows, sharing, editing, deletion, automatic selection, and reasoner-generated proposals. **Generate workflow** only creates a reviewable proposal; **Execute prompt** is the separate action that starts a run.
 - **History** contains recent runs and the event stream. Selecting a run displays its complete report and artifacts without returning to the workflow launcher.
 - **Administration** contains access control, execution policy, GPU pools, telemetry, model selection, and runtime controls. This tab is rendered only for administrators.
 
