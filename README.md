@@ -2,6 +2,10 @@
 
 Skein is a local, GPU-aware multi-agent workflow orchestrator. It separates reasoning and worker roles, routes tasks to real local models, exposes task outputs and project artifacts, and can execute generated code either in isolated Docker sandboxes or directly on the host.
 
+## Engineering policy
+
+Skein favors mature, actively maintained libraries over custom security, protocol, parsing, and persistence code. Dependencies are selected for maintenance health, tests, documentation, license compatibility, supply-chain cost, and safe upgrade paths. Framework migrations remain incremental and test-backed so that existing users, workflows, and artifacts continue to work. See [DEPENDENCY_POLICY.md](DEPENDENCY_POLICY.md) for the selection checklist and current adoption roadmap.
+
 ## Highlights
 
 - NVIDIA GPU discovery, utilization, VRAM, temperature, and power telemetry.

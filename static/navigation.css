@@ -4,5 +4,5 @@
 .view-section-hidden{display:none!important}
 .view-intro{margin:26px 0 10px;padding:18px;border:1px solid var(--line);background:var(--panel)}
 .view-intro h2{margin:0 0 5px}.view-intro p{margin:0;color:var(--muted)}
-.history-view .lower{grid-template-columns:1fr}.history-view .lower>div:first-child{order:2}.history-view .lower>div:last-child{order:1}
+.history-view .lower{grid-template-columns:1fr;order:1}.history-view .workspace{order:2}.history-view .lower>div:first-child{order:2}.history-view .lower>div:last-child{order:1}
 @media(max-width:700px){.main-navigation{top:58px;overflow:auto}.main-navigation button{flex:1;padding:9px}}
