@@ -61,4 +61,6 @@ The shell defines shared colors, spacing, radii, borders, and shadows in `static
 
 Static interface copy uses English canonical markup with explicit `data-i18n`, `data-i18n-placeholder`, or `data-i18n-value` keys. Dynamic components call the same translation service directly. DOM text scanning remains only as a compatibility bridge for older workflow-result templates and should not be used for new interface copy.
 
+Workflow history dates follow the selected locale. Dynamic workflow metrics, GPU/model controls, result summaries, artifact actions, execution warnings, error contexts, and Markdown viewer controls use catalog keys rather than language-specific strings in feature code. Result grids set explicit minimum-width and wrapping constraints so long model output cannot expand the application canvas.
+
 Future framework adoption should replace the current incremental DOM scripts only when it brings typed components, reliable state management, testability, and an accessible component system without blocking the working prototype.
