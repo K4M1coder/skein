@@ -37,6 +37,8 @@ Skein uses composable RBAC profiles rather than a single hard-coded administrato
 
 Backend permissions are `users.manage`, `settings.manage`, `models.manage`, `workflows.execute`, `workflows.read_own`, `workflows.read_all`, and `server_stats.read`. UI visibility follows the same server-issued permission list; hiding a control is never the authorization boundary.
 
+Registration and email verification add `users.verify` and `email.manage` permissions. The default User Manager can manually approve pending registrations; the default Settings Manager can configure and test SMTP delivery.
+
 Administrators can:
 
 - manage users and roles;
@@ -47,6 +49,19 @@ Administrators can:
 Standard users can create and inspect only their own workflows. They cannot change models or system settings. Local/Sandbox selection is available only when enabled by an administrator.
 
 The server statistics endpoint (`GET /api/server-stats`) exposes dated request-step metadata: anonymized request reference, model, role, status, token counts, tokens/s, duration, average/peak watts, and estimated Wh. It deliberately excludes objectives, prompts, usernames, user IDs, results, deliverables, and artifacts. The request reference is a truncated SHA-256 digest and cannot be used to retrieve workflow content through the statistics API.
+
+## Registration and email verification
+
+Public registration requires a unique username, unique email address, and a password of at least eight characters. A new account receives the Workflow Operator profile but has no effective permissions until its email is verified.
+
+- Verification codes contain six digits, expire after ten minutes, and are stored only as salted PBKDF2-SHA256 hashes.
+- Successful verification consumes the code atomically; it cannot be reused.
+- Sending a new code invalidates every previous code immediately.
+- Resends are limited to one per minute, invalid verification attempts are limited to five per code, and registration attempts are rate-limited per client address.
+- An authorized User Manager can approve a pending account manually. Manual approval invalidates all outstanding codes.
+- Pending accounts can only inspect their verification state, submit a code, request a resend, or sign out. Every workflow and administration endpoint rejects them.
+
+Configure outbound mail under **Administration → Outbound email server**. Supported transport modes are STARTTLS, implicit SSL/TLS, and plain SMTP. On Windows, the SMTP password is encrypted with the current account's DPAPI key before being stored; the API never returns it. On other platforms, set `SKEIN_SMTP_PASSWORD` instead of persisting the password. Use **Send test email** to verify the connection before enabling user onboarding.
 
 On the first start, Skein creates a bootstrap administrator. Configure it before that first start:
 

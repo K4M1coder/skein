@@ -53,7 +53,7 @@
   };
   window.skeinNavigation = {
     init(session) {
-      administrationAccess = session.user.permissions.some(permission => ["users.manage","settings.manage","models.manage","server_stats.read"].includes(permission));
+      administrationAccess = session.user.permissions.some(permission => ["users.manage","users.verify","settings.manage","email.manage","models.manage","server_stats.read"].includes(permission));
       executionAccess = session.user.permissions.includes("workflows.execute");
       historyAccess = session.user.permissions.some(permission => ["workflows.read_own","workflows.read_all"].includes(permission));
       activeWorkflowSection = document.querySelector("#title")?.closest(".workspace");

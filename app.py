@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import csv, io, json, mimetypes, os, shlex, shutil, sqlite3, subprocess, sys, tempfile, threading, time, uuid, zipfile, hashlib, hmac, secrets
+import base64, csv, ctypes, io, json, mimetypes, os, re, shlex, shutil, sqlite3, subprocess, sys, tempfile, threading, time, uuid, zipfile, hashlib, hmac, secrets, smtplib, ssl
+from email.message import EmailMessage
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -82,6 +83,11 @@ def init_db():
           profile_id TEXT NOT NULL, permission_id TEXT NOT NULL, PRIMARY KEY(profile_id,permission_id));
         CREATE TABLE IF NOT EXISTS user_profiles(
           user_id TEXT NOT NULL, profile_id TEXT NOT NULL, PRIMARY KEY(user_id,profile_id));
+        CREATE TABLE IF NOT EXISTS email_verification_codes(
+          id TEXT PRIMARY KEY, user_id TEXT NOT NULL, code_hash TEXT NOT NULL,
+          expires_at REAL NOT NULL, used_at REAL, attempts INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS auth_rate_limits(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, subject TEXT NOT NULL, created_at REAL NOT NULL);
         """
     try:
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -94,13 +100,18 @@ def init_db():
     with db() as conn:
         columns={r[1] for r in conn.execute("PRAGMA table_info(workflows)")}
         if "owner_id" not in columns: conn.execute("ALTER TABLE workflows ADD COLUMN owner_id TEXT")
+        user_columns={r[1] for r in conn.execute("PRAGMA table_info(users)")}
+        if "email" not in user_columns: conn.execute("ALTER TABLE users ADD COLUMN email TEXT")
+        if "verified_at" not in user_columns: conn.execute("ALTER TABLE users ADD COLUMN verified_at REAL")
+        conn.execute("UPDATE users SET verified_at=created_at WHERE verified_at IS NULL AND email IS NULL")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_email_unique ON users(email) WHERE email IS NOT NULL")
         conn.execute("INSERT OR IGNORE INTO pools VALUES('reasoner','Reasoner','reasoner','#78a7ff')")
         conn.execute("INSERT OR IGNORE INTO pools VALUES('workers','Workers','worker','#ffb44c')")
         conn.execute("INSERT OR IGNORE INTO pools VALUES('retrieval','Retrieval','service','#b9f45c')")
         conn.execute("INSERT OR IGNORE INTO settings VALUES('users_can_choose_execution_mode','false')")
         if not conn.execute("SELECT 1 FROM users").fetchone():
             username=os.getenv("SKEIN_ADMIN_USER","admin"); password=os.getenv("SKEIN_ADMIN_PASSWORD","admin")
-            conn.execute("INSERT INTO users VALUES(?,?,?,?,?,?)",(str(uuid.uuid4()),username,password_hash(password),"admin",1,stamp()))
+            created=stamp(); conn.execute("INSERT INTO users(id,username,password_hash,role,active,created_at,email,verified_at) VALUES(?,?,?,?,?,?,?,?)",(str(uuid.uuid4()),username,password_hash(password),"admin",1,created,None,created))
         permissions={
           "users.manage":"Create, update, activate, and assign profiles to users",
           "settings.manage":"Manage execution policy, GPU pools, and the application stack",
@@ -109,12 +120,14 @@ def init_db():
           "workflows.read_own":"Read workflows owned by the current user",
           "workflows.read_all":"Read all workflow reports and deliverables",
           "server_stats.read":"Read privacy-preserving server and inference statistics",
+          "email.manage":"Configure and test the outbound SMTP server",
+          "users.verify":"Manually approve pending user registrations",
         }
         for pid,description in permissions.items(): conn.execute("INSERT OR IGNORE INTO rbac_permissions VALUES(?,?)",(pid,description))
         profiles={
           "super_admin":("Super Administrator","Full access to all Skein capabilities",list(permissions)),
-          "user_manager":("User Manager","Manage users and RBAC profile assignments",["users.manage"]),
-          "settings_manager":("Settings Manager","Manage execution policy, GPU pools, and stack controls",["settings.manage"]),
+          "user_manager":("User Manager","Manage users, profile assignments, and account verification",["users.manage","users.verify"]),
+          "settings_manager":("Settings Manager","Manage execution policy, GPU pools, stack controls, and SMTP",["settings.manage","email.manage"]),
           "model_manager":("Model Manager","Manage model registry and runtimes",["models.manage","server_stats.read"]),
           "workflow_operator":("Workflow Operator","Execute and inspect owned workflows",["workflows.execute","workflows.read_own"]),
           "stats_auditor":("Statistics Auditor","Read anonymized operational statistics only",["server_stats.read"]),
@@ -151,6 +164,106 @@ def access_for_user(user_id):
         profiles=[dict(r) for r in conn.execute("SELECT p.id,p.name,p.description FROM rbac_profiles p JOIN user_profiles up ON up.profile_id=p.id WHERE up.user_id=? ORDER BY p.name",(user_id,)).fetchall()]
         permissions=[r[0] for r in conn.execute("SELECT DISTINCT pp.permission_id FROM rbac_profile_permissions pp JOIN user_profiles up ON up.profile_id=pp.profile_id WHERE up.user_id=? ORDER BY pp.permission_id",(user_id,)).fetchall()]
     return profiles,permissions
+
+
+def protect_secret(value):
+    if not value: return ""
+    if os.name!="nt": return "env:SKEIN_SMTP_PASSWORD"
+    class Blob(ctypes.Structure): _fields_=[("size",ctypes.c_ulong),("data",ctypes.POINTER(ctypes.c_byte))]
+    raw=value.encode("utf-8"); buffer=ctypes.create_string_buffer(raw); source=Blob(len(raw),ctypes.cast(buffer,ctypes.POINTER(ctypes.c_byte))); target=Blob()
+    if not ctypes.windll.crypt32.CryptProtectData(ctypes.byref(source),"Skein SMTP",None,None,None,0,ctypes.byref(target)):
+        raise RuntimeError("Windows DPAPI could not protect the SMTP password")
+    try: encrypted=ctypes.string_at(target.data,target.size)
+    finally: ctypes.windll.kernel32.LocalFree(target.data)
+    return "dpapi:"+base64.b64encode(encrypted).decode("ascii")
+
+
+def unprotect_secret(value):
+    if not value: return os.getenv("SKEIN_SMTP_PASSWORD","")
+    if value.startswith("env:"): return os.getenv(value[4:],"")
+    if not value.startswith("dpapi:") or os.name!="nt": return ""
+    class Blob(ctypes.Structure): _fields_=[("size",ctypes.c_ulong),("data",ctypes.POINTER(ctypes.c_byte))]
+    raw=base64.b64decode(value[6:]); buffer=ctypes.create_string_buffer(raw); source=Blob(len(raw),ctypes.cast(buffer,ctypes.POINTER(ctypes.c_byte))); target=Blob()
+    if not ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(source),None,None,None,None,0,ctypes.byref(target)):
+        raise RuntimeError("Windows DPAPI could not unlock the SMTP password")
+    try: decrypted=ctypes.string_at(target.data,target.size)
+    finally: ctypes.windll.kernel32.LocalFree(target.data)
+    return decrypted.decode("utf-8")
+
+
+def smtp_configuration(include_password=False):
+    keys=("smtp_host","smtp_port","smtp_username","smtp_password","smtp_from","smtp_security")
+    with db() as conn: values={r["key"]:r["value"] for r in conn.execute("SELECT key,value FROM settings WHERE key IN (%s)"%",".join("?"*len(keys)),keys)}
+    config={"host":values.get("smtp_host",""),"port":int(values.get("smtp_port","587")),"username":values.get("smtp_username",""),
+      "from_address":values.get("smtp_from",""),"security":values.get("smtp_security","starttls"),"configured":bool(values.get("smtp_host") and values.get("smtp_from"))}
+    if include_password: config["password"]=unprotect_secret(values.get("smtp_password",""))
+    return config
+
+
+def send_email(recipient,subject,text_body):
+    config=smtp_configuration(True)
+    if not config["configured"]: raise RuntimeError("SMTP server is not configured")
+    message=EmailMessage(); message["From"]=config["from_address"]; message["To"]=recipient; message["Subject"]=subject; message.set_content(text_body)
+    context=ssl.create_default_context()
+    if config["security"]=="ssl": server=smtplib.SMTP_SSL(config["host"],config["port"],timeout=15,context=context)
+    else:
+        server=smtplib.SMTP(config["host"],config["port"],timeout=15)
+        if config["security"]=="starttls": server.starttls(context=context)
+    try:
+        if config["username"]: server.login(config["username"],config["password"])
+        server.send_message(message)
+    finally: server.quit()
+
+
+def issue_verification_code(user_id,language="en",force=False):
+    now=stamp()
+    with db() as conn:
+        user=conn.execute("SELECT id,username,email,verified_at,active FROM users WHERE id=?",(user_id,)).fetchone()
+        latest=conn.execute("SELECT created_at FROM email_verification_codes WHERE user_id=? ORDER BY created_at DESC LIMIT 1",(user_id,)).fetchone()
+    if not user or not user["active"]: return {"error":"Account not found or inactive"},404
+    if user["verified_at"]: return {"error":"Account is already verified"},409
+    if not user["email"]: return {"error":"No email address is associated with this account"},400
+    if latest and not force and now-latest["created_at"]<60: return {"error":"Please wait before requesting another code","retry_after_seconds":round(60-(now-latest["created_at"]))},429
+    code=f"{secrets.randbelow(1_000_000):06d}"; code_id=str(uuid.uuid4())
+    with db() as conn:
+        conn.execute("UPDATE email_verification_codes SET used_at=? WHERE user_id=? AND used_at IS NULL",(now,user_id))
+        conn.execute("INSERT INTO email_verification_codes VALUES(?,?,?,?,?,?,?)",(code_id,user_id,password_hash(code),now+600,None,0,now))
+    french=str(language).lower().startswith("fr")
+    subject="Votre code de vérification Skein" if french else "Your Skein verification code"
+    body=(f"Bonjour {user['username']},\n\nVotre code Skein est : {code}\n\nIl expire dans 10 minutes et ne peut être utilisé qu'une seule fois."
+      if french else f"Hello {user['username']},\n\nYour Skein code is: {code}\n\nIt expires in 10 minutes and can be used only once.")
+    try: send_email(user["email"],subject,body)
+    except Exception as exc: return {"error":"Verification email could not be sent","details":str(exc),"registration_pending":True},503
+    return {"sent":True,"expires_in_seconds":600,"resend_after_seconds":60,"email_hint":user["email"][:2]+"***@"+user["email"].split("@")[-1]},200
+
+
+def verify_user_code(user_id,code):
+    now=stamp()
+    with db() as conn: rows=conn.execute("SELECT * FROM email_verification_codes WHERE user_id=? AND used_at IS NULL ORDER BY created_at DESC",(user_id,)).fetchall()
+    if not rows: return {"error":"No active verification code"},400
+    current=rows[0]
+    if current["expires_at"]<now:
+        with db() as conn: conn.execute("UPDATE email_verification_codes SET used_at=? WHERE id=?",(now,current["id"]))
+        return {"error":"Verification code expired"},410
+    if current["attempts"]>=5: return {"error":"Too many invalid attempts; request a new code"},429
+    if not password_valid(str(code).strip(),current["code_hash"]):
+        with db() as conn: conn.execute("UPDATE email_verification_codes SET attempts=attempts+1 WHERE id=?",(current["id"],))
+        return {"error":"Invalid verification code","attempts_remaining":max(0,4-current["attempts"])},400
+    with db() as conn:
+        changed=conn.execute("UPDATE email_verification_codes SET used_at=? WHERE id=? AND used_at IS NULL",(now,current["id"])).rowcount
+        if changed!=1: return {"error":"Verification code was already used"},409
+        conn.execute("UPDATE users SET verified_at=? WHERE id=? AND verified_at IS NULL",(now,user_id))
+    return {"verified":True},200
+
+
+def consume_rate_limit(action,subject,limit,window_seconds):
+    now=stamp()
+    with db() as conn:
+        conn.execute("DELETE FROM auth_rate_limits WHERE created_at<?",(now-max(window_seconds,86400),))
+        count=conn.execute("SELECT COUNT(*) FROM auth_rate_limits WHERE action=? AND subject=? AND created_at>?",(action,subject,now-window_seconds)).fetchone()[0]
+        if count>=limit: return False
+        conn.execute("INSERT INTO auth_rate_limits(action,subject,created_at) VALUES(?,?,?)",(action,subject,now))
+    return True
 
 
 def discover_local_models():
@@ -775,7 +888,7 @@ def privacy_safe_server_stats(limit=200):
           "peak_power_w":float(metrics.get("peak_power_w") or 0),"energy_wh":float(metrics.get("energy_wh") or 0),
         })
     total_duration=sum(r["duration_seconds"] for r in requests); total_completion=sum(r["completion_tokens"] for r in requests)
-    return {"privacy":{"content_excluded":True,"excluded_fields":["objective","prompt","result","deliverable","artifacts","username","user_id"],"request_reference":"SHA-256 workflow identifier truncated to 12 characters"},
+    return {"privacy":{"content_excluded":True,"excluded_fields":["objective","prompt","result","deliverable","artifacts","username","user_id","email"],"request_reference":"SHA-256 workflow identifier truncated to 12 characters"},
       "summary":{"request_steps":len(requests),"total_tokens":sum(r["total_tokens"] for r in requests),"total_duration_seconds":round(total_duration,3),
         "average_tokens_per_second":round(total_completion/total_duration,2) if total_duration else 0,"energy_wh":round(sum(r["energy_wh"] for r in requests),4),
         "average_power_w":round(sum(r["average_power_w"]*r["duration_seconds"] for r in requests)/total_duration,2) if total_duration else 0},
@@ -808,19 +921,21 @@ class Handler(SimpleHTTPRequestHandler):
         token=self.cookie("skein_session")
         if not token: return None
         with db() as conn:
-            row=conn.execute("SELECT u.id,u.username,u.role,u.active FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires_at>?",(token,stamp())).fetchone()
+            row=conn.execute("SELECT u.id,u.username,u.email,u.verified_at,u.role,u.active FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires_at>?",(token,stamp())).fetchone()
         if not row or not row["active"]: return None
-        user=dict(row); user["profiles"],user["permissions"]=access_for_user(user["id"]); return user
+        user=dict(row); user["verified"]=bool(user.pop("verified_at")); user["profiles"],grants=access_for_user(user["id"]); user["permissions"]=grants if user["verified"] else []; return user
     def deny(self,status=401,message="Authentication required"):
         return self.json({"error":message,"action":"Sign in with an authorized account."},status)
     def authorize(self,permission=None):
         user=self.current_user()
         if not user: self.deny(); return None
+        if not user.get("verified",True): self.deny(403,"Email verification required"); return None
         if permission and permission not in user["permissions"]: self.deny(403,f"Permission required: {permission}"); return None
         return user
     def authorize_any(self,*permissions):
         user=self.current_user()
         if not user: self.deny(); return None
+        if not user.get("verified",True): self.deny(403,"Email verification required"); return None
         if permissions and not any(permission in user["permissions"] for permission in permissions):
             self.deny(403,"One of these permissions is required: "+", ".join(permissions)); return None
         return user
@@ -836,10 +951,12 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         if self.path=="/api/health": return self.json({"status":"ok","active":len(ACTIVE),"database":str(DB_PATH),"execution_mode":EXECUTION_MODE,"active_models":ACTIVE_ENDPOINTS,"backends":{"worker":bool(os.getenv("SKEIN_WORKER_URL") or ACTIVE_ENDPOINTS.get("worker")),"reasoner":bool(os.getenv("SKEIN_REASONER_URL") or ACTIVE_ENDPOINTS.get("reasoner"))}})
         if self.path=="/api/auth/me":
-            user=self.authorize()
-            return self.json({"user":user,"policy":{"users_can_choose_execution_mode":setting_bool("users_can_choose_execution_mode")}}) if user else None
+            user=self.current_user()
+            if not user: return self.deny()
+            return self.json({"user":user,"policy":{"users_can_choose_execution_mode":setting_bool("users_can_choose_execution_mode")}})
         if self.path.startswith("/api/"):
             if self.path in ("/api/users","/api/rbac/profiles"): user=self.authorize("users.manage")
+            elif self.path=="/api/admin/email": user=self.authorize("email.manage")
             elif self.path=="/api/admin/settings": user=self.authorize("settings.manage")
             elif self.path=="/api/models": user=self.authorize("models.manage")
             elif self.path=="/api/hardware": user=self.authorize_any("server_stats.read","settings.manage","models.manage")
@@ -856,10 +973,10 @@ class Handler(SimpleHTTPRequestHandler):
                 with db() as conn: row=conn.execute("SELECT workflow_id FROM artifacts WHERE id=?",(aid,)).fetchone()
                 if not row or not self.workflow_allowed(user,row["workflow_id"]): return self.deny(403,"Artifact access denied")
         if self.path=="/api/users":
-            with db() as conn: rows=conn.execute("SELECT id,username,role,active,created_at FROM users ORDER BY username").fetchall()
+            with db() as conn: rows=conn.execute("SELECT id,username,email,verified_at,role,active,created_at FROM users ORDER BY username").fetchall()
             result=[]
             for row in rows:
-                item=dict(row); item["profiles"],item["permissions"]=access_for_user(item["id"]); result.append(item)
+                item=dict(row); item["verified"]=bool(item.pop("verified_at")); item["profiles"],item["permissions"]=access_for_user(item["id"]); result.append(item)
             return self.json(result)
         if self.path=="/api/rbac/profiles":
             with db() as conn:
@@ -868,6 +985,8 @@ class Handler(SimpleHTTPRequestHandler):
             for grant in grants: by_profile.setdefault(grant["profile_id"],[]).append(grant["permission_id"])
             return self.json([{**dict(row),"permissions":by_profile.get(row["id"],[])} for row in rows])
         if self.path=="/api/admin/settings": return self.json({"users_can_choose_execution_mode":setting_bool("users_can_choose_execution_mode")})
+        if self.path=="/api/admin/email":
+            config=smtp_configuration(); return self.json(config)
         if self.path=="/api/server-stats": return self.json(privacy_safe_server_stats())
         if self.path=="/api/sandbox/capabilities": return self.json({"mode":EXECUTION_MODE,"runtimes":sandbox_capabilities()})
         if self.path=="/api/execution-mode": return self.json({"mode":EXECUTION_MODE,"warning":"Local mode runs on the host without isolation." if EXECUTION_MODE=="local" else None})
@@ -928,6 +1047,22 @@ class Handler(SimpleHTTPRequestHandler):
         global EXECUTION_MODE
         try: body=json.loads(self.rfile.read(int(self.headers.get("Content-Length",0))) or b"{}")
         except json.JSONDecodeError: return self.json({"error":"JSON invalide"},400)
+        if self.path=="/api/auth/register":
+            remote=self.client_address[0]
+            if not consume_rate_limit("register",remote,5,600): return self.json({"error":"Too many registration attempts; try again later"},429)
+            username=str(body.get("username","")).strip(); email=str(body.get("email","")).strip().lower(); password=str(body.get("password","")); language=str(body.get("language","en"))
+            if len(username)<3 or len(password)<8 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+",email): return self.json({"error":"Valid email, username of 3+ characters, and password of 8+ characters are required"},400)
+            uid=str(uuid.uuid4()); created=stamp()
+            try:
+                with db() as conn:
+                    conn.execute("INSERT INTO users(id,username,password_hash,role,active,created_at,email,verified_at) VALUES(?,?,?,?,?,?,?,NULL)",(uid,username,password_hash(password),"user",1,created,email))
+                    conn.execute("INSERT INTO user_profiles VALUES(?,?)",(uid,"workflow_operator"))
+            except sqlite3.IntegrityError: return self.json({"error":"Username or email already registered"},409)
+            delivery,status=issue_verification_code(uid,language,True)
+            response={"registered":True,"verification_required":True,"email_sent":status==200,"expires_in_seconds":600}
+            if status==200: response.update(delivery)
+            else: response["message"]="Account created, but email delivery failed. Retry later or ask an authorized user manager for manual approval."
+            return self.json(response,201)
         if self.path=="/api/auth/login":
             username=str(body.get("username","")).strip(); password=str(body.get("password",""))
             with db() as conn: row=conn.execute("SELECT * FROM users WHERE username=? COLLATE NOCASE",(username,)).fetchone()
@@ -936,7 +1071,14 @@ class Handler(SimpleHTTPRequestHandler):
             with db() as conn:
                 conn.execute("DELETE FROM sessions WHERE expires_at<=?",(stamp(),)); conn.execute("INSERT INTO sessions VALUES(?,?,?,?)",(token,row["id"],stamp()+43200,stamp()))
             profiles,permissions=access_for_user(row["id"])
-            return self.send_session({"id":row["id"],"username":row["username"],"role":row["role"],"profiles":profiles,"permissions":permissions},token)
+            verified=bool(row["verified_at"])
+            return self.send_session({"id":row["id"],"username":row["username"],"email":row["email"],"verified":verified,"role":row["role"],"profiles":profiles,"permissions":permissions if verified else []},token)
+        if self.path in ("/api/auth/verify","/api/auth/resend"):
+            user=self.current_user()
+            if not user: return self.deny()
+            if self.path.endswith("/verify"):
+                result,status=verify_user_code(user["id"],str(body.get("code",""))); return self.json(result,status)
+            result,status=issue_verification_code(user["id"],str(body.get("language","en"))); return self.json(result,status)
         if self.path=="/api/auth/logout":
             token=self.cookie("skein_session")
             if token:
@@ -944,6 +1086,7 @@ class Handler(SimpleHTTPRequestHandler):
             raw=b'{"ok":true}'; self.send_response(200); self.send_header("Content-Type","application/json"); self.send_header("Set-Cookie","skein_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"); self.send_header("Content-Length",str(len(raw))); self.end_headers(); return self.wfile.write(raw)
         if self.path.startswith("/api/models"): user=self.authorize("models.manage")
         elif self.path.startswith("/api/users") or self.path.startswith("/api/rbac"): user=self.authorize("users.manage")
+        elif self.path.startswith("/api/admin/email"): user=self.authorize("email.manage")
         elif self.path.startswith(("/api/pools","/api/gpus","/api/stack","/api/admin")): user=self.authorize("settings.manage")
         elif self.path=="/api/workflows" or self.path.endswith("/run") or self.path.endswith("/execute") or self.path.endswith("/command"): user=self.authorize("workflows.execute")
         else: user=self.authorize()
@@ -965,10 +1108,17 @@ class Handler(SimpleHTTPRequestHandler):
             try:
                 uid=str(uuid.uuid4())
                 with db() as conn:
-                    conn.execute("INSERT INTO users VALUES(?,?,?,?,?,?)",(uid,username,password_hash(password),role,1,stamp()))
+                    created=stamp(); conn.execute("INSERT INTO users(id,username,password_hash,role,active,created_at,email,verified_at) VALUES(?,?,?,?,?,?,?,?)",(uid,username,password_hash(password),role,1,created,body.get("email") or None,created))
                     for profile in profiles: conn.execute("INSERT INTO user_profiles VALUES(?,?)",(uid,profile))
                 assigned,_=access_for_user(uid); return self.json({"id":uid,"username":username,"role":role,"active":1,"profiles":assigned},201)
             except sqlite3.IntegrityError: return self.json({"error":"This username already exists"},409)
+        if self.path.startswith("/api/users/") and self.path.endswith("/approve"):
+            if "users.verify" not in user["permissions"]: return self.deny(403,"Permission required: users.verify")
+            uid=self.path.split("/")[-2]; now=stamp()
+            with db() as conn:
+                changed=conn.execute("UPDATE users SET verified_at=? WHERE id=? AND verified_at IS NULL",(now,uid)).rowcount
+                conn.execute("UPDATE email_verification_codes SET used_at=? WHERE user_id=? AND used_at IS NULL",(now,uid))
+            return self.json({"verified":True,"changed":bool(changed)})
         if self.path.startswith("/api/users/"):
             uid=self.path.rsplit("/",1)[-1]; fields=[]; values=[]
             with db() as conn: existing=conn.execute("SELECT role,active FROM users WHERE id=?",(uid,)).fetchone()
@@ -999,6 +1149,20 @@ class Handler(SimpleHTTPRequestHandler):
             allowed=bool(body.get("users_can_choose_execution_mode"))
             with db() as conn: conn.execute("INSERT INTO settings VALUES('users_can_choose_execution_mode',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",("true" if allowed else "false",))
             return self.json({"users_can_choose_execution_mode":allowed})
+        if self.path=="/api/admin/email":
+            host=str(body.get("host","")).strip(); from_address=str(body.get("from_address","")).strip(); security=str(body.get("security","starttls"))
+            if not host or not from_address or security not in ("starttls","ssl","plain"): return self.json({"error":"SMTP host, sender address, and valid security mode are required"},400)
+            values={"smtp_host":host,"smtp_port":str(int(body.get("port",587))),"smtp_username":str(body.get("username","")).strip(),"smtp_from":from_address,"smtp_security":security}
+            if body.get("password"): values["smtp_password"]=protect_secret(str(body["password"]))
+            with db() as conn:
+                for key,value in values.items(): conn.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(key,value))
+            return self.json(smtp_configuration())
+        if self.path=="/api/admin/email/test":
+            recipient=str(body.get("recipient","")).strip()
+            if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+",recipient): return self.json({"error":"Valid recipient email required"},400)
+            try: send_email(recipient,"Skein SMTP test","Your Skein SMTP configuration is working.")
+            except Exception as exc: return self.json({"error":"SMTP test failed","details":str(exc)},502)
+            return self.json({"sent":True})
         if self.path=="/api/workflows":
             objective=str(body.get("objective","")).strip()
             if len(objective)<5: return self.json({"error":"Objective is too short"},400)

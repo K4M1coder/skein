@@ -135,9 +135,22 @@ class AuthTest(unittest.TestCase):
         self.request(admin, "/api/users", {"username": "settings-manager", "password": "settings-password", "profiles": ["settings_manager"]})
         settings_manager = self.client()
         _, settings_session = self.request(settings_manager, "/api/auth/login", {"username": "settings-manager", "password": "settings-password"})
-        self.assertEqual(settings_session["user"]["permissions"], ["settings.manage"])
+        self.assertCountEqual(settings_session["user"]["permissions"], ["email.manage", "settings.manage"])
         _, current_settings = self.request(settings_manager, "/api/admin/settings")
         self.assertIn("users_can_choose_execution_mode", current_settings)
+        _, smtp = self.request(settings_manager, "/api/admin/email", {"host": "smtp.example.test", "port": 587, "security": "starttls", "username": "mailer", "password": "smtp-test-secret", "from_address": "skein@example.test"})
+        self.assertTrue(smtp["configured"])
+        self.assertNotIn("password", smtp)
+        self.assertEqual(app.smtp_configuration(True)["password"], "smtp-test-secret")
+        sent = []
+        original_sender = app.send_email
+        app.send_email = lambda recipient, subject, body: sent.append(recipient)
+        try:
+            _, test_delivery = self.request(settings_manager, "/api/admin/email/test", {"recipient": "admin@example.test"})
+            self.assertTrue(test_delivery["sent"])
+            self.assertEqual(sent, ["admin@example.test"])
+        finally:
+            app.send_email = original_sender
         with self.assertRaises(HTTPError) as settings_models_denied:
             self.request(settings_manager, "/api/models")
         self.assertEqual(settings_models_denied.exception.code, 403)
@@ -158,6 +171,66 @@ class AuthTest(unittest.TestCase):
         with self.assertRaises(HTTPError) as last_super_admin:
             self.request(admin, f"/api/users/{admin_id}", {"profiles": ["user_manager"]})
         self.assertEqual(last_super_admin.exception.code, 409)
+
+    def test_registration_email_code_lifecycle_and_manual_approval(self):
+        delivered = []
+        original_sender = app.send_email
+        app.send_email = lambda recipient, subject, body: delivered.append({"recipient": recipient, "subject": subject, "body": body})
+        try:
+            anonymous = self.client()
+            status, registered = self.request(anonymous, "/api/auth/register", {"username": "pending-user", "email": "pending@example.test", "password": "pending-password", "language": "en"})
+            self.assertEqual(status, 201)
+            self.assertTrue(registered["verification_required"])
+            self.assertTrue(registered["email_sent"])
+            first_code = delivered[-1]["body"].split("Your Skein code is: ", 1)[1].splitlines()[0]
+
+            pending = self.client()
+            _, pending_session = self.request(pending, "/api/auth/login", {"username": "pending-user", "password": "pending-password"})
+            self.assertFalse(pending_session["user"]["verified"])
+            self.assertEqual(pending_session["user"]["permissions"], [])
+            with self.assertRaises(HTTPError) as blocked:
+                self.request(pending, "/api/workflows", {"objective": "This must remain blocked"})
+            self.assertEqual(blocked.exception.code, 403)
+            with self.assertRaises(HTTPError) as invalid:
+                self.request(pending, "/api/auth/verify", {"code": "111111"})
+            self.assertEqual(invalid.exception.code, 400)
+            with self.assertRaises(HTTPError) as early_resend:
+                self.request(pending, "/api/auth/resend", {"language": "en"})
+            self.assertEqual(early_resend.exception.code, 429)
+
+            with app.db() as conn:
+                user_id = conn.execute("SELECT id FROM users WHERE username='pending-user'").fetchone()[0]
+                conn.execute("UPDATE email_verification_codes SET created_at=created_at-61 WHERE user_id=?", (user_id,))
+            _, resent = self.request(pending, "/api/auth/resend", {"language": "en"})
+            self.assertTrue(resent["sent"])
+            second_code = delivered[-1]["body"].split("Your Skein code is: ", 1)[1].splitlines()[0]
+            self.assertNotEqual(first_code, second_code)
+            with self.assertRaises(HTTPError):
+                self.request(pending, "/api/auth/verify", {"code": first_code})
+            _, verified = self.request(pending, "/api/auth/verify", {"code": second_code})
+            self.assertTrue(verified["verified"])
+            with self.assertRaises(HTTPError) as reused:
+                self.request(pending, "/api/auth/verify", {"code": second_code})
+            self.assertEqual(reused.exception.code, 400)
+
+            self.request(anonymous, "/api/auth/register", {"username": "expired-user", "email": "expired@example.test", "password": "expired-password", "language": "en"})
+            expired_code = delivered[-1]["body"].split("Your Skein code is: ", 1)[1].splitlines()[0]
+            expired = self.client(); self.request(expired, "/api/auth/login", {"username": "expired-user", "password": "expired-password"})
+            with app.db() as conn: conn.execute("UPDATE email_verification_codes SET expires_at=? WHERE user_id=(SELECT id FROM users WHERE username='expired-user')", (app.stamp()-1,))
+            with self.assertRaises(HTTPError) as expired_response:
+                self.request(expired, "/api/auth/verify", {"code": expired_code})
+            self.assertEqual(expired_response.exception.code, 410)
+
+            self.request(anonymous, "/api/auth/register", {"username": "manual-user", "email": "manual@example.test", "password": "manual-password", "language": "en"})
+            admin = self.client(); _, admin_session = self.request(admin, "/api/auth/login", {"username": "admin", "password": "admin-test-password"})
+            _, users = self.request(admin, "/api/users"); manual = next(user for user in users if user["username"] == "manual-user")
+            _, approved = self.request(admin, f"/api/users/{manual['id']}/approve", {})
+            self.assertTrue(approved["verified"])
+            manual_client = self.client(); _, manual_session = self.request(manual_client, "/api/auth/login", {"username": "manual-user", "password": "manual-password"})
+            self.assertTrue(manual_session["user"]["verified"])
+            self.assertIn("workflows.execute", manual_session["user"]["permissions"])
+        finally:
+            app.send_email = original_sender
 
 
 if __name__ == "__main__":
