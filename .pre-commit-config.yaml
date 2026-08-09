@@ -1,0 +1,30 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-added-large-files
+        args: [--maxkb=4096]
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.2
+    hooks:
+      - id: ruff-check
+        args: ["--select=E9,F63,F7,F82"]
+  - repo: local
+    hooks:
+      - id: javascript-syntax
+        name: Validate JavaScript syntax
+        entry: python tests/check_javascript.py
+        language: system
+        pass_filenames: false
+        files: ^static/.*\.js$
+      - id: skein-tests
+        name: Run isolated Skein test suites
+        entry: python tests/run_precommit_tests.py
+        language: system
+        pass_filenames: false
+        always_run: true
