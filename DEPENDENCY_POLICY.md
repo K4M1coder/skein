@@ -29,6 +29,7 @@ Dependencies are version-bounded, reviewed before upgrades, and never loaded dir
 | Rate limiting | A maintained backend-aware limiter | Adopt before multi-node deployment; the current SQLite limiter remains acceptable only for the single-node prototype. |
 | Frontend Markdown | GFM renderer, DOMPurify, Mermaid, syntax highlighter | Already uses specialized libraries; versions must be vendored or package-locked and covered by XSS regression tests. |
 | Interface icons | Lucide | Adopted at a pinned version for consistent, accessible SVG navigation icons. |
+| Internationalization | i18next | Adopted with embedded resources, explicit English fallback, and a lightweight local fallback when the library is unavailable. |
 
 ## Migration rules
 

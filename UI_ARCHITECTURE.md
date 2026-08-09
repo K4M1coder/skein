@@ -56,6 +56,7 @@ The shell defines shared colors, spacing, radii, borders, and shadows in `static
 ## Maintained UI dependencies
 
 - **Lucide 1.31.0** supplies consistent navigation icons under the ISC license.
+- **i18next 26.3.6** provides language resolution and explicit English fallback while translations remain bundled for local use.
 - Existing Markdown output continues to use pinned Marked, DOMPurify, Highlight.js, and Mermaid builds.
 
 Future framework adoption should replace the current incremental DOM scripts only when it brings typed components, reliable state management, testability, and an accessible component system without blocking the working prototype.

@@ -87,9 +87,19 @@
   };
   const saved = localStorage.getItem("skein_language") || "auto";
   const resolved = saved === "auto" ? ((navigator.language || "en").toLowerCase().startsWith("fr") ? "fr" : "en") : (saved === "fr" ? "fr" : "en");
+  const engine = window.i18next;
+  engine?.init({
+    lng: resolved,
+    fallbackLng: "en",
+    supportedLngs: ["en", "fr"],
+    resources: { en: { translation: messages.en }, fr: { translation: messages.fr } },
+    initAsync: false,
+    interpolation: { escapeValue: false },
+  });
+  document.documentElement.dataset.i18nEngine = engine ? "i18next" : "fallback";
   window.skeinI18n = {
-    selected: saved, language: resolved,
-    t(key) { return messages[resolved]?.[key] || messages.en[key] || key; },
+    selected: saved, language: resolved, engine: engine ? "i18next" : "fallback",
+    t(key, options) { return engine?.t(key, options) || messages[resolved]?.[key] || messages.en[key] || key; },
     set(value) { localStorage.setItem("skein_language", value); location.reload(); },
   };
   const translate = root => {
