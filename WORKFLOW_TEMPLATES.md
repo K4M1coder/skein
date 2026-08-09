@@ -69,6 +69,11 @@ The workflow library lists system, private, and shared templates. Permission-awa
 
 The execution form keeps planning controls on their own row and gives the user request a full-width, resizable editor. Selecting a saved workflow therefore never compresses the prompt into the remaining horizontal space.
 
-Every saved template has a **View graph** action. The graph lays tasks out by dependency depth and draws directed edges between them. The workflow editor includes the same visualization as a live preview: changing the task JSON redraws the DAG after a short debounce. Unknown dependencies, empty task sets, and cycles are displayed inside the preview instead of leaving a stale graph on screen. Generated proposals are visualized before they can be saved.
+Every saved template has a **View graph** action with two generated representations:
+
+- an algorithm/activity diagram with start and end terminators, typed action nodes, dependency arrows, conditional diamonds, and true/false branches;
+- a UML-style sequence diagram with User, Orchestrator, Reasoner, Worker, and command/script Runtime lifelines, chronological messages, optional condition fragments, and parallel markers.
+
+Both representations support zoom buttons, mouse-wheel zoom, reset, drag-to-pan, and fullscreen display. When the browser denies the native Fullscreen API, the viewer uses an application-level fullscreen fallback. The workflow editor includes the same dual visualization as a live preview: changing the task JSON redraws both diagrams after a short debounce. Unknown dependencies, empty task sets, and cycles are displayed inside the preview instead of leaving stale diagrams on screen. Generated proposals are visualized before they can be saved.
 
 When no real reasoner is loaded, automatic selection and generation return actionable errors. Deterministic selection and generation are available only when `SKEIN_ALLOW_SIMULATION=1`, which is reserved for tests and explicit development mode. Automatic selection runs once when the workflow is launched; it is not invoked on every edit of the user prompt.

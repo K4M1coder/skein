@@ -36,6 +36,7 @@ Reference documentation consulted during the audit: [Claude Desktop](https://doc
 ### Workflows
 
 - The complete template library, generator, editor, sharing controls, and DAG previews live in their own view.
+- Each DAG preview offers an algorithm/activity view and a sequence view, with fullscreen, zoom, reset, and drag-to-pan controls.
 - `workflow_templates.read` controls menu visibility and read access.
 - `workflow_templates.manage_own` and `workflow_templates.manage_all` independently control mutation actions.
 - Selecting a template transfers it to the Execution composer without starting a run.
