@@ -16,10 +16,13 @@ This separation prevents account, infrastructure, navigation, and workflow actio
 
 The design deliberately adopts established interaction patterns without reproducing any product-specific visual identity:
 
-- ChatGPT, Claude, Gemini, Ollama, and Open WebUI use persistent navigation and make task creation the primary action.
+- ChatGPT, Claude, Gemini, Ollama Desktop, and Open WebUI use persistent navigation and make task creation the primary action.
 - Claude separates conversational work, longer-running agentic work, and code work into distinct destinations. Skein similarly separates Execution, History, and Administration.
 - Gemini and Open WebUI use side panels to keep project/history navigation available without displacing the active content.
 - Open WebUI separates administrator capabilities from the normal user workspace and exposes features according to permissions.
+- Colibri.ai is a task-focused meeting assistant embedded in the active work context; Skein applies the same focus principle by showing only the controls relevant to the selected Execution, History, or Administration context.
+
+Reference documentation consulted during the audit: [Claude Desktop](https://docs.anthropic.com/en/docs/claude-code/desktop), [Open WebUI workspace](https://docs.openwebui.com/features/workspace/), [Open WebUI administration](https://docs.openwebui.com/features/administration/), [Colibri.ai feature overview](https://support.colibri.ai/hc/en-us/categories/360003014040-Feature-overview), [Lucide](https://lucide.dev/), and [i18next fallback behavior](https://www.i18next.com/principles/fallback).
 
 ## View responsibilities
 
@@ -58,6 +61,8 @@ The shell defines shared colors, spacing, radii, borders, and shadows in `static
 - **Lucide 1.31.0** supplies consistent navigation icons under the ISC license.
 - **i18next 26.3.6** provides language resolution and explicit English fallback while translations remain bundled for local use.
 - Existing Markdown output continues to use pinned Marked, DOMPurify, Highlight.js, and Mermaid builds.
+
+All CDN assets declare SHA-384 Subresource Integrity and anonymous CORS attributes. A compromised or unexpectedly changed CDN response is rejected by the browser instead of executing with application privileges.
 
 Static interface copy uses English canonical markup with explicit `data-i18n`, `data-i18n-placeholder`, or `data-i18n-value` keys. Dynamic components and navigation call the same translation service directly. The localization layer never scans or rewrites arbitrary DOM text, which protects user input and keeps translations deterministic.
 

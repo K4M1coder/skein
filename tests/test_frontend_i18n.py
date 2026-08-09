@@ -23,6 +23,22 @@ class FrontendLocalizationTest(unittest.TestCase):
         self.assertTrue(keys)
         self.assertEqual(set(), keys - self.english_keys)
 
+    def test_external_assets_are_versioned_and_integrity_protected(self):
+        markup = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        external_tags = re.findall(r'<(?:script|link)\b[^>]+https://[^>]+>', markup)
+        self.assertGreaterEqual(len(external_tags), 7)
+        for tag in external_tags:
+            with self.subTest(tag=tag):
+                self.assertIn('integrity="sha384-', tag)
+                self.assertIn('crossorigin="anonymous"', tag)
+                self.assertRegex(tag, r"@?\d+\.\d+\.\d+")
+
+    def test_model_controls_collapse_at_the_tablet_breakpoint(self):
+        styles = (ROOT / "static" / "control.css").read_text(encoding="utf-8")
+        self.assertIn("@media(max-width:980px)", styles)
+        self.assertIn(".model-form,.model-row{grid-template-columns:1fr}", styles)
+        self.assertIn(".model-row>*{min-width:0}", styles)
+
     def test_legacy_dom_translation_scanner_is_removed(self):
         self.assertNotIn("TreeWalker", self.catalog_source)
         self.assertNotIn("MutationObserver", self.catalog_source)

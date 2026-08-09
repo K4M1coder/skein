@@ -14,7 +14,7 @@ A new dependency must satisfy the following checks before adoption:
 6. Its integration is covered by unit tests and, for user-visible behavior, an end-to-end test.
 7. It can be upgraded or removed without corrupting persisted data.
 
-Dependencies are version-bounded, reviewed before upgrades, and never loaded directly from an unpinned remote URL at runtime. Security-sensitive defaults must fail closed. Secrets must not be logged or returned by APIs.
+Dependencies are version-bounded and reviewed before upgrades. Browser dependencies loaded from a pinned CDN URL must also declare a SHA-384 Subresource Integrity hash and anonymous CORS mode; vendoring remains preferred for fully offline deployments. Security-sensitive defaults must fail closed. Secrets must not be logged or returned by APIs.
 
 ## Current adoption plan
 
@@ -27,7 +27,7 @@ Dependencies are version-bounded, reviewed before upgrades, and never loaded dir
 | Persistence | SQLAlchemy 2 and Alembic | Planned migration from direct SQLite statements. Alembic becomes the only production schema migration path. |
 | Authorization | PyCasbin | Evaluate through contract tests against the current permission matrix before replacing the existing RBAC evaluator. Domain-scoped roles are required for future multi-tenant pools. |
 | Rate limiting | A maintained backend-aware limiter | Adopt before multi-node deployment; the current SQLite limiter remains acceptable only for the single-node prototype. |
-| Frontend Markdown | GFM renderer, DOMPurify, Mermaid, syntax highlighter | Already uses specialized libraries; versions must be vendored or package-locked and covered by XSS regression tests. |
+| Frontend Markdown | Marked, DOMPurify, Mermaid, Highlight.js | Adopted at pinned versions with SRI. DOMPurify remains mandatory before generated Markdown enters the DOM; retain XSS regression coverage. |
 | Interface icons | Lucide | Adopted at a pinned version for consistent, accessible SVG navigation icons. |
 | Internationalization | i18next | Adopted with embedded resources, explicit English fallback, and a lightweight local fallback when the library is unavailable. |
 
