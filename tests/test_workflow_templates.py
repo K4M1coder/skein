@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from urllib.error import HTTPError
@@ -87,6 +88,35 @@ class WorkflowTemplateTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, 400)
         error = json.load(caught.exception)["error"]
         self.assertIn("acyclic", error)
+
+    def test_automatic_selection_and_generation_are_validated(self):
+        _, selected = self.request("/api/workflow-templates/select", {"objective": "Build a Python API with complete tests"})
+        self.assertEqual(selected["id"], "default-software")
+        self.assertTrue(selected["validation"]["valid"])
+        _, generated = self.request("/api/workflow-templates/generate", {"objective": "Translate a product announcement into French"})
+        self.assertEqual(generated["mode"], "simulation")
+        self.assertTrue(generated["validation"]["valid"])
+        self.assertEqual(generated["validation"]["terminal_task"], generated["tasks"][-1]["key"])
+
+    def test_execution_modes_report_their_planning_source(self):
+        requests = (
+            ({"objective": "Translate this sentence into French", "planning_mode": "automatic"}, "automatic", "default-translation"),
+            ({"objective": "Analyze an unusual operational request", "planning_mode": "generate"}, "generate", None),
+            ({"objective": "Implement a tested Python module", "planning_mode": "template", "template_id": "default-software"}, "template", "default-software"),
+        )
+        workflow_ids = []
+        for payload, expected_mode, expected_template in requests:
+            status, created = self.request("/api/workflows", payload)
+            self.assertEqual(status, 201)
+            self.assertEqual(created["planning"]["mode"], expected_mode)
+            self.assertEqual(created["planning"]["template_id"], expected_template)
+            workflow_ids.append(created["id"])
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            states = [self.request(f"/api/workflows/{workflow_id}")[1]["workflow"]["status"] for workflow_id in workflow_ids]
+            if all(state in ("COMPLETED", "FAILED") for state in states): break
+            time.sleep(.1)
+        self.assertTrue(all(state == "COMPLETED" for state in states))
 
 
 if __name__ == "__main__":

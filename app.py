@@ -594,6 +594,40 @@ def normalize_workflow_template(body):
     return {"name":name,"description":description,"objective_template":objective_template,"tasks":tasks,"tags":tags[:20],"shared":bool(body.get("shared")),"validation":validation}
 
 
+def objective_tokens(text):
+    stop_words = {"about","avec","dans","des","for","from","les","pour","that","the","this","une","with"}
+    return {token for token in re.findall(r"[a-z0-9_-]{3,}", str(text).lower()) if token not in stop_words}
+
+
+def select_workflow_template(objective,user_id,manage_all=False):
+    objective_words = objective_tokens(objective)
+    templates = visible_workflow_templates(user_id,manage_all)
+    best = None
+    for template in templates:
+        tags = set(template["tags"]); names = objective_tokens(template["name"]); description = objective_tokens(template["description"]+" "+template["objective_template"])
+        score = 5*len(objective_words & tags)+3*len(objective_words & names)+len(objective_words & description)
+        if template["id"] == "default-general": score += .1
+        candidate = (score,1 if template["owner_id"]==user_id else 0,template["updated_at"],template)
+        if best is None or candidate[:3] > best[:3]: best = candidate
+    if not best: return None
+    selected = best[3]; selected["selection"]={"score":best[0],"matched_terms":sorted(objective_words & (set(selected["tags"])|objective_tokens(selected["name"]+" "+selected["description"]+" "+selected["objective_template"])))[:12]}
+    return selected
+
+
+def generate_validated_workflow_template(objective):
+    if not 5 <= len(objective.strip()) <= 4000: return {"error":"Objective must contain 5 to 4000 characters"},400
+    proposal = ModelClient("reasoner-large").generate_workflow_template(objective)
+    if proposal.get("error"): return proposal,409 if "No active endpoint" in proposal["error"] else 502
+    try: normalized = normalize_workflow_template(proposal)
+    except ValueError as first_error:
+        repaired = ModelClient("reasoner-large").generate_workflow_template(objective,True)
+        if repaired.get("error"): return repaired,502
+        try: normalized = normalize_workflow_template(repaired)
+        except ValueError as second_error: return {"error":"Generated workflow failed validation","details":str(second_error),"first_validation_error":str(first_error)},422
+        proposal = repaired
+    return {**normalized,"mode":proposal.get("mode","live"),"metrics":proposal.get("metrics",{})},200
+
+
 def template_task_specs(tasks):
     validation = validate_workflow_tasks(tasks)
     if not validation["valid"]: raise ValueError("; ".join(validation["errors"]))
@@ -698,6 +732,34 @@ class ModelClient:
                 "assumptions": ["Demonstration without external tools"],
                 "evidence": ["Dependencies completed", f"Route: {self.tier}"],
                 "next_actions": ["Validate the produced artifact"], "mode": "simulation"}
+
+    def generate_workflow_template(self, objective, retry=False):
+        if not self.url:
+            if os.getenv("SKEIN_ALLOW_SIMULATION", "0") == "1":
+                tasks = task_specs_to_template(plan_for(objective))
+                return {"name":"Generated workflow","description":"Generated and validated for the supplied objective","objective_template":objective,"tags":sorted(objective_tokens(objective))[:8],"tasks":tasks,"mode":"simulation","metrics":{}}
+            return {"error":"No active endpoint for reasoner-large","action":"Load a reasoner model in Model Plane."}
+        repair = "The previous proposal was invalid. Return corrected JSON only.\n" if retry else ""
+        prompt = ("/no_think\n"+repair+"You are the Skein workflow architect. Design a directly executable task DAG for the user objective. "
+          "Return only one JSON object with name, description, objective_template, tags, and tasks. "
+          "tasks contains 1 to 12 objects with key, title, role, dependencies, complexity, risk, and criticality. "
+          "Use stable lowercase keys; dependencies reference earlier task keys. Scores are numbers from 0 to 1. "
+          "Allowed roles: "+", ".join(sorted(WORKFLOW_ROLES))+". The graph must be acyclic, have exactly one terminal task, "
+          "and that terminal task must use the integrator role. Include implementation and verification tasks when required.\n"
+          "USER OBJECTIVE:\n"+objective)
+        body=json.dumps({"model":self.model,"messages":[{"role":"user","content":prompt}],"temperature":0 if retry else .1,"max_tokens":4096,"response_format":{"type":"json_object"},"chat_template_kwargs":{"enable_thinking":False}}).encode()
+        started=time.perf_counter()
+        try:
+            with urlopen(Request(self.url,body,{"Content-Type":"application/json"}),timeout=120) as response:
+                payload=json.load(response); content=payload["choices"][0]["message"]["content"].strip()
+            if content.startswith("```"): content=content.split("\n",1)[1].rsplit("```",1)[0]
+            proposal=json.loads(content); proposal["mode"]="live"
+            usage=payload.get("usage") or {}; duration=max(.001,time.perf_counter()-started)
+            proposal["metrics"]={"prompt_tokens":int(usage.get("prompt_tokens") or 0),"completion_tokens":int(usage.get("completion_tokens") or 0),"total_tokens":int(usage.get("total_tokens") or 0),"inference_seconds":round(duration,3)}
+            return proposal
+        except (URLError,TimeoutError,KeyError,json.JSONDecodeError) as exc:
+            if not retry: return self.generate_workflow_template(objective,True)
+            return {"error":f"Workflow generation backend unavailable: {exc}","action":"Check the reasoner runtime and retry."}
 
 
 POOL = ThreadPoolExecutor(max_workers=max(1,int(os.getenv("SKEIN_TASK_WORKERS","4"))), thread_name_prefix="skein-worker")
@@ -1321,6 +1383,13 @@ class Handler(SimpleHTTPRequestHandler):
             aid=self.path.split("/")[3]
             with db() as conn: artifact_owner=conn.execute("SELECT workflow_id FROM artifacts WHERE id=?",(aid,)).fetchone()
             if not artifact_owner or not self.workflow_allowed(user,artifact_owner["workflow_id"]): return self.deny(403,"Artifact access denied")
+        if self.path=="/api/workflow-templates/generate":
+            result,status=generate_validated_workflow_template(str(body.get("objective","")).strip()); return self.json(result,status)
+        if self.path=="/api/workflow-templates/select":
+            objective=str(body.get("objective","")).strip()
+            if len(objective)<5: return self.json({"error":"Objective is too short"},400)
+            selected=select_workflow_template(objective,user["id"],"workflow_templates.manage_all" in user["permissions"])
+            return self.json(selected or {"error":"No visible workflow template"},200 if selected else 404)
         if self.path=="/api/workflow-templates":
             try: template=normalize_workflow_template(body)
             except ValueError as exc: return self.json({"error":str(exc)},400)
@@ -1414,7 +1483,22 @@ class Handler(SimpleHTTPRequestHandler):
                 missing=[role for role in ("reasoner","worker") if not endpoint_ready(ACTIVE_ENDPOINTS.get(role,""))]
                 if missing: return self.json({"error":"Real models are not loaded","missing_roles":missing,
                   "action":"Use Auto-detect and load local models in Model Plane."},409)
-            wid=create_workflow(objective,user["id"],user.get("session_id")); start_workflow(wid); return self.json({"id":wid},201)
+            planning_mode=str(body.get("planning_mode","automatic")).strip().lower(); template_id=body.get("template_id"); specs=None; selection=None
+            if planning_mode not in ("template","automatic","generate"): return self.json({"error":"Invalid workflow planning mode"},400)
+            if planning_mode=="template":
+                if not template_id: return self.json({"error":"A workflow template must be selected"},400)
+                row=self.template_row(str(template_id))
+                if not self.template_visible(user,row): return self.json({"error":"Workflow template not found"},404)
+                template=workflow_template_payload(row,user["id"],"workflow_templates.manage_all" in user["permissions"]); specs=template_task_specs(template["tasks"]); selection={"template_id":template["id"],"template_name":template["name"],"mode":"template"}
+            elif planning_mode=="automatic":
+                template=select_workflow_template(objective,user["id"],"workflow_templates.manage_all" in user["permissions"])
+                if not template: return self.json({"error":"No visible workflow template"},404)
+                template_id=template["id"]; specs=template_task_specs(template["tasks"]); selection={"template_id":template["id"],"template_name":template["name"],"mode":"automatic","score":template["selection"]["score"],"matched_terms":template["selection"]["matched_terms"]}
+            else:
+                generated,status=generate_validated_workflow_template(objective)
+                if status!=200: return self.json(generated,status)
+                specs=template_task_specs(generated["tasks"]); selection={"template_id":None,"template_name":generated["name"],"mode":"generate","validation":generated["validation"],"generation_mode":generated["mode"]}
+            wid=create_workflow(objective,user["id"],user.get("session_id"),specs,template_id,planning_mode); start_workflow(wid); return self.json({"id":wid,"planning":selection},201)
         if self.path=="/api/execution-mode":
             if "settings.manage" not in user["permissions"] and not setting_bool("users_can_choose_execution_mode"): return self.deny(403,"Execution mode selection is disabled by the administrator")
             mode=str(body.get("mode","")).lower()

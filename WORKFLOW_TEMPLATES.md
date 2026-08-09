@@ -30,8 +30,19 @@ Sharing changes visibility but never transfers ownership or edit rights.
 - `GET /api/workflow-templates` lists visible templates.
 - `GET /api/workflow-templates/{id}` returns one visible template.
 - `POST /api/workflow-templates` creates an owned template.
+- `POST /api/workflow-templates/select` selects the best visible template for an objective and returns the score and matched terms.
+- `POST /api/workflow-templates/generate` asks the active reasoner to propose a template and returns it only after structural validation.
 - `POST /api/workflow-templates/{id}` updates an editable template, including its sharing state.
 - `DELETE /api/workflow-templates/{id}` deletes an editable non-system template.
 
-Automatic selection, AI generation, and execution integration are implemented as separate layers so template persistence and authorization remain independently testable.
+## Planning modes
 
+`POST /api/workflows` accepts a `planning_mode`:
+
+- `template` executes the selected visible `template_id`;
+- `automatic` scores visible templates using objective terms, tags, names, descriptions, and objective hints;
+- `generate` asks the reasoner for a new DAG, validates it, and executes the validated ephemeral plan without silently saving it as a reusable template.
+
+The response identifies the chosen or generated planning source. Template generation and prompt execution remain separate API operations: generating a proposal never executes the user prompt, and executing in generation mode performs a fresh validated planning task.
+
+When no real reasoner is loaded, generation returns an actionable error. Deterministic generation is available only when `SKEIN_ALLOW_SIMULATION=1`, which is reserved for tests and explicit development mode.
