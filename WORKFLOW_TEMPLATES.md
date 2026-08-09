@@ -14,7 +14,7 @@ Validation requires:
 - an acyclic dependency graph;
 - exactly one terminal task using the `integrator` role.
 
-System templates are seeded for general delivery, software implementation, translation, and security-sensitive changes. They are shared, immutable, and validated during database initialization.
+System templates are seeded for general delivery, software implementation, translation, security-sensitive changes, simple chat, daily assistance, research and synthesis, and specification derived from code. They are shared, immutable, and validated during database initialization.
 
 ## Access rules
 
@@ -30,7 +30,7 @@ Sharing changes visibility but never transfers ownership or edit rights.
 - `GET /api/workflow-templates` lists visible templates.
 - `GET /api/workflow-templates/{id}` returns one visible template.
 - `POST /api/workflow-templates` creates an owned template.
-- `POST /api/workflow-templates/select` selects the best visible template for an objective and returns the score and matched terms.
+- `POST /api/workflow-templates/select` asks the active reasoner to select the best visible template and returns its concise reason and confidence.
 - `POST /api/workflow-templates/generate` asks the active reasoner to propose a template and returns it only after structural validation.
 - `POST /api/workflow-templates/{id}` updates an editable template, including its sharing state.
 - `DELETE /api/workflow-templates/{id}` deletes an editable non-system template.
@@ -40,7 +40,7 @@ Sharing changes visibility but never transfers ownership or edit rights.
 `POST /api/workflows` accepts a `planning_mode`:
 
 - `template` executes the selected visible `template_id`;
-- `automatic` scores visible templates using objective terms, tags, names, descriptions, and objective hints;
+- `automatic` gives the active reasoner the visible validated template catalog and asks it to select exactly one template. The server rejects unknown identifiers and never silently substitutes a different template;
 - `generate` asks the reasoner for a new DAG, validates it, and executes the validated ephemeral plan without silently saving it as a reusable template.
 
 The response identifies the chosen or generated planning source. Template generation and prompt execution remain separate API operations: generating a proposal never executes the user prompt, and executing in generation mode performs a fresh validated planning task.
@@ -58,4 +58,4 @@ The workflow library lists system, private, and shared templates. Permission-awa
 
 Every saved template has a **View graph** action. The graph lays tasks out by dependency depth and draws directed edges between them. The workflow editor includes the same visualization as a live preview: changing the task JSON redraws the DAG after a short debounce. Unknown dependencies, empty task sets, and cycles are displayed inside the preview instead of leaving a stale graph on screen. Generated proposals are visualized before they can be saved.
 
-When no real reasoner is loaded, generation returns an actionable error. Deterministic generation is available only when `SKEIN_ALLOW_SIMULATION=1`, which is reserved for tests and explicit development mode.
+When no real reasoner is loaded, automatic selection and generation return actionable errors. Deterministic selection and generation are available only when `SKEIN_ALLOW_SIMULATION=1`, which is reserved for tests and explicit development mode. Automatic selection runs once when the workflow is launched; it is not invoked on every edit of the user prompt.
