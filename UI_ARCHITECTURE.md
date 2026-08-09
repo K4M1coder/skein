@@ -6,7 +6,7 @@ Skein is an agentic operations workspace rather than a conventional chat applica
 
 The layout uses three stable regions:
 
-1. **Primary sidebar** — Execution, History, and Administration. The available destinations come from server-issued RBAC permissions.
+1. **Primary sidebar** — Execution, Workflows, History, and Administration. The available destinations come from server-issued RBAC permissions.
 2. **System header** — authenticated user, language, control-plane health, and stack lifecycle controls.
 3. **Task canvas** — the active product view, optimized independently for creation, review, or administration.
 
@@ -17,10 +17,10 @@ This separation prevents account, infrastructure, navigation, and workflow actio
 The design deliberately adopts established interaction patterns without reproducing any product-specific visual identity:
 
 - ChatGPT, Claude, Gemini, Ollama Desktop, and Open WebUI use persistent navigation and make task creation the primary action.
-- Claude separates conversational work, longer-running agentic work, and code work into distinct destinations. Skein similarly separates Execution, History, and Administration.
+- Claude separates conversational work, longer-running agentic work, and code work into distinct destinations. Skein similarly separates Execution, workflow design, History, and Administration.
 - Gemini and Open WebUI use side panels to keep project/history navigation available without displacing the active content.
 - Open WebUI separates administrator capabilities from the normal user workspace and exposes features according to permissions.
-- Colibri.ai is a task-focused meeting assistant embedded in the active work context; Skein applies the same focus principle by showing only the controls relevant to the selected Execution, History, or Administration context.
+- Colibri.ai is a task-focused meeting assistant embedded in the active work context; Skein applies the same focus principle by showing only the controls relevant to the selected Execution, Workflows, History, or Administration context.
 
 Reference documentation consulted during the audit: [Claude Desktop](https://docs.anthropic.com/en/docs/claude-code/desktop), [Open WebUI workspace](https://docs.openwebui.com/features/workspace/), [Open WebUI administration](https://docs.openwebui.com/features/administration/), [Colibri.ai feature overview](https://support.colibri.ai/hc/en-us/categories/360003014040-Feature-overview), [Lucide](https://lucide.dev/), and [i18next fallback behavior](https://www.i18next.com/principles/fallback).
 
@@ -32,6 +32,13 @@ Reference documentation consulted during the audit: [Claude Desktop](https://doc
 - Sandbox/local execution tools immediately below the composer.
 - Active workflow, task graph, step results, and deliverables after the creation controls.
 - Operational controls remain visible only when the current permission set allows them.
+
+### Workflows
+
+- The complete template library, generator, editor, sharing controls, and DAG previews live in their own view.
+- `workflow_templates.read` controls menu visibility and read access.
+- `workflow_templates.manage_own` and `workflow_templates.manage_all` independently control mutation actions.
+- Selecting a template transfers it to the Execution composer without starting a run.
 
 ### History
 

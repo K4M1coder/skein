@@ -21,7 +21,7 @@ Development commits are protected by the checks documented in [CONTRIBUTING.md](
 - Markdown viewer with GFM, Mermaid, DOMPurify, and syntax highlighting.
 - Persistent users, session authentication, `admin` and `user` roles.
 - English/French interface with `Automatic`, `English`, and `Français` selection. Automatic follows a French browser locale and falls back to English.
-- Role-aware tab navigation that separates workflow execution, run history, and system administration.
+- Role-aware tab navigation that separates execution, workflow design, run history, and system administration.
 - Permission-aware history cleanup for the current user or, when authorized, every user.
 - Parallel workflow scheduling with a visible FIFO queue and per-user, per-session workspaces.
 - Responsive desktop-style shell with permission-aware navigation and bilingual mobile layouts.
@@ -29,7 +29,7 @@ Development commits are protected by the checks documented in [CONTRIBUTING.md](
 ## Navigation
 
 - **Execution** contains workflow creation, the sandbox/local tool plane, the active DAG, step outputs, metrics, and deliverables.
-- The workflow library in **Execution** supports validated defaults, owned workflows, sharing, editing, deletion, automatic selection, and reasoner-generated proposals. Workflow generation has its own request inside the library; **Execute prompt** remains the only action in the execution request that starts a run.
+- **Workflows** is a dedicated RBAC-protected library for validated defaults, owned workflows, sharing, editing, deletion, graph previews, and reasoner-generated proposals. Choosing **Use** returns to Execution with that template selected.
 - Saved, generated, and currently edited workflows can be visualized as dependency graphs. The editor redraws its DAG live and reports unknown dependencies or cycles directly in the preview.
 - **History** contains recent runs and the event stream. Selecting a run displays its complete report and artifacts without returning to the workflow launcher.
 - **Administration** contains access control, execution policy, GPU pools, telemetry, model selection, and runtime controls. This tab is rendered only for administrators.
@@ -47,9 +47,11 @@ Skein uses composable RBAC profiles rather than a single hard-coded administrato
 | Settings Manager | Execution policy, GPU pools, assignments, and stack controls |
 | Model Manager | Model registry/runtimes and privacy-safe server statistics |
 | Workflow Operator | Execute workflows and read only owned workflows |
+| Workflow Runner | Execute workflows and manage personal run history; browse templates without editing them |
+| Workflow Designer | Browse templates and create, edit, share, or delete owned templates without workflow execution rights |
 | Statistics Auditor | Read privacy-safe operational statistics only |
 
-Backend permissions are `users.manage`, `settings.manage`, `models.manage`, `workflows.execute`, `workflows.read_own`, `workflows.read_all`, `workflows.delete_own`, `workflows.delete_all`, and `server_stats.read`. UI visibility follows the same server-issued permission list; hiding a control is never the authorization boundary.
+Backend permissions are `users.manage`, `settings.manage`, `models.manage`, `workflows.execute`, `workflows.read_own`, `workflows.read_all`, `workflows.delete_own`, `workflows.delete_all`, and `server_stats.read`. The Workflows menu requires `workflow_templates.read`; its write controls additionally require `workflow_templates.manage_own` or `workflow_templates.manage_all`. UI visibility follows the same server-issued permission list; hiding a control is never the authorization boundary.
 
 Workflow-template permissions are `workflow_templates.read`, `workflow_templates.manage_own`, and `workflow_templates.manage_all`. See [WORKFLOW_TEMPLATES.md](WORKFLOW_TEMPLATES.md) for validation, ownership, sharing, and API rules.
 
