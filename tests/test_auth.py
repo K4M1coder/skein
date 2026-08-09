@@ -148,6 +148,9 @@ class AuthTest(unittest.TestCase):
         with self.assertRaises(HTTPError) as model_denied:
             self.request(user, "/api/models/autoload", {})
         self.assertEqual(model_denied.exception.code, 403)
+        with self.assertRaises(HTTPError) as telemetry_denied:
+            self.request(user, "/api/hardware/telemetry")
+        self.assertEqual(telemetry_denied.exception.code, 403)
 
         status, workflow = self.request(user, "/api/workflows", {"objective": "Return a short hello message"})
         self.assertEqual(status, 201)

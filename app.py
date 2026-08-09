@@ -1558,7 +1558,7 @@ class Handler(SimpleHTTPRequestHandler):
             elif self.path=="/api/admin/settings": user=self.authorize("settings.manage")
             elif self.path=="/api/models": user=self.authorize("models.manage")
             elif self.path.startswith("/api/workflow-templates"): user=self.authorize("workflow_templates.read")
-            elif self.path=="/api/hardware": user=self.authorize_any("server_stats.read","settings.manage","models.manage")
+            elif self.path=="/api/hardware" or urlparse(self.path).path=="/api/hardware/telemetry": user=self.authorize_any("server_stats.read","settings.manage","models.manage")
             elif self.path=="/api/server-stats": user=self.authorize("server_stats.read")
             else: user=self.authorize()
             if not user: return
