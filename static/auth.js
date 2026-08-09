@@ -31,7 +31,7 @@
   const renderAdmin = async session => {
     const can = permission => session.user.permissions.includes(permission);
     const section = document.createElement("section"); section.className = "workspace admin-panel admin-only";
-    section.innerHTML = `<div class="head"><div><p class="eyebrow">RBAC CONTROL PLANE</p><h2>${t("administration")}</h2></div></div><div id="rbac-users"></div><div id="rbac-settings"></div><div id="smtp-settings"></div><div id="privacy-stats"></div>`;
+    section.innerHTML = `<div class="head"><div><p class="eyebrow">${t("rbacControlPlane")}</p><h2>${t("administration")}</h2></div></div><div id="rbac-users"></div><div id="rbac-settings"></div><div id="smtp-settings"></div><div id="privacy-stats"></div>`;
     document.querySelector("main").prepend(section);
     if (can("users.manage")) {
       const [users, profiles] = await Promise.all([request("/api/users"), request("/api/rbac/profiles")]);
@@ -69,7 +69,7 @@
       document.querySelector(".runtime-gate").classList.toggle("permission-hidden",!can("models.manage")); document.querySelector(".hardware").classList.toggle("permission-hidden",!session.user.permissions.some(permission=>["server_stats.read","settings.manage","models.manage"].includes(permission))); document.querySelector(".model-control").classList.toggle("permission-hidden",!can("models.manage")); document.querySelectorAll("[data-stack]").forEach(x=>x.classList.toggle("permission-hidden",!can("settings.manage")));
       if(administrationAccess) await renderAdmin(session);
       window.skeinNavigation.init(session);
-      const script=document.createElement("script"); script.src="/app.js?v=6"; document.body.appendChild(script);
+      const script=document.createElement("script"); script.src="/app.js?v=7"; document.body.appendChild(script);
     } catch (error) { showLogin(); }
   };
   addEventListener("DOMContentLoaded", boot);

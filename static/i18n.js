@@ -143,6 +143,36 @@
       markdownUnavailable: "Markdown libraries are unavailable. Check the network connection.",
       copy: "Copy",
       mermaidRendering: "Mermaid rendering",
+      execution: "Execution",
+      history: "History",
+      executionTitle: "Workflow execution",
+      executionText: "Create a workflow, follow its steps, inspect outputs, and run its deliverables.",
+      historyTitle: "Workflow history",
+      historyText: "Select a previous run to inspect its report, metrics, steps, and artifacts.",
+      administrationTitle: "System administration",
+      administrationText: "Manage access, execution policy, hardware pools, models, and runtimes.",
+      workspace: "Workspace",
+      localControlPlane: "Local control plane",
+      gpuWorkspace: "GPU orchestration workspace",
+      primaryNavigation: "Primary navigation",
+      reasonerFunctions: "architecture · arbitration · review",
+      workerFunctions: "code · tests · documentation",
+      toolPlane: "TOOL PLANE",
+      hardwareControlPlane: "HARDWARE CONTROL PLANE",
+      gpuDomainsPools: "GPU domains & pools",
+      scanning: "SCANNING",
+      modelPlane: "MODEL PLANE",
+      modelRegistryRuntime: "Model registry & runtime",
+      activeWorkflow: "ACTIVE WORKFLOW",
+      eventStream: "EVENT STREAM",
+      recentRuns: "RECENT RUNS",
+      viewer: "VIEWER",
+      viewerFeatures: "Markdown · Mermaid · Syntax highlighting",
+      source: "Source",
+      productTagline: "LOCAL AGENT RUNTIME",
+      orchestrationLabel: "ORCHESTRATION / GPU-AGNOSTIC",
+      rbacControlPlane: "RBAC CONTROL PLANE",
+      controlPlane: "CONTROL PLANE",
     },
     fr: {
       language: "Langue",
@@ -287,41 +317,37 @@
       markdownUnavailable: "Les bibliothèques Markdown sont indisponibles. Vérifiez la connexion réseau.",
       copy: "Copier",
       mermaidRendering: "Rendu Mermaid",
+      execution: "Exécution",
+      history: "Historique",
+      executionTitle: "Exécution des workflows",
+      executionText: "Créez un workflow, suivez ses étapes, consultez ses sorties et exécutez ses livrables.",
+      historyTitle: "Historique des workflows",
+      historyText: "Sélectionnez une exécution précédente pour consulter son rapport, ses métriques, ses étapes et ses fichiers.",
+      administrationTitle: "Administration du système",
+      administrationText: "Gérez les accès, la politique d’exécution, les pools matériels, les modèles et les runtimes.",
+      workspace: "Espace de travail",
+      localControlPlane: "Plan de contrôle local",
+      gpuWorkspace: "Orchestration des ressources GPU",
+      primaryNavigation: "Navigation principale",
+      reasonerFunctions: "architecture · arbitrage · revue",
+      workerFunctions: "code · tests · documentation",
+      toolPlane: "PLAN D’EXÉCUTION",
+      hardwareControlPlane: "PLAN DE CONTRÔLE MATÉRIEL",
+      gpuDomainsPools: "Domaines et pools GPU",
+      scanning: "ANALYSE",
+      modelPlane: "PLAN DES MODÈLES",
+      modelRegistryRuntime: "Registre des modèles et runtimes",
+      activeWorkflow: "WORKFLOW ACTIF",
+      eventStream: "FLUX D’ÉVÉNEMENTS",
+      recentRuns: "EXÉCUTIONS RÉCENTES",
+      viewer: "VISUALISEUR",
+      viewerFeatures: "Markdown · Mermaid · coloration syntaxique",
+      source: "Source",
+      productTagline: "RUNTIME D’AGENTS LOCAL",
+      orchestrationLabel: "ORCHESTRATION / INDÉPENDANTE DU GPU",
+      rbacControlPlane: "PLAN DE CONTRÔLE RBAC",
+      controlPlane: "PLAN DE CONTRÔLE",
     },
-  };
-  const pairs = {
-    "Un objectif.": "One objective.", "Plusieurs cerveaux.": "Multiple minds.",
-    "Le CPU organise. Les modèles raisonnent. Les agents exécutent selon des politiques inspectables.": "The CPU organizes. Models reason. Agents execute under inspectable policies.",
-    "Lancer le workflow →": "Run workflow →", "RUNTIMES REQUIS": "REQUIRED RUNTIMES",
-    "Exécution & terminal": "Execution & terminal", "PUISSANCE GPU": "GPU POWER",
-    "TÂCHES TERMINÉES": "COMPLETED TASKS", "EN COURS": "RUNNING",
-    "RÉSULTATS & LIVRABLES": "RESULTS & DELIVERABLES", "Sorties du workflow": "Workflow outputs",
-    "Télécharger le rapport .md": "Download report .md", "Synthèse du workflow": "Workflow summary",
-    "Livrable final": "Final deliverable", "Résultat final": "Final result",
-    "Télécharger le projet .zip": "Download project .zip", "Visualiser": "Preview", "Exécuter": "Execute",
-    "Aucun workflow sélectionné": "No workflow selected", "Aucune exécution.": "No execution yet.",
-    "RECENT RUNS": "RECENT RUNS", "EVENT STREAM": "EVENT STREAM", "Model registry & runtime": "Model registry & runtime",
-    "+ Ajouter un modèle": "+ Add model", "Reasoner et worker doivent être chargés.": "Reasoner and worker must be loaded.",
-    "⚡ Auto-détecter et charger les modèles locaux": "⚡ Auto-detect and load local models",
-    "INFÉRENCES LIVE": "LIVE INFERENCES", "dépendance(s)": "dependency(ies)", "en attente": "pending",
-    "Non affecté": "Unassigned", "Aucun GPU détecté.": "No GPU detected.", "Charger": "Load",
-    "Aucun modèle enregistré.": "No registered model.", "Enregistrer": "Save", "DURÉE": "DURATION",
-    "PUISSANCE MOY.": "AVERAGE POWER", "ÉNERGIE EST.": "ESTIMATED ENERGY", "Étape": "Step",
-    "sans modèle": "no model", "RÉSUMÉ": "SUMMARY", "Sans résumé": "No summary", "LIVRABLE": "DELIVERABLE",
-    "FICHIERS PRODUITS": "PRODUCED FILES", "Hypothèses": "Assumptions", "Preuves": "Evidence",
-    "Actions suivantes": "Next actions", "ERREUR": "ERROR", "Dernier résultat disponible": "Latest available result",
-    "Visualiser en Markdown": "Preview as Markdown", "Le livrable apparaîtra lorsque les étapes auront produit une sortie.": "The deliverable will appear after the steps produce an output.",
-    "Commande dans le workspace du workflow actif": "Command in the active workflow workspace",
-    "Docker · réseau désactivé · CPU/RAM/PID limités · filesystem isolé.": "Docker · network disabled · CPU/RAM/PID limited · isolated filesystem.",
-    "DANGER · Commandes exécutées sur Windows sans isolation. Accès filesystem réel depuis le workspace.": "DANGER · Commands run on Windows without isolation. Real filesystem access from the workspace.",
-    "IMAGE ABSENTE": "IMAGE MISSING", "Exécution en cours…": "Execution in progress…", "Commande en cours…": "Command running…",
-    "Aucun fichier n’était requis ou produit pour cette demande.": "No file was required or produced for this request.",
-    "Reasoner et worker sont prêts · workflows en mode LIVE": "Reasoner and worker are ready · workflows use LIVE mode",
-    "Reasoner et worker doivent être chargés.": "Reasoner and worker must be loaded.",
-    "Chargement CUDA en cours…": "Loading CUDA…", "Démarrage des deux serveurs et chargement des poids…": "Starting both servers and loading weights…",
-    "GPU DÉTECTÉS": "DETECTED GPUS", "Lancez un objectif pour matérialiser son DAG.": "Run an objective to materialize its DAG.",
-    "Ajouter une API OAuth2 robuste avec refresh tokens et tests de sécurité": "Add a robust OAuth2 API with refresh tokens and security tests",
-    "Nom du profil": "Profile name", "Commande dans le workspace du workflow actif": "Command in the active workflow workspace",
   };
   const saved = localStorage.getItem("skein_language") || "auto";
   const resolved = saved === "auto" ? ((navigator.language || "en").toLowerCase().startsWith("fr") ? "fr" : "en") : (saved === "fr" ? "fr" : "en");
@@ -344,32 +370,8 @@
     root.querySelectorAll?.("[data-i18n]").forEach(el => { el.textContent = window.skeinI18n.t(el.dataset.i18n); });
     root.querySelectorAll?.("[data-i18n-placeholder]").forEach(el => { el.placeholder = window.skeinI18n.t(el.dataset.i18nPlaceholder); });
     root.querySelectorAll?.("[data-i18n-value]").forEach(el => { el.value = window.skeinI18n.t(el.dataset.i18nValue); });
-    root.querySelectorAll?.("[placeholder]").forEach(el => {
-      if (resolved === "en") Object.entries(pairs).forEach(([french, english]) => { el.placeholder = el.placeholder.replaceAll(french, english); });
-    });
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-    let node;
-    while ((node = walker.nextNode())) {
-      const value = node.nodeValue.trim();
-      if (!value) continue;
-      if (resolved === "en") {
-        let translated=node.nodeValue;
-        Object.entries(pairs).forEach(([french, english]) => { translated = translated.replaceAll(french, english); });
-        if(translated!==node.nodeValue) node.nodeValue=translated;
-      }
-      if (resolved === "fr") {
-        const hit = Object.entries(pairs).find(([, english]) => english === value);
-        if (hit) node.nodeValue = node.nodeValue.replace(value, hit[0]);
-      }
-    }
     document.documentElement.lang = resolved;
   };
   window.skeinTranslate = translate;
-  addEventListener("DOMContentLoaded", () => {
-    translate(document.body);
-    new MutationObserver(records => records.forEach(r => {
-      r.addedNodes.forEach(n => n.nodeType === 1 ? translate(n) : (n.nodeType === 3 && n.parentElement ? translate(n.parentElement) : null));
-      if(r.type === "characterData" && r.target.parentElement) translate(r.target.parentElement);
-    })).observe(document.body, { childList: true, characterData:true, subtree: true });
-  });
+  addEventListener("DOMContentLoaded", () => translate(document.body));
 })();

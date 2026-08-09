@@ -1,36 +1,5 @@
 (() => {
-  const labels = {
-    en: {
-      execution: "Execution",
-      history: "History",
-      administration: "Administration",
-      executionTitle: "Workflow execution",
-      executionText: "Create a workflow, follow its steps, inspect outputs, and run its deliverables.",
-      historyTitle: "Workflow history",
-      historyText: "Select a previous run to inspect its report, metrics, steps, and artifacts.",
-      administrationTitle: "System administration",
-      administrationText: "Manage access, execution policy, hardware pools, models, and runtimes.",
-      workspace: "Workspace",
-      localControlPlane: "Local control plane",
-      gpuWorkspace: "GPU orchestration workspace",
-    },
-    fr: {
-      execution: "Exécution",
-      history: "Historique",
-      administration: "Administration",
-      executionTitle: "Exécution des workflows",
-      executionText: "Créez un workflow, suivez ses étapes, consultez ses sorties et exécutez ses livrables.",
-      historyTitle: "Historique des workflows",
-      historyText: "Sélectionnez une exécution précédente pour consulter son rapport, ses métriques, ses étapes et ses fichiers.",
-      administrationTitle: "Administration du système",
-      administrationText: "Gérez les accès, la politique d’exécution, les pools matériels, les modèles et les runtimes.",
-      workspace: "Espace de travail",
-      localControlPlane: "Plan de contrôle local",
-      gpuWorkspace: "Orchestration des ressources GPU",
-    },
-  };
-  const language = () => window.skeinI18n?.language === "fr" ? "fr" : "en";
-  const text = key => labels[language()][key];
+  const text = key => window.skeinI18n.t(key);
   let activeView = "execution";
   let administrationAccess = false;
   let executionAccess = false;
@@ -67,7 +36,7 @@
       const navigation = document.createElement("nav");
       navigation.className = "main-navigation"; navigation.dataset.section=text("workspace");
       navigation.innerHTML = `${executionAccess?`<button data-main-view="execution"><i data-lucide="message-square-plus"></i><span>${text("execution")}</span></button>`:""}${historyAccess?`<button data-main-view="history"><i data-lucide="history"></i><span>${text("history")}</span></button>`:""}${administrationAccess ? `<button data-main-view="administration"><i data-lucide="settings-2"></i><span>${text("administration")}</span></button>` : ""}`;
-      const sidebar=document.createElement("aside"); sidebar.className="app-sidebar"; sidebar.setAttribute("aria-label","Primary navigation");
+      const sidebar=document.createElement("aside"); sidebar.className="app-sidebar"; sidebar.setAttribute("aria-label",text("primaryNavigation"));
       const brand=document.querySelector("body > header .brand"); sidebar.append(brand,navigation);
       const status=document.createElement("div"); status.className="sidebar-status"; status.innerHTML=`<b><i></i>${text("localControlPlane")}</b><span>${text("gpuWorkspace")}</span>`; sidebar.append(status);
       document.body.prepend(sidebar); window.lucide?.createIcons();
