@@ -521,7 +521,7 @@ def plan_for(objective):
 
 WORKFLOW_ROLES = {
     "architect", "analyst", "coder", "executor", "integrator", "researcher",
-    "reviewer", "security-reviewer", "tester", "translator",
+    "reviewer", "security-reviewer", "tester", "translator", "workflow-reporter",
 }
 WORKFLOW_ACTION_TYPES = {"llm", "command", "script"}
 WORKFLOW_OUTPUT_FORMATS = {"text", "markdown", "json", "files", "exit_code", "boolean"}
@@ -537,6 +537,17 @@ def normalize_task_contract(task):
       "system_prompt":task.get("system_prompt") or default_system_prompt(task.get("role","executor")),
       "output_format":task.get("output_format","markdown" if task.get("role")=="integrator" else "json"),
       "output_schema":task.get("output_schema") or ("A complete usable final answer" if task.get("role")=="integrator" else "Structured findings for dependent steps")}
+
+
+def ensure_workflow_report_task(tasks,is_chat=False):
+    normalized=[normalize_task_contract(task) for task in tasks]
+    if is_chat or any(task.get("role")=="workflow-reporter" or task.get("key")=="workflow_report" for task in normalized): return normalized
+    keys=[task["key"] for task in normalized]
+    normalized.append({"key":"workflow_report","title":"Analyze execution logs and produce the workflow report","role":"workflow-reporter","dependencies":keys,
+      "complexity":.35,"risk":.15,"criticality":.85,"action_type":"llm","action_config":{},
+      "system_prompt":"You are the workflow execution auditor. Analyze every task result, event, command or script log, error, timing, token metric, and power metric. Produce a factual execution report. Distinguish measured data from estimates, identify failures and uncertainty, and never replace the user's main deliverable.",
+      "output_format":"markdown","output_schema":"Markdown execution report with status, chronological step analysis, log and error analysis, performance and energy metrics, anomalies, and recommendations"})
+    return normalized
 
 
 def task_specs_to_template(specs):
@@ -624,7 +635,8 @@ def validate_workflow_tasks(tasks):
     if len(visited) != len(keys): errors.append("Task dependencies must form an acyclic graph")
     terminals = [key for key in keys if key not in referenced]
     if len(terminals) != 1: errors.append("A workflow must have exactly one terminal task")
-    elif tasks[keys.index(terminals[0])].get("role") != "integrator": errors.append("The terminal task must use the integrator role")
+    elif tasks[keys.index(terminals[0])].get("role") not in ("integrator", "workflow-reporter"):
+        errors.append("The terminal task must use the integrator or workflow-reporter role")
     return {"valid": not errors, "errors": errors, "task_count": len(tasks), "terminal_task": terminals[0] if len(terminals) == 1 else None}
 
 
@@ -666,7 +678,8 @@ def seed_default_workflow_templates(conn):
 
 
 def workflow_template_payload(row, user_id=None, manage_all=False):
-    item = dict(row); item["tasks"] = [normalize_task_contract(task) for task in json.loads(item["tasks"])]; item["tags"] = [tag for tag in item["tags"].split(",") if tag]
+    item = dict(row); item["tags"] = [tag for tag in item["tags"].split(",") if tag]; is_chat=item["id"]=="default-chat" or "chat" in item["tags"]
+    item["tasks"] = ensure_workflow_report_task(json.loads(item["tasks"]),is_chat)
     item["shared"] = bool(item["shared"]); item["system"] = bool(item["system"])
     owned = bool(user_id and item["owner_id"] == user_id)
     item["permissions"] = {"edit": not item["system"] and (owned or manage_all), "delete": not item["system"] and (owned or manage_all), "share": not item["system"] and (owned or manage_all)}
@@ -688,10 +701,11 @@ def normalize_workflow_template(body):
     if len(description) > 500: raise ValueError("Template description must not exceed 500 characters")
     if not 3 <= len(objective_template) <= 500: raise ValueError("Objective template must contain 3 to 500 characters")
     raw_tasks = body.get("tasks")
-    tasks=[] if not isinstance(raw_tasks,list) else [normalize_task_contract(task) for task in raw_tasks]
+    raw_tags = body.get("tags", [])
+    chat_hint="chat" in ([tag.strip().lower() for tag in raw_tags.split(",")] if isinstance(raw_tags,str) else [str(tag).strip().lower() for tag in raw_tags])
+    tasks=[] if not isinstance(raw_tasks,list) else ensure_workflow_report_task(raw_tasks,chat_hint)
     validation = validate_workflow_tasks(tasks)
     if not validation["valid"]: raise ValueError("; ".join(validation["errors"]))
-    raw_tags = body.get("tags", [])
     if isinstance(raw_tags, str): raw_tags = raw_tags.split(",")
     if not isinstance(raw_tags, list): raise ValueError("Tags must be a list or comma-separated string")
     tags = []
@@ -779,7 +793,7 @@ def route(task):
     score = round(.40*task["complexity"] + .30*task["risk"] + .30*task["criticality"], 3)
     if task["role"] in ("coder","tester","translator","executor") and task["risk"] < .90:
         return "worker-general", score
-    if score >= .68 or task["role"] in ("architect", "security-reviewer", "integrator"):
+    if score >= .68 or task["role"] in ("architect", "security-reviewer", "integrator", "workflow-reporter"):
         return "reasoner-large", score
     return "worker-general", score
 
@@ -799,7 +813,8 @@ class ModelClient:
               "evidence":[],"next_actions":["Load a model for this role in Model Plane"],
               "mode":"error","error":f"No active endpoint for {self.tier}"}
         dependency_results=dependency_results or []
-        previous=json.dumps(dependency_results,ensure_ascii=False)[:12000]
+        context_limit=48000 if task["role"]=="workflow-reporter" else 12000
+        previous=json.dumps(dependency_results,ensure_ascii=False)[:context_limit]
         role_instruction = {
           "translator":"Perform the translation. deliverable must contain the final translated text.",
           "coder":"Write the actual code. files must contain every complete file with path and content.",
@@ -807,6 +822,7 @@ class ModelClient:
           "integrator":"Produce the final usable answer in deliverable. Do not replace the result with a plan.",
           "executor":"Execute the request and place the complete result in deliverable.",
           "reviewer":"Verify the previous result, correct it, and place the corrected version in deliverable.",
+          "workflow-reporter":"Analyze the supplied task results and execution logs. Produce only the factual Markdown execution report in deliverable; do not replace or rewrite the user's main deliverable.",
         }.get(task["role"],"Complete the task concretely instead of only explaining how to do it.")
         system_prompt=str(task.get("system_prompt") or default_system_prompt(task["role"]))+"\nExpected output format: "+str(task.get("output_format") or "markdown")+". Output contract: "+str(task.get("output_schema") or "Complete the assigned task.")
         prompt = ("/no_think\n"+("REPAIR ATTEMPT: the previous JSON was invalid. Verify every quote and escape sequence.\n" if retry else "")+role_instruction+"\nReturn only one JSON object with exactly these fields: "
@@ -1165,6 +1181,32 @@ def evaluate_task_condition(wid,task,objective,dependency_results):
     return value.startswith(("true","yes","oui","1")),result
 
 
+def format_execution_report(auditor_result,dependency_results):
+    task_results=[item for item in dependency_results if item.get("task")!="Workflow events and execution logs"]
+    log_context=next((item.get("result",{}) for item in dependency_results if item.get("task")=="Workflow events and execution logs"),{})
+    failed=[]; lines=["# Workflow Execution Report","","## Status and step analysis",""]
+    total_tokens=0; total_seconds=0.0; energy_wh=0.0
+    for index,item in enumerate(task_results,1):
+        result=item.get("result") or {}; metrics=result.get("metrics") or {}; execution=result.get("execution") or {}
+        status="FAILED" if result.get("error") or execution.get("status") in ("FAIL","TIMEOUT") or result.get("mode")=="blocked" else "COMPLETED"
+        if status=="FAILED": failed.append(item.get("task","Unknown task"))
+        total_tokens+=int(metrics.get("total_tokens") or 0); total_seconds+=float(metrics.get("execution_seconds") or 0); energy_wh+=float(metrics.get("energy_wh") or 0)
+        detail=result.get("summary") or result.get("error") or execution.get("stderr") or "No summary was returned."
+        lines.extend([f"### {index}. {item.get('task','Unknown task')}",f"- Status: {status}",f"- Mode: {result.get('mode','unknown')}",f"- Summary: {detail}"])
+        if execution:
+            lines.append(f"- Execution: {execution.get('status','unknown')}; exit code {execution.get('exit_code')}; {execution.get('duration',0)} seconds")
+        lines.append("")
+    events=log_context.get("events") or []; executions=log_context.get("executions") or []
+    lines.extend(["## Log and error analysis","",f"- Events analyzed: {len(events)}",f"- Command or script executions analyzed: {len(executions)}",f"- Failed or blocked tasks: {', '.join(failed) if failed else 'none'}"])
+    for execution in executions:
+        if execution.get("stderr"):
+            lines.append(f"- `{execution.get('runtime','runtime')}` stderr: {str(execution['stderr'])[-1000:]}")
+    lines.extend(["","## Performance and energy metrics","",f"- Total tokens before reporting: {total_tokens}",f"- Aggregated task execution time: {round(total_seconds,3)} seconds",f"- Estimated energy before reporting: {round(energy_wh,4)} Wh","- GPU power is measured when nvidia-smi is available; CPU and RAM power may be host-window estimates.","","## Auditor analysis","",str(auditor_result.get("deliverable") or auditor_result.get("summary") or "The auditor model returned no narrative analysis."),"","## Anomalies and recommendations",""])
+    recommendations=auditor_result.get("next_actions") or (["Inspect failed task output and retry after correction."] if failed else ["No blocking anomaly was detected."])
+    lines.extend(f"- {recommendation}" for recommendation in recommendations)
+    return "\n".join(lines)
+
+
 def execute_task(wid, tid, objective):
     with db() as conn:
         task = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
@@ -1172,6 +1214,12 @@ def execute_task(wid, tid, objective):
         for dep in json.loads(task["dependencies"]):
             row=conn.execute("SELECT title,result FROM tasks WHERE id=?",(dep,)).fetchone()
             if row and row["result"]: dependency_results.append({"task":row["title"],"result":json.loads(row["result"])})
+        if task["role"]=="workflow-reporter":
+            event_rows=conn.execute("SELECT task_id,kind,payload,created_at FROM events WHERE workflow_id=? ORDER BY id LIMIT 200",(wid,)).fetchall()
+            execution_rows=conn.execute("SELECT artifact_id,runtime,status,exit_code,stdout,stderr,duration,created_at FROM executions WHERE workflow_id=? ORDER BY created_at LIMIT 100",(wid,)).fetchall()
+            dependency_results.append({"task":"Workflow events and execution logs","result":{
+              "events":[{**dict(row),"payload":json.loads(row["payload"])} for row in event_rows],
+              "executions":[{**dict(row),"stdout":str(row["stdout"] or "")[-4000:],"stderr":str(row["stderr"] or "")[-4000:]} for row in execution_rows]}})
         model, score = route(task) if task["action_type"]=="llm" else (task["action_type"],0)
         conn.execute("UPDATE tasks SET status='RUNNING',model=?,routing_score=?,attempts=attempts+1,started_at=? WHERE id=?",
                      (model, score, stamp(), tid))
@@ -1190,7 +1238,11 @@ def execute_task(wid, tid, objective):
         if artifacts: execution,_=execute_in_sandbox(artifacts[0]["id"],60,EXECUTION_MODE)
         passed=execution.get("status") in ("PASS","PREVIEW_READY")
         result={"summary":f"{runtime} script {execution.get('status','FAILED')}","deliverable":execution.get("stdout") or execution.get("stderr") or "No output","files":[],"confidence":1.0 if passed else 0.0,"assumptions":[],"evidence":[f"Exit code: {execution.get('exit_code')}"],"next_actions":[] if passed else ["Inspect stderr and correct the script"],"mode":"script","execution":execution,"artifacts":artifacts}
-    else: result = ModelClient(model).generate(task, objective, dependency_results)
+    else:
+        result = ModelClient(model).generate(task, objective, dependency_results)
+        if task["role"]=="workflow-reporter" and not result.get("error"):
+            result["deliverable"]=format_execution_report(result,dependency_results)
+            result["summary"]="Workflow execution report generated from task results, events, and execution logs"
     if condition_passed and task["action_type"]=="llm" and model == "worker-general" and float(result.get("confidence", 0)) < .65:
         emit(wid, "task.escalated", {"from": model, "confidence": result.get("confidence")}, tid)
         model, result = "reasoner-large", ModelClient("reasoner-large").generate(task, objective, dependency_results)
@@ -1225,6 +1277,13 @@ def orchestrate(wid):
                 with db() as conn: conn.execute("UPDATE workflows SET status='COMPLETED',updated_at=? WHERE id=?", (stamp(),wid))
                 return
             if any(s == "FAILED" for s in state.values()):
+                reporter=next((task for task in tasks if task["role"]=="workflow-reporter"),None)
+                if reporter and reporter["status"]=="READY":
+                    blocked={"summary":"Task blocked by an earlier failure","deliverable":"Not executed because a required workflow step failed.","files":[],"confidence":0.0,"assumptions":[],"evidence":["An earlier task failed"],"next_actions":["Inspect the execution report and failed task logs"],"mode":"blocked"}
+                    with db() as conn:
+                        conn.execute("UPDATE tasks SET status='FAILED',confidence=0,result=?,finished_at=? WHERE workflow_id=? AND status='READY' AND role!='workflow-reporter'",(json.dumps(blocked),stamp(),wid))
+                    execute_task(wid,reporter["id"],wf["objective"])
+                    continue
                 emit(wid, "workflow.failed")
                 with db() as conn: conn.execute("UPDATE workflows SET status='FAILED',updated_at=? WHERE id=?", (stamp(),wid))
                 return
@@ -1282,7 +1341,10 @@ def workflow_data(wid):
         seen.add(row["relative_path"]); item=dict(row); item["validation"]=json.loads(item["validation"]) if item["validation"] else None
         item.pop("disk_path",None); item["download_url"]=f"/api/artifacts/{item['id']}"; artifacts.append(item)
     completed=[t for t in out if t["status"]=="COMPLETED" and t["result"]]
-    final=completed[-1]["result"] if completed else None
+    report_task=next((task for task in reversed(completed) if task["role"]=="workflow-reporter"),None)
+    deliverable_tasks=[task for task in completed if task["role"]!="workflow-reporter"]
+    final=deliverable_tasks[-1]["result"] if deliverable_tasks else None
+    execution_report=report_task["result"] if report_task else None
     task_metrics=[t["result"].get("metrics",{}) for t in out if t.get("result")]
     total_tokens=sum(int(m.get("total_tokens") or 0) for m in task_metrics)
     completion_tokens=sum(int(m.get("completion_tokens") or 0) for m in task_metrics)
@@ -1305,7 +1367,7 @@ def workflow_data(wid):
     with ACTIVE_LOCK:
         workflow["queue_position"]=(list(WORKFLOW_QUEUE).index(wid)+1) if wid in WORKFLOW_QUEUE else None
         workflow["parallel_limit"]=MAX_PARALLEL_WORKFLOWS
-    return {"workflow":workflow,"tasks":out,"events":ev,"final_output":final,"artifacts":artifacts,"summary":summary,
+    return {"workflow":workflow,"tasks":out,"events":ev,"final_output":final,"execution_report":execution_report,"artifacts":artifacts,"summary":summary,
             "deliverable":{"kind":"none" if not artifacts else ("file" if len(artifacts)==1 else "project"),"file_count":len(artifacts),"archive_url":f"/api/workflows/{wid}/deliverable.zip" if artifacts else None},
             "artifact_notice":f"{len(artifacts)} file(s) produced and validated." if artifacts else "No file was required or produced for this request."}
 

@@ -16,7 +16,7 @@ Development commits are protected by the checks documented in [CONTRIBUTING.md](
 - Real workflows for code, translation, and general tasks with dependency-aware steps.
 - A reusable workflow-template catalog with validated default, private, and shared DAGs.
 - Per-task tokens, output throughput, duration, average/peak GPU power, and estimated Wh.
-- End-of-workflow summary, Markdown audit report, individual artifacts, and project ZIP downloads.
+- A terminal log-analysis task on every non-chat workflow, with the Markdown execution report kept separate from the main deliverable.
 - Python, Node.js, Java, PHP, HTML, and CSS sandbox support.
 - Markdown viewer with GFM, Mermaid, DOMPurify, and syntax highlighting.
 - Persistent users, session authentication, `admin` and `user` roles.
@@ -153,6 +153,18 @@ python -B tests/live_e2e.py
 ```
 
 The live test requires loaded reasoner and worker endpoints. Sandbox tests require Docker and the runtime images listed above.
+
+### Manual full workflow matrix
+
+The manual matrix runs every workflow visible to the chosen account, one after another, with simple, medium, complex, and very complex cases. It creates `4 × workflow count` real runs, so it is intentionally excluded from pre-commit hooks and automated CI. The script refuses to start without the explicit `--run` switch.
+
+```powershell
+$env:SKEIN_TEST_USERNAME = "admin"
+$env:SKEIN_TEST_PASSWORD = "your-password"
+python scripts/manual_workflow_matrix.py --run --base-url http://127.0.0.1:8787
+```
+
+Each workflow must finish before the next begins. Results are written as timestamped JSON and Markdown files under `manual-test-results` by default. Use `--timeout`, `--output-dir`, or `--stop-on-failure` when needed. The JSON retains each objective, task status, metrics, final deliverable, and separate execution report. Do not commit result files, as they may contain user-visible generated content.
 
 ## License
 

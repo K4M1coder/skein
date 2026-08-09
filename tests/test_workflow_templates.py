@@ -66,6 +66,14 @@ class WorkflowTemplateTest(unittest.TestCase):
         self.assertGreaterEqual(len(defaults), 8)
         self.assertTrue({"default-chat", "default-daily-assistance", "default-research", "default-code-specification"}.issubset({template["id"] for template in defaults}))
         self.assertTrue(all(template["validation"]["valid"] for template in defaults))
+        chat = next(template for template in defaults if template["id"] == "default-chat")
+        self.assertFalse(any(task["role"] == "workflow-reporter" for task in chat["tasks"]))
+        for template in defaults:
+            if template["id"] == "default-chat":
+                continue
+            reporter = template["tasks"][-1]
+            self.assertEqual(reporter["role"], "workflow-reporter")
+            self.assertEqual(reporter["dependencies"], [task["key"] for task in template["tasks"][:-1]])
         with self.assertRaises(HTTPError) as caught:
             self.request(f"/api/workflow-templates/{defaults[0]['id']}", method="DELETE")
         self.assertEqual(caught.exception.code, 409)
@@ -75,6 +83,7 @@ class WorkflowTemplateTest(unittest.TestCase):
         self.assertEqual(status, 201)
         self.assertTrue(created["validation"]["valid"])
         self.assertTrue(created["permissions"]["edit"])
+        self.assertEqual(created["tasks"][-1]["role"], "workflow-reporter")
         payload = self.valid_template() | {"name": "Shared documentation delivery", "shared": True}
         _, updated = self.request(f"/api/workflow-templates/{created['id']}", payload)
         self.assertEqual(updated["name"], "Shared documentation delivery")
@@ -163,6 +172,13 @@ class WorkflowTemplateTest(unittest.TestCase):
             if all(state in ("COMPLETED", "FAILED") for state in states): break
             time.sleep(.1)
         self.assertTrue(all(state == "COMPLETED" for state in states))
+        for workflow_id in workflow_ids:
+            workflow = self.request(f"/api/workflows/{workflow_id}")[1]
+            self.assertIsNotNone(workflow["final_output"])
+            self.assertIsNotNone(workflow["execution_report"])
+            self.assertEqual(workflow["tasks"][-1]["role"], "workflow-reporter")
+            self.assertNotEqual(workflow["final_output"], workflow["execution_report"])
+            self.assertTrue(workflow["execution_report"]["deliverable"].startswith("# Workflow Execution Report"))
 
     def test_command_action_executes_without_an_llm(self):
         previous_mode = app.EXECUTION_MODE
@@ -196,6 +212,41 @@ class WorkflowTemplateTest(unittest.TestCase):
             self.assertEqual(resources["resource_scope"], "local_machine")
             self.assertIn("estimated_cpu_w", resources)
             self.assertIn("estimated_ram_w", resources)
+        finally:
+            app.EXECUTION_MODE = previous_mode
+
+    def test_reporter_runs_after_a_failed_task_and_analyzes_the_failure(self):
+        previous_mode = app.EXECUTION_MODE
+        app.EXECUTION_MODE = "local"
+        try:
+            tasks = app.ensure_workflow_report_task([{
+                "key": "failing_command",
+                "title": "Run an intentionally failing command",
+                "role": "integrator",
+                "dependencies": [],
+                "complexity": 0.1,
+                "risk": 0.1,
+                "criticality": 0.5,
+                "action_type": "command",
+                "action_config": {"command": "Write-Error 'intentional failure'; exit 7"},
+                "system_prompt": "",
+                "output_format": "exit_code",
+                "output_schema": "A failing exit code and captured standard error",
+            }])
+            workflow_id = app.create_workflow("Verify failure reporting", specs=app.template_task_specs(tasks))
+            app.start_workflow(workflow_id)
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                workflow = app.workflow_data(workflow_id)
+                if workflow["workflow"]["status"] in ("COMPLETED", "FAILED"):
+                    break
+                time.sleep(0.05)
+            self.assertEqual(workflow["workflow"]["status"], "FAILED")
+            self.assertEqual(workflow["tasks"][-1]["status"], "COMPLETED")
+            self.assertIsNotNone(workflow["execution_report"])
+            self.assertIn("Failed or blocked tasks", workflow["execution_report"]["deliverable"])
+            self.assertIn("intentional failure", workflow["execution_report"]["deliverable"])
+            self.assertEqual(workflow["tasks"][0]["result"]["execution"]["exit_code"], 7)
         finally:
             app.EXECUTION_MODE = previous_mode
 

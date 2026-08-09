@@ -44,17 +44,19 @@ class SmokeTest(unittest.TestCase):
             if data["workflow"]["status"] in ("COMPLETED", "FAILED"): break
             time.sleep(.15)
         self.assertEqual(data["workflow"]["status"], "COMPLETED")
-        self.assertEqual(len(data["tasks"]), 4)
+        self.assertEqual(len(data["tasks"]), 5)
+        self.assertEqual(data["tasks"][-1]["role"], "workflow-reporter")
         self.assertTrue(all(t["result"] and t["confidence"] for t in data["tasks"]))
         self.assertIn("worker-general", {t["model"] for t in data["tasks"]})
         self.assertIn("reasoner-large", {t["model"] for t in data["tasks"]})
         self.assertTrue(any(e["kind"] == "workflow.completed" for e in data["events"]))
         self.assertIsNotNone(data["final_output"])
+        self.assertIsNotNone(data["execution_report"])
         self.assertIn("No file", data["artifact_notice"])
         with urlopen(f"http://127.0.0.1:{self.port}/api/workflows/{wid}/report") as response:
             report=response.read().decode()
         self.assertIn("# Skein Report",report)
-        self.assertIn("## Step 4",report)
+        self.assertIn("## Step 5",report)
 
     def test_artifact_persistence_validation_and_download(self):
         wid=app.create_workflow("Créer un script Python hello world","owner-test","session-test")

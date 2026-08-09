@@ -22,8 +22,12 @@ Validation requires:
 - existing, unique dependencies with no self-reference;
 - scores between zero and one;
 - an acyclic dependency graph;
-- exactly one terminal task using the `integrator` role.
+- exactly one terminal task using the `integrator` or `workflow-reporter` role;
 - valid action configuration, output format, and output schema for every task and condition.
+
+Skein automatically appends a `workflow-reporter` LLM task to every non-chat template. It depends on every preceding task and receives their results plus workflow events and command/script execution logs. Its system prompt requires a factual Markdown audit covering chronological step outcomes, errors, logs, timing, tokens, power, uncertainty, anomalies, and recommendations. Templates tagged `chat`, including the system Simple chat template, deliberately omit this extra step.
+
+The reporter is operational metadata, not the user's deliverable. The workflow API therefore exposes the last completed non-reporter result as `final_output` and the reporter result separately as `execution_report`. The Execution and History views present both independently.
 
 System templates are seeded for general delivery, software implementation, translation, security-sensitive changes, simple chat, daily assistance, research and synthesis, and specification derived from code. They are shared, immutable, and validated during database initialization.
 

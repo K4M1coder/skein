@@ -22,7 +22,7 @@
     const end=`<path d="M ${endFrom.x} ${endFrom.y+36} C ${endFrom.x} ${endY-45}, ${width/2} ${endY-45}, ${width/2} ${endY-22}"/><ellipse cx="${width/2}" cy="${endY}" rx="44" ry="20"/><ellipse cx="${width/2}" cy="${endY}" rx="38" ry="15"/><text x="${width/2}" y="${endY+5}" text-anchor="middle">${esc(text("diagramEnd"))}</text>`;
     return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${esc(text("algorithmDiagram"))}"><defs><marker id="activity-arrow" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z"/></marker></defs><g class="activity-edges">${starters}${edges}</g><g class="activity-nodes">${start}${nodes}${end}</g></svg>`;
   };
-  const participantFor=task=>task.action_type==="command"||task.action_type==="script"?"Runtime":task.role==="integrator"||["architect","analyst","reviewer","security-reviewer","researcher"].includes(task.role)?"Reasoner":"Worker";
+  const participantFor=task=>task.action_type==="command"||task.action_type==="script"?"Runtime":task.role==="integrator"||["architect","analyst","reviewer","security-reviewer","researcher","workflow-reporter"].includes(task.role)?"Reasoner":"Worker";
   const sequenceSvg=tasks=>{
     const {levels}=validate(tasks),participants=["User","Orchestrator","Reasoner","Worker","Runtime"],labels={User:text("sequenceUser"),Orchestrator:text("sequenceOrchestrator"),Reasoner:"Reasoner",Worker:"Worker",Runtime:text("sequenceRuntime")};
     const width=1000,margin=90,gap=(width-margin*2)/(participants.length-1),headerY=45,rowHeight=92,height=125+tasks.length*rowHeight,positions=Object.fromEntries(participants.map((name,index)=>[name,margin+index*gap]));
