@@ -69,7 +69,8 @@
       document.querySelector(".runtime-gate").classList.toggle("permission-hidden",!can("models.manage")); document.querySelector(".hardware").classList.toggle("permission-hidden",!session.user.permissions.some(permission=>["server_stats.read","settings.manage","models.manage"].includes(permission))); document.querySelector(".model-control").classList.toggle("permission-hidden",!can("models.manage")); document.querySelectorAll("[data-stack]").forEach(x=>x.classList.toggle("permission-hidden",!can("settings.manage")));
       if(administrationAccess) await renderAdmin(session);
       window.skeinNavigation.init(session);
-      const script=document.createElement("script"); script.src="/app.js?v=7"; document.body.appendChild(script);
+      await window.skeinWorkflowTemplates.init(session);
+      const script=document.createElement("script"); script.src="/app.js?v=8"; document.body.appendChild(script);
     } catch (error) { showLogin(); }
   };
   addEventListener("DOMContentLoaded", boot);

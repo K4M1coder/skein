@@ -9,7 +9,7 @@
   let intro;
 
   const sections = () => ({
-    execution: [document.querySelector(".hero"), document.querySelector(".models"), document.querySelector(".tool-plane"), activeWorkflowSection],
+    execution: [document.querySelector(".hero"), document.querySelector(".models"), document.querySelector(".workflow-catalog"), document.querySelector(".tool-plane"), activeWorkflowSection],
     history: [lowerSection, activeWorkflowSection],
     administration: [document.querySelector(".admin-panel"), document.querySelector(".runtime-gate"), document.querySelector(".hardware"), document.querySelector(".model-control")],
   });
