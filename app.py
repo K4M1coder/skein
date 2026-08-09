@@ -49,7 +49,9 @@ def init_db():
           complexity REAL NOT NULL, risk REAL NOT NULL, criticality REAL NOT NULL,
           status TEXT NOT NULL, model TEXT, routing_score REAL, confidence REAL,
           result TEXT, attempts INTEGER NOT NULL DEFAULT 0,
-          started_at REAL, finished_at REAL);
+          started_at REAL, finished_at REAL, action_type TEXT NOT NULL DEFAULT 'llm',
+          action_config TEXT NOT NULL DEFAULT '{}', system_prompt TEXT NOT NULL DEFAULT '',
+          output_format TEXT NOT NULL DEFAULT 'markdown', output_schema TEXT NOT NULL DEFAULT '');
         CREATE TABLE IF NOT EXISTS events(
           id INTEGER PRIMARY KEY AUTOINCREMENT, workflow_id TEXT NOT NULL,
           task_id TEXT, kind TEXT NOT NULL, payload TEXT NOT NULL, created_at REAL NOT NULL);
@@ -114,6 +116,9 @@ def init_db():
         if "email" not in user_columns: conn.execute("ALTER TABLE users ADD COLUMN email TEXT")
         if "verified_at" not in user_columns: conn.execute("ALTER TABLE users ADD COLUMN verified_at REAL")
         session_columns={r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
+        task_columns={r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+        for column,definition in (("action_type","TEXT NOT NULL DEFAULT 'llm'"),("action_config","TEXT NOT NULL DEFAULT '{}'"),("system_prompt","TEXT NOT NULL DEFAULT ''"),("output_format","TEXT NOT NULL DEFAULT 'markdown'"),("output_schema","TEXT NOT NULL DEFAULT ''")):
+            if column not in task_columns: conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} {definition}")
         if "storage_id" not in session_columns: conn.execute("ALTER TABLE sessions ADD COLUMN storage_id TEXT")
         for session in conn.execute("SELECT token FROM sessions WHERE storage_id IS NULL OR storage_id='' ").fetchall():
             conn.execute("UPDATE sessions SET storage_id=? WHERE token=?",(str(uuid.uuid4()),session["token"]))
@@ -477,6 +482,20 @@ WORKFLOW_ROLES = {
     "architect", "analyst", "coder", "executor", "integrator", "researcher",
     "reviewer", "security-reviewer", "tester", "translator",
 }
+WORKFLOW_ACTION_TYPES = {"llm", "command", "script"}
+WORKFLOW_OUTPUT_FORMATS = {"text", "markdown", "json", "files", "exit_code", "boolean"}
+
+
+def default_system_prompt(role):
+    return f"You are the {role} for this workflow step. Complete only the assigned micro-task, use dependency results as evidence, and satisfy the declared output contract."
+
+
+def normalize_task_contract(task):
+    return {**task,
+      "action_type":task.get("action_type","llm"),"action_config":task.get("action_config",{}),
+      "system_prompt":task.get("system_prompt") or default_system_prompt(task.get("role","executor")),
+      "output_format":task.get("output_format","markdown" if task.get("role")=="integrator" else "json"),
+      "output_schema":task.get("output_schema") or ("A complete usable final answer" if task.get("role")=="integrator" else "Structured findings for dependent steps")}
 
 
 def task_specs_to_template(specs):
@@ -490,6 +509,11 @@ def task_specs_to_template(specs):
             "complexity": complexity,
             "risk": risk,
             "criticality": criticality,
+            "action_type": "llm",
+            "action_config": {},
+            "system_prompt": default_system_prompt(role),
+            "output_format": "markdown" if role == "integrator" else "json",
+            "output_schema": "A complete usable final answer" if role == "integrator" else "Structured findings for dependent steps",
         }
         for index, (title, role, dependencies, complexity, risk, criticality) in enumerate(specs)
     ]
@@ -507,9 +531,33 @@ def validate_workflow_tasks(tasks):
         key = str(task.get("key", "")).strip()
         title = str(task.get("title", "")).strip()
         role = str(task.get("role", "")).strip()
+        action_type = str(task.get("action_type", "llm")).strip()
+        output_format = str(task.get("output_format", "markdown")).strip()
         if not re.fullmatch(r"[a-z][a-z0-9_-]{1,63}", key): errors.append(f"Task {index + 1} has an invalid key")
         if not 3 <= len(title) <= 200: errors.append(f"Task {index + 1} title must contain 3 to 200 characters")
         if role not in WORKFLOW_ROLES: errors.append(f"Task {index + 1} has an unsupported role")
+        if action_type not in WORKFLOW_ACTION_TYPES: errors.append(f"Task {index + 1} has an unsupported action type")
+        if output_format not in WORKFLOW_OUTPUT_FORMATS: errors.append(f"Task {index + 1} has an unsupported output format")
+        if not 3 <= len(str(task.get("output_schema", "")).strip()) <= 1000: errors.append(f"Task {index + 1} output schema must contain 3 to 1000 characters")
+        config=task.get("action_config",{})
+        if not isinstance(config,dict): errors.append(f"Task {index + 1} action config must be an object")
+        elif action_type=="command" and not 1 <= len(str(config.get("command","")).strip()) <= 4000: errors.append(f"Task {index + 1} command is required")
+        elif action_type=="script":
+            if str(config.get("runtime","")) not in {"python","node","java","php"}: errors.append(f"Task {index + 1} script runtime is unsupported")
+            if not 1 <= len(str(config.get("content",""))) <= 100000: errors.append(f"Task {index + 1} script content is required")
+        if isinstance(config,dict) and config.get("condition") is not None:
+            condition=config["condition"]
+            if not isinstance(condition,dict): errors.append(f"Task {index + 1} condition must be an object")
+            else:
+                condition_type=str(condition.get("action_type",""))
+                if condition_type not in WORKFLOW_ACTION_TYPES: errors.append(f"Task {index + 1} condition has an unsupported action type")
+                if condition.get("output_format")!="boolean": errors.append(f"Task {index + 1} condition output format must be boolean")
+                condition_config=condition.get("action_config",{})
+                if not isinstance(condition_config,dict): errors.append(f"Task {index + 1} condition action config must be an object")
+                elif condition_type=="command" and not str(condition_config.get("command","")).strip(): errors.append(f"Task {index + 1} condition command is required")
+                elif condition_type=="script" and (condition_config.get("runtime") not in {"python","node","java","php"} or not str(condition_config.get("content","")).strip()): errors.append(f"Task {index + 1} condition script is incomplete")
+                if condition_type=="llm" and len(str(condition.get("system_prompt","")).strip())<10: errors.append(f"Task {index + 1} condition LLM system prompt is required")
+        if action_type=="llm" and not 10 <= len(str(task.get("system_prompt","")).strip()) <= 4000: errors.append(f"Task {index + 1} LLM system prompt must contain 10 to 4000 characters")
         for field in ("complexity", "risk", "criticality"):
             try: value = float(task.get(field, 0.5))
             except (TypeError, ValueError): errors.append(f"Task {index + 1} {field} must be a number"); continue
@@ -577,7 +625,7 @@ def seed_default_workflow_templates(conn):
 
 
 def workflow_template_payload(row, user_id=None, manage_all=False):
-    item = dict(row); item["tasks"] = json.loads(item["tasks"]); item["tags"] = [tag for tag in item["tags"].split(",") if tag]
+    item = dict(row); item["tasks"] = [normalize_task_contract(task) for task in json.loads(item["tasks"])]; item["tags"] = [tag for tag in item["tags"].split(",") if tag]
     item["shared"] = bool(item["shared"]); item["system"] = bool(item["system"])
     owned = bool(user_id and item["owner_id"] == user_id)
     item["permissions"] = {"edit": not item["system"] and (owned or manage_all), "delete": not item["system"] and (owned or manage_all), "share": not item["system"] and (owned or manage_all)}
@@ -598,7 +646,8 @@ def normalize_workflow_template(body):
     if not 3 <= len(name) <= 80: raise ValueError("Template name must contain 3 to 80 characters")
     if len(description) > 500: raise ValueError("Template description must not exceed 500 characters")
     if not 3 <= len(objective_template) <= 500: raise ValueError("Objective template must contain 3 to 500 characters")
-    tasks = body.get("tasks")
+    raw_tasks = body.get("tasks")
+    tasks=[] if not isinstance(raw_tasks,list) else [normalize_task_contract(task) for task in raw_tasks]
     validation = validate_workflow_tasks(tasks)
     if not validation["valid"]: raise ValueError("; ".join(validation["errors"]))
     raw_tags = body.get("tags", [])
@@ -660,7 +709,7 @@ def template_task_specs(tasks):
     validation = validate_workflow_tasks(tasks)
     if not validation["valid"]: raise ValueError("; ".join(validation["errors"]))
     positions = {task["key"]: index for index, task in enumerate(tasks)}
-    return [(task["title"], task["role"], [positions[key] for key in task["dependencies"]], float(task.get("complexity", .5)), float(task.get("risk", .5)), float(task.get("criticality", .5))) for task in tasks]
+    return [{**normalize_task_contract(task),"dependencies":[positions[key] for key in task["dependencies"]]} for task in tasks]
 
 
 def create_workflow(objective,owner_id=None,session_id=None,specs=None,template_id=None,planning_mode="automatic"):
@@ -670,11 +719,16 @@ def create_workflow(objective,owner_id=None,session_id=None,specs=None,template_
     with db() as conn:
         conn.execute("INSERT INTO workflows(id,objective,status,created_at,updated_at,owner_id,session_id,template_id,planning_mode) VALUES(?,?,?,?,?,?,?,?,?)", (wid, objective, "READY", created, created,owner_id,session_id,template_id,planning_mode))
         for pos, spec in enumerate(specs):
-            title, role, deps, complexity, risk, criticality = spec
+            if isinstance(spec,dict):
+                title,role,deps=spec["title"],spec["role"],spec["dependencies"]
+                complexity,risk,criticality=float(spec.get("complexity",.5)),float(spec.get("risk",.5)),float(spec.get("criticality",.5))
+                contract=normalize_task_contract(spec)
+            else:
+                title, role, deps, complexity, risk, criticality = spec; contract=normalize_task_contract({"role":role})
             conn.execute("""INSERT INTO tasks(id,workflow_id,position,title,role,dependencies,
-              complexity,risk,criticality,status) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+              complexity,risk,criticality,status,action_type,action_config,system_prompt,output_format,output_schema) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                (ids[pos], wid, pos, title, role, json.dumps([ids[i] for i in deps]),
-               complexity, risk, criticality, "READY"))
+               complexity, risk, criticality, "READY",contract["action_type"],json.dumps(contract["action_config"],ensure_ascii=False),contract["system_prompt"],contract["output_format"],contract["output_schema"]))
     workflow_storage_root(wid,owner_id,session_id).mkdir(parents=True,exist_ok=True)
     emit(wid, "workflow.created", {"objective": objective, "tasks": len(specs), "template_id": template_id, "planning_mode": planning_mode})
     return wid
@@ -713,12 +767,13 @@ class ModelClient:
           "executor":"Execute the request and place the complete result in deliverable.",
           "reviewer":"Verify the previous result, correct it, and place the corrected version in deliverable.",
         }.get(task["role"],"Complete the task concretely instead of only explaining how to do it.")
+        system_prompt=str(task.get("system_prompt") or default_system_prompt(task["role"]))+"\nExpected output format: "+str(task.get("output_format") or "markdown")+". Output contract: "+str(task.get("output_schema") or "Complete the assigned task.")
         prompt = ("/no_think\n"+("REPAIR ATTEMPT: the previous JSON was invalid. Verify every quote and escape sequence.\n" if retry else "")+role_instruction+"\nReturn only one JSON object with exactly these fields: "
           "summary (short), deliverable (complete usable result), files (list of {path, content}), "
           "confidence (0..1), assumptions, evidence, next_actions. Lists other than files contain at most 3 items. "
           "Do not wrap JSON in Markdown. Never claim that a file exists: include its complete content in files.\n"
           "USER OBJECTIVE:\n"+objective+"\nCURRENT TASK:\n"+task["title"]+"\nDEPENDENCY RESULTS:\n"+previous)
-        body = json.dumps({"model": self.model, "messages": [{"role":"user","content":prompt}],
+        body = json.dumps({"model": self.model, "messages": [{"role":"system","content":system_prompt},{"role":"user","content":prompt}],
                            "temperature": 0 if retry else .15, "max_tokens": 4096,
                            "response_format": {"type":"json_object"},
                            "chat_template_kwargs": {"enable_thinking": False}}).encode()
@@ -798,7 +853,9 @@ class ModelClient:
         repair = "The previous proposal was invalid. Return corrected JSON only.\n" if retry else ""
         prompt = ("/no_think\n"+repair+"You are the Skein workflow architect. Design a directly executable task DAG for the user objective. "
           "Return only one JSON object with name, description, objective_template, tags, and tasks. "
-          "tasks contains 1 to 12 objects with key, title, role, dependencies, complexity, risk, and criticality. "
+          "tasks contains 1 to 12 objects with key, title, role, dependencies, complexity, risk, criticality, action_type, action_config, system_prompt, output_format, and output_schema. "
+          "Every action_type is llm, command, or script. LLM steps require a task-specific system_prompt. Command steps require action_config.command. Script steps require action_config.runtime and action_config.content. "
+          "Every step declares output_format (text, markdown, json, files, exit_code, or boolean) and a precise output_schema. An optional action_config.condition uses the same action fields and must declare boolean output. "
           "Use stable lowercase keys; dependencies reference earlier task keys. Scores are numbers from 0 to 1. "
           "Allowed roles: "+", ".join(sorted(WORKFLOW_ROLES))+". The graph must be acyclic, have exactly one terminal task, "
           "and that terminal task must use the integrator role. Include implementation and verification tasks when required.\n"
@@ -1044,26 +1101,58 @@ def persist_artifacts(wid,tid,files):
     return saved
 
 
+def evaluate_task_condition(wid,task,objective,dependency_results):
+    condition=json.loads(task["action_config"] or "{}").get("condition")
+    if not condition: return True,None
+    action_type=condition["action_type"]
+    if action_type=="command":
+        execution,_=execute_command(wid,condition["action_config"]["command"],60,EXECUTION_MODE)
+        return execution.get("status")=="PASS",execution
+    if action_type=="script":
+        config=condition["action_config"]; extensions={"python":"py","node":"js","java":"java","php":"php"}; runtime=config["runtime"]
+        artifacts=persist_artifacts(wid,task["id"],[{"path":f"workflow-conditions/{task['position']+1:02d}.{extensions[runtime]}","content":config["content"]}])
+        if not artifacts: return False,{"status":"FAIL","stderr":"Condition script artifact could not be created"}
+        execution,_=execute_in_sandbox(artifacts[0]["id"],60,EXECUTION_MODE)
+        return execution.get("status")=="PASS",execution
+    condition_task={**task,"role":"analyst","system_prompt":condition["system_prompt"],"output_format":"boolean","output_schema":condition.get("output_schema","Return true when the step should run, otherwise false")}
+    result=ModelClient("reasoner-large").generate(condition_task,objective,dependency_results)
+    value=str(result.get("deliverable") or result.get("summary") or "").strip().lower()
+    return value.startswith(("true","yes","oui","1")),result
+
+
 def execute_task(wid, tid, objective):
     with db() as conn:
-        task = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+        task = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
         dependency_results=[]
         for dep in json.loads(task["dependencies"]):
             row=conn.execute("SELECT title,result FROM tasks WHERE id=?",(dep,)).fetchone()
             if row and row["result"]: dependency_results.append({"task":row["title"],"result":json.loads(row["result"])})
-        model, score = route(task)
+        model, score = route(task) if task["action_type"]=="llm" else (task["action_type"],0)
         conn.execute("UPDATE tasks SET status='RUNNING',model=?,routing_score=?,attempts=attempts+1,started_at=? WHERE id=?",
                      (model, score, stamp(), tid))
     emit(wid, "task.started", {"model": model, "routing_score": score}, tid)
     task_started=time.perf_counter(); power=PowerSampler().start()
-    result = ModelClient(model).generate(task, objective, dependency_results)
-    if model == "worker-general" and float(result.get("confidence", 0)) < .65:
+    condition_passed,condition_result=evaluate_task_condition(wid,task,objective,dependency_results)
+    if not condition_passed:
+        result={"summary":"Task skipped because its condition evaluated to false","deliverable":"Condition false; the task action was not executed.","files":[],"confidence":1.0,"assumptions":[],"evidence":[condition_result],"next_actions":[],"mode":"condition"}
+    elif task["action_type"]=="command":
+        execution,_=execute_command(wid,json.loads(task["action_config"]).get("command",""),60,EXECUTION_MODE)
+        passed=execution.get("status")=="PASS"
+        result={"summary":f"Command {execution.get('status','FAILED')}","deliverable":execution.get("stdout") or execution.get("stderr") or "No output","files":[],"confidence":1.0 if passed else 0.0,"assumptions":[],"evidence":[f"Exit code: {execution.get('exit_code')}"],"next_actions":[] if passed else ["Inspect stderr and correct the command"],"mode":"command","execution":execution}
+    elif task["action_type"]=="script":
+        config=json.loads(task["action_config"]); extensions={"python":"py","node":"js","java":"java","php":"php"}; runtime=config.get("runtime"); path=config.get("path") or f"workflow-scripts/{task['position']+1:02d}-{task['id'][:8]}.{extensions.get(runtime,'txt')}"
+        artifacts=persist_artifacts(wid,tid,[{"path":path,"content":config.get("content","")}]); execution={"status":"FAIL","stderr":"Script artifact could not be created"}
+        if artifacts: execution,_=execute_in_sandbox(artifacts[0]["id"],60,EXECUTION_MODE)
+        passed=execution.get("status") in ("PASS","PREVIEW_READY")
+        result={"summary":f"{runtime} script {execution.get('status','FAILED')}","deliverable":execution.get("stdout") or execution.get("stderr") or "No output","files":[],"confidence":1.0 if passed else 0.0,"assumptions":[],"evidence":[f"Exit code: {execution.get('exit_code')}"],"next_actions":[] if passed else ["Inspect stderr and correct the script"],"mode":"script","execution":execution,"artifacts":artifacts}
+    else: result = ModelClient(model).generate(task, objective, dependency_results)
+    if condition_passed and task["action_type"]=="llm" and model == "worker-general" and float(result.get("confidence", 0)) < .65:
         emit(wid, "task.escalated", {"from": model, "confidence": result.get("confidence")}, tid)
         model, result = "reasoner-large", ModelClient("reasoner-large").generate(task, objective, dependency_results)
     duration=max(.001,time.perf_counter()-task_started)
     metrics=result.setdefault("metrics",{})
     metrics.update({"execution_seconds":round(duration,3),**power.stop(duration)})
-    result["artifacts"]=persist_artifacts(wid,tid,result.get("files",[])) if result.get("files") else []
+    if task["action_type"]!="script": result["artifacts"]=persist_artifacts(wid,tid,result.get("files",[])) if result.get("files") else []
     confidence = float(result.get("confidence", 0))
     status = "COMPLETED" if confidence >= .55 else "FAILED"
     with db() as conn:

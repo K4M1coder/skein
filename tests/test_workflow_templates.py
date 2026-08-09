@@ -1,6 +1,7 @@
 import importlib
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -90,6 +91,35 @@ class WorkflowTemplateTest(unittest.TestCase):
         error = json.load(caught.exception)["error"]
         self.assertIn("acyclic", error)
 
+    def test_typed_actions_and_conditions_are_validated(self):
+        payload = self.valid_template()
+        payload["tasks"][0].update({
+            "action_type": "command",
+            "action_config": {
+                "command": "python --version",
+                "condition": {
+                    "action_type": "llm",
+                    "action_config": {},
+                    "system_prompt": "Decide whether documentation generation is required.",
+                    "output_format": "boolean",
+                    "output_schema": "Return true or false only",
+                },
+            },
+            "system_prompt": "",
+            "output_format": "exit_code",
+            "output_schema": "Exit code zero and captured standard output",
+        })
+        _, created = self.request("/api/workflow-templates", payload)
+        first = created["tasks"][0]
+        self.assertEqual(first["action_type"], "command")
+        self.assertEqual(first["output_format"], "exit_code")
+        self.assertEqual(first["action_config"]["condition"]["output_format"], "boolean")
+
+        payload["tasks"][0]["action_config"]["condition"]["output_format"] = "text"
+        with self.assertRaises(HTTPError) as caught:
+            self.request("/api/workflow-templates", payload)
+        self.assertEqual(caught.exception.code, 400)
+
     def test_automatic_selection_and_generation_are_validated(self):
         _, selected = self.request("/api/workflow-templates/select", {"objective": "Build a Python API with complete tests"})
         self.assertEqual(selected["id"], "default-software")
@@ -133,6 +163,37 @@ class WorkflowTemplateTest(unittest.TestCase):
             if all(state in ("COMPLETED", "FAILED") for state in states): break
             time.sleep(.1)
         self.assertTrue(all(state == "COMPLETED" for state in states))
+
+    def test_command_action_executes_without_an_llm(self):
+        previous_mode = app.EXECUTION_MODE
+        app.EXECUTION_MODE = "local"
+        try:
+            specs = [{
+                "title": "Run a deterministic command",
+                "role": "integrator",
+                "dependencies": [],
+                "complexity": 0.1,
+                "risk": 0.1,
+                "criticality": 0.5,
+                "action_type": "command",
+                "action_config": {"command": f'& "{sys.executable}" -c "print(\'typed-action-ok\')"'},
+                "system_prompt": "",
+                "output_format": "text",
+                "output_schema": "Standard output must contain typed-action-ok",
+            }]
+            workflow_id = app.create_workflow("Verify command task execution", specs=specs)
+            app.start_workflow(workflow_id)
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                workflow = app.workflow_data(workflow_id)
+                if workflow["workflow"]["status"] in ("COMPLETED", "FAILED"):
+                    break
+                time.sleep(0.05)
+            self.assertEqual(workflow["workflow"]["status"], "COMPLETED")
+            self.assertEqual(workflow["tasks"][0]["result"]["mode"], "command")
+            self.assertIn("typed-action-ok", workflow["tasks"][0]["result"]["deliverable"])
+        finally:
+            app.EXECUTION_MODE = previous_mode
 
 
 if __name__ == "__main__":

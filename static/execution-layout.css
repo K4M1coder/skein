@@ -1,0 +1,46 @@
+.hero form#create {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 14px;
+  padding: 16px;
+}
+
+.hero form#create .workflow-planning-controls {
+  grid-column: 1 / -1;
+  grid-template-columns: minmax(220px, .7fr) minmax(300px, 1.3fr);
+  margin-bottom: 2px;
+}
+
+.execution-prompt {
+  grid-column: 1 / -1;
+  display: grid;
+  min-width: 0;
+  gap: 7px;
+  color: var(--muted);
+  font-size: .78rem;
+}
+
+.hero form#create .execution-prompt textarea {
+  display: block;
+  width: 100%;
+  min-height: 160px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  background: #090c0e;
+  font-size: 15px;
+  line-height: 1.55;
+}
+
+.hero form#create .workflow-submit-actions {
+  grid-column: 1 / -1;
+  justify-content: flex-end;
+  margin: 0;
+}
+
+@media (max-width: 720px) {
+  .hero form#create { display: block; }
+  .hero form#create .workflow-planning-controls { grid-template-columns: 1fr; }
+  .hero form#create .execution-prompt,
+  .hero form#create .workflow-submit-actions { margin-top: 12px; }
+}
