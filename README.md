@@ -14,6 +14,13 @@ Skein is a local, GPU-aware multi-agent workflow orchestrator. It separates reas
 - Markdown viewer with GFM, Mermaid, DOMPurify, and syntax highlighting.
 - Persistent users, session authentication, `admin` and `user` roles.
 - English/French interface with `Automatic`, `English`, and `Français` selection. Automatic follows a French browser locale and falls back to English.
+- Role-aware tab navigation that separates workflow execution, run history, and system administration.
+
+## Navigation
+
+- **Execution** contains workflow creation, the sandbox/local tool plane, the active DAG, step outputs, metrics, and deliverables.
+- **History** contains recent runs and the event stream. Selecting a run displays its complete report and artifacts without returning to the workflow launcher.
+- **Administration** contains access control, execution policy, GPU pools, telemetry, model selection, and runtime controls. This tab is rendered only for administrators.
 
 ## Access control
 

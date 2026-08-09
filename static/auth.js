@@ -39,6 +39,7 @@
       document.querySelector("#logout").onclick=async()=>{await request("/api/auth/logout",{method:"POST",body:"{}"});location.reload();};
       document.querySelector(".runtime-gate").classList.add("admin-only"); document.querySelector(".hardware").classList.add("admin-only"); document.querySelector(".model-control").classList.add("admin-only"); document.querySelectorAll("[data-stack]").forEach(x=>x.classList.add("admin-only"));
       if(session.user.role==="admin") await renderAdmin();
+      window.skeinNavigation.init(session);
       const script=document.createElement("script"); script.src="/app.js"; document.body.appendChild(script);
     } catch (error) { showLogin(); }
   };
