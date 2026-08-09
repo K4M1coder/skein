@@ -110,6 +110,28 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(activation["status"], "CONFIGURED")
         self.assertIn("not found", activation["error"])
 
+    def test_pool_telemetry_and_session_continuation(self):
+        telemetry = app.pool_telemetry(300)
+        self.assertIn("current", telemetry)
+        self.assertIn("pool_metrics", telemetry["current"])
+        self.assertTrue(all("domain" in item and "power_w" in item for item in telemetry["current"]["pool_metrics"]))
+        status, first = self.request("/api/workflows", {"objective": "Create a session that can be continued"})
+        self.assertEqual(status, 201)
+        status, continued = self.request("/api/workflows", {"objective": "Continue the previous session with a follow-up", "continue_workflow_id": first["id"]})
+        self.assertEqual(status, 201)
+        self.assertEqual(continued["continued_from"], first["id"])
+        source = app.workflow_data(first["id"])["workflow"]
+        follow_up = app.workflow_data(continued["id"])["workflow"]
+        self.assertEqual(source["session_id"], follow_up["session_id"])
+        self.assertEqual(follow_up["continued_from"], first["id"])
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            states = [app.workflow_data(workflow_id)["workflow"]["status"] for workflow_id in (first["id"], continued["id"])]
+            if all(state in ("COMPLETED", "FAILED") for state in states):
+                break
+            time.sleep(0.05)
+        self.assertTrue(all(state == "COMPLETED" for state in states))
+
     def test_workflow_queue_reports_position_and_runs_fifo(self):
         previous_limit=app.MAX_PARALLEL_WORKFLOWS; app.MAX_PARALLEL_WORKFLOWS=1
         try:

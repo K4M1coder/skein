@@ -151,14 +151,30 @@ class AuthTest(unittest.TestCase):
 
         status, workflow = self.request(user, "/api/workflows", {"objective": "Return a short hello message"})
         self.assertEqual(status, 201)
+        with self.assertRaises(HTTPError) as continuation_denied:
+            self.request(admin, "/api/workflows", {"objective": "Attempt to access another user's session", "continue_workflow_id": workflow["id"]})
+        self.assertEqual(continuation_denied.exception.code, 403)
         deadline = time.time() + 15
         while time.time() < deadline:
             _, workflow_data = self.request(user, f"/api/workflows/{workflow['id']}")
             if workflow_data["workflow"]["status"] in ("COMPLETED", "FAILED"):
                 break
             time.sleep(0.1)
+        self.assertEqual(workflow_data["workflow"]["status"], "COMPLETED")
+        _, continuation = self.request(user, "/api/workflows", {"objective": "Continue my own session", "continue_workflow_id": workflow["id"]})
+        with app.db() as conn:
+            source_session = conn.execute("SELECT session_id FROM workflows WHERE id=?", (workflow["id"],)).fetchone()[0]
+            continued = conn.execute("SELECT session_id,continued_from FROM workflows WHERE id=?", (continuation["id"],)).fetchone()
+        self.assertEqual(continued["session_id"], source_session)
+        self.assertEqual(continued["continued_from"], workflow["id"])
+        while time.time() < deadline:
+            _, continuation_data = self.request(user, f"/api/workflows/{continuation['id']}")
+            if continuation_data["workflow"]["status"] in ("COMPLETED", "FAILED"):
+                break
+            time.sleep(0.1)
+        self.assertEqual(continuation_data["workflow"]["status"], "COMPLETED")
         _, user_runs = self.request(user, "/api/workflows")
-        self.assertEqual([row["id"] for row in user_runs], [workflow["id"]])
+        self.assertEqual([row["id"] for row in user_runs], [continuation["id"], workflow["id"]])
 
         _, policy = self.request(admin, "/api/admin/settings", {"users_can_choose_execution_mode": True})
         self.assertTrue(policy["users_can_choose_execution_mode"])

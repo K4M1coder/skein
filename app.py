@@ -59,6 +59,9 @@ def init_db():
           id TEXT PRIMARY KEY, name TEXT NOT NULL, domain TEXT NOT NULL, color TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS gpu_assignments(
           gpu_id TEXT PRIMARY KEY, pool_id TEXT, updated_at REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS pool_telemetry(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, created_at REAL NOT NULL, pool_id TEXT NOT NULL, domain TEXT NOT NULL,
+          assigned_gpus INTEGER NOT NULL, utilization REAL, power_w REAL, memory_used_mb REAL, memory_total_mb REAL, temperature_c REAL);
         CREATE TABLE IF NOT EXISTS models(
           id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, backend TEXT NOT NULL,
           model_path TEXT NOT NULL, runtime_path TEXT NOT NULL, context_size INTEGER NOT NULL,
@@ -112,6 +115,7 @@ def init_db():
         if "session_id" not in columns: conn.execute("ALTER TABLE workflows ADD COLUMN session_id TEXT")
         if "template_id" not in columns: conn.execute("ALTER TABLE workflows ADD COLUMN template_id TEXT")
         if "planning_mode" not in columns: conn.execute("ALTER TABLE workflows ADD COLUMN planning_mode TEXT DEFAULT 'legacy'")
+        if "continued_from" not in columns: conn.execute("ALTER TABLE workflows ADD COLUMN continued_from TEXT")
         user_columns={r[1] for r in conn.execute("PRAGMA table_info(users)")}
         if "email" not in user_columns: conn.execute("ALTER TABLE users ADD COLUMN email TEXT")
         if "verified_at" not in user_columns: conn.execute("ALTER TABLE users ADD COLUMN verified_at REAL")
@@ -165,6 +169,7 @@ def init_db():
             if not conn.execute("SELECT 1 FROM user_profiles WHERE user_id=?",(user["id"],)).fetchone():
                 conn.execute("INSERT OR IGNORE INTO user_profiles VALUES(?,?)",(user["id"],"super_admin" if user["role"]=="admin" else "workflow_operator"))
         seed_default_workflow_templates(conn)
+        conn.execute("DELETE FROM pool_telemetry WHERE created_at<?", (stamp()-7*24*3600,))
     discover_local_models()
 
 
@@ -368,9 +373,31 @@ def hardware_snapshot():
     cpu_script = "(Get-CimInstance Win32_Processor | Measure-Object LoadPercentage -Average).Average"
     try: cpu = float(run_text(["powershell","-NoProfile","-Command",cpu_script],6) or 0)
     except ValueError: cpu = None
+    pool_metrics=[]
+    for pool in pools:
+        members=[gpu for gpu in gpus if gpu.get("pool_id")==pool["id"]]
+        values=lambda field:[float(gpu[field]) for gpu in members if gpu.get(field) is not None]
+        utilization=values("utilization"); temperatures=values("temperature_c")
+        pool_metrics.append({"pool_id":pool["id"],"name":pool["name"],"domain":pool["domain"],"color":pool["color"],"assigned_gpus":len(members),
+          "utilization":round(sum(utilization)/len(utilization),2) if utilization else None,
+          "power_w":round(sum(values("power_w")),2) if members else 0,
+          "memory_used_mb":round(sum(values("memory_used_mb")),2),"memory_total_mb":round(sum(values("memory_total_mb")),2),
+          "temperature_c":round(sum(temperatures)/len(temperatures),2) if temperatures else None,
+          "gpu_ids":[gpu["id"] for gpu in members]})
     return {"node":{"name":os.environ.get("COMPUTERNAME","local-node"),"cpu_utilization":cpu,
       "gpu_power_w":round(sum(g["power_w"] or 0 for g in gpus),1),"gpu_count":len(gpus)},
-      "gpus":gpus,"pools":pools,"timestamp":stamp()}
+      "gpus":gpus,"pools":pools,"pool_metrics":pool_metrics,"timestamp":stamp()}
+
+
+def pool_telemetry(window_seconds=900):
+    snapshot=hardware_snapshot(); now=snapshot["timestamp"]
+    with db() as conn:
+        latest=conn.execute("SELECT MAX(created_at) FROM pool_telemetry").fetchone()[0] or 0
+        if now-latest>=4:
+            conn.executemany("INSERT INTO pool_telemetry(created_at,pool_id,domain,assigned_gpus,utilization,power_w,memory_used_mb,memory_total_mb,temperature_c) VALUES(?,?,?,?,?,?,?,?,?)",
+              [(now,item["pool_id"],item["domain"],item["assigned_gpus"],item["utilization"],item["power_w"],item["memory_used_mb"],item["memory_total_mb"],item["temperature_c"]) for item in snapshot["pool_metrics"]])
+        rows=conn.execute("SELECT created_at,pool_id,domain,assigned_gpus,utilization,power_w,memory_used_mb,memory_total_mb,temperature_c FROM pool_telemetry WHERE created_at>=? ORDER BY created_at",(now-max(60,min(window_seconds,86400)),)).fetchall()
+    return {"current":snapshot,"history":[dict(row) for row in rows],"window_seconds":window_seconds}
 
 
 def host_power_sensors():
@@ -767,12 +794,12 @@ def template_task_specs(tasks):
     return [{**normalize_task_contract(task),"dependencies":[positions[key] for key in task["dependencies"]]} for task in tasks]
 
 
-def create_workflow(objective,owner_id=None,session_id=None,specs=None,template_id=None,planning_mode="automatic"):
+def create_workflow(objective,owner_id=None,session_id=None,specs=None,template_id=None,planning_mode="automatic",continued_from=None):
     wid, created = str(uuid.uuid4()), stamp()
     specs = specs or plan_for(objective)
     ids = [str(uuid.uuid4()) for _ in specs]
     with db() as conn:
-        conn.execute("INSERT INTO workflows(id,objective,status,created_at,updated_at,owner_id,session_id,template_id,planning_mode) VALUES(?,?,?,?,?,?,?,?,?)", (wid, objective, "READY", created, created,owner_id,session_id,template_id,planning_mode))
+        conn.execute("INSERT INTO workflows(id,objective,status,created_at,updated_at,owner_id,session_id,template_id,planning_mode,continued_from) VALUES(?,?,?,?,?,?,?,?,?,?)", (wid, objective, "READY", created, created,owner_id,session_id,template_id,planning_mode,continued_from))
         for pos, spec in enumerate(specs):
             if isinstance(spec,dict):
                 title,role,deps=spec["title"],spec["role"],spec["dependencies"]
@@ -1562,6 +1589,10 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path=="/api/server-stats": return self.json(privacy_safe_server_stats())
         if self.path=="/api/sandbox/capabilities": return self.json({"mode":EXECUTION_MODE,"runtimes":sandbox_capabilities()})
         if self.path=="/api/execution-mode": return self.json({"mode":EXECUTION_MODE,"warning":"Local mode runs on the host without isolation." if EXECUTION_MODE=="local" else None})
+        if urlparse(self.path).path=="/api/hardware/telemetry":
+            try: window=int((parse_qs(urlparse(self.path).query).get("window") or [900])[0])
+            except ValueError: return self.json({"error":"Telemetry window must be an integer"},400)
+            return self.json(pool_telemetry(window))
         if self.path=="/api/hardware": return self.json(hardware_snapshot())
         if self.path=="/api/pools":
             with db() as conn: rows=conn.execute("SELECT * FROM pools ORDER BY rowid").fetchall()
@@ -1796,7 +1827,14 @@ class Handler(SimpleHTTPRequestHandler):
                 generated,status=generate_validated_workflow_template(objective)
                 if status!=200: return self.json(generated,status)
                 specs=template_task_specs(generated["tasks"]); selection={"template_id":None,"template_name":generated["name"],"mode":"generate","validation":generated["validation"],"generation_mode":generated["mode"]}
-            wid=create_workflow(objective,user["id"],user.get("session_id"),specs,template_id,planning_mode); start_workflow(wid); return self.json({"id":wid,"planning":selection},201)
+            continued_from=str(body.get("continue_workflow_id") or "").strip() or None
+            session_id=user.get("session_id")
+            if continued_from:
+                with db() as conn: source=conn.execute("SELECT id,owner_id,session_id FROM workflows WHERE id=?",(continued_from,)).fetchone()
+                if not source: return self.json({"error":"Source workflow not found"},404)
+                if source["owner_id"]!=user["id"]: return self.deny(403,"Only the workflow owner can continue its session")
+                session_id=source["session_id"] or session_id
+            wid=create_workflow(objective,user["id"],session_id,specs,template_id,planning_mode,continued_from); start_workflow(wid); return self.json({"id":wid,"planning":selection,"continued_from":continued_from,"session_id":session_id},201)
         if self.path=="/api/execution-mode":
             if "settings.manage" not in user["permissions"] and not setting_bool("users_can_choose_execution_mode"): return self.deny(403,"Execution mode selection is disabled by the administrator")
             mode=str(body.get("mode","")).lower()

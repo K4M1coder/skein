@@ -33,8 +33,8 @@ Development commits are protected by the checks documented in [CONTRIBUTING.md](
 - **Execution** contains workflow creation, the sandbox/local tool plane, the active DAG, step outputs, metrics, and deliverables.
 - **Workflows** is a dedicated RBAC-protected library for validated defaults, owned workflows, sharing, editing, deletion, graph previews, and reasoner-generated proposals. Choosing **Use** returns to Execution with that template selected.
 - Saved, generated, and currently edited workflows can be visualized as dependency graphs. The editor redraws its DAG live and reports unknown dependencies or cycles directly in the preview.
-- **History** contains recent runs and the event stream. Selecting a run displays its complete report and artifacts without returning to the workflow launcher.
-- **Administration** contains access control, execution policy, GPU pools, telemetry, model selection, and runtime controls. This tab is rendered only for administrators.
+- **History** contains recent runs and the event stream. Selecting a run displays its complete report and artifacts without returning to the workflow launcher. Use **Continue session** on one of your previous runs to start a follow-up in its existing session workspace; users cannot continue another user's session, including administrators.
+- **Administration** contains access control, execution policy, GPU pools, telemetry, model selection, and runtime controls. The hardware control plane retains the latest 15 minutes of measurements and draws power, GPU load, VRAM use, and temperature charts for every configured pool, labelled with its domain. This tab is rendered only for administrators.
 
 The interface uses a persistent sidebar on desktop, an icon rail on tablets, and bottom navigation on phones. See [UI_ARCHITECTURE.md](UI_ARCHITECTURE.md) for the layout rationale, reference patterns, responsive behavior, and visual dependency policy.
 
@@ -134,6 +134,8 @@ Inference token counts come from the model server response. Tokens/s uses genera
 The default SQLite database and artifacts live under `%LOCALAPPDATA%\Skein`. Override the database path with `SKEIN_DB_PATH`. Generated models, databases, workflow artifacts, logs, and local secrets are excluded from version control.
 
 Workflow deliverables are isolated under `users/<user-id>/sessions/<session-id>/workflows/<workflow-id>/artifacts`. Opaque identifiers keep paths stable when usernames change and prevent collisions between concurrent sessions. Existing workflows without session metadata remain readable through the `legacy` session namespace.
+
+Continuing an owned workflow creates a separate workflow record and artifact directory, but preserves its parent session ID so related work remains in the same per-user session tree. The continuation source is recorded for auditability; it does not expose prior objectives or results to other users.
 
 Skein runs up to two workflows concurrently by default and keeps additional submissions in a FIFO queue. Configure workflow and task concurrency independently before startup:
 
