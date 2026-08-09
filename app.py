@@ -119,6 +119,8 @@ def init_db():
           "workflows.execute":"Create workflows and execute their artifacts or commands",
           "workflows.read_own":"Read workflows owned by the current user",
           "workflows.read_all":"Read all workflow reports and deliverables",
+          "workflows.delete_own":"Delete workflows owned by the current user",
+          "workflows.delete_all":"Delete workflows owned by any user",
           "server_stats.read":"Read privacy-preserving server and inference statistics",
           "email.manage":"Configure and test the outbound SMTP server",
           "users.verify":"Manually approve pending user registrations",
@@ -129,7 +131,7 @@ def init_db():
           "user_manager":("User Manager","Manage users, profile assignments, and account verification",["users.manage","users.verify"]),
           "settings_manager":("Settings Manager","Manage execution policy, GPU pools, stack controls, and SMTP",["settings.manage","email.manage"]),
           "model_manager":("Model Manager","Manage model registry and runtimes",["models.manage","server_stats.read"]),
-          "workflow_operator":("Workflow Operator","Execute and inspect owned workflows",["workflows.execute","workflows.read_own"]),
+          "workflow_operator":("Workflow Operator","Execute, inspect, and delete owned workflows",["workflows.execute","workflows.read_own","workflows.delete_own"]),
           "stats_auditor":("Statistics Auditor","Read anonymized operational statistics only",["server_stats.read"]),
         }
         for profile_id,(name,description,grants) in profiles.items():
@@ -579,6 +581,33 @@ def artifact_root(wid):
     root=DB_PATH.parent/"workflows"/wid/"artifacts"; root.mkdir(parents=True,exist_ok=True); return root
 
 
+def delete_workflow_history(user_id,delete_all=False):
+    with db() as conn:
+        rows=conn.execute("SELECT id FROM workflows" if delete_all else "SELECT id FROM workflows WHERE owner_id=?",() if delete_all else (user_id,)).fetchall()
+    workflow_ids=[row["id"] for row in rows]
+    with ACTIVE_LOCK:
+        running=[wid for wid in workflow_ids if wid in ACTIVE]
+    if running:
+        return {"error":"Workflow history cannot be deleted while matching workflows are running","running_workflow_ids":running},409
+    if not workflow_ids: return {"deleted_workflows":0,"deleted_artifacts":0,"scope":"all" if delete_all else "own","warnings":[]},200
+    placeholders=",".join("?" for _ in workflow_ids)
+    with db() as conn:
+        artifact_count=conn.execute(f"SELECT COUNT(*) FROM artifacts WHERE workflow_id IN ({placeholders})",workflow_ids).fetchone()[0]
+        conn.execute(f"DELETE FROM executions WHERE workflow_id IN ({placeholders})",workflow_ids)
+        conn.execute(f"DELETE FROM artifacts WHERE workflow_id IN ({placeholders})",workflow_ids)
+        conn.execute(f"DELETE FROM events WHERE workflow_id IN ({placeholders})",workflow_ids)
+        conn.execute(f"DELETE FROM tasks WHERE workflow_id IN ({placeholders})",workflow_ids)
+        conn.execute(f"DELETE FROM workflows WHERE id IN ({placeholders})",workflow_ids)
+    warnings=[]; workflows_root=(DB_PATH.parent/"workflows").resolve()
+    for wid in workflow_ids:
+        workflow_path=(workflows_root/wid).resolve()
+        if workflow_path.parent!=workflows_root:
+            warnings.append(f"Skipped unsafe workflow path for {wid}"); continue
+        try: shutil.rmtree(workflow_path) if workflow_path.exists() else None
+        except OSError as exc: warnings.append(f"Could not remove files for {wid}: {exc}")
+    return {"deleted_workflows":len(workflow_ids),"deleted_artifacts":artifact_count,"scope":"all" if delete_all else "own","warnings":warnings},200
+
+
 def validate_artifact(path):
     try:
         suffix=path.suffix.lower()
@@ -917,7 +946,7 @@ class Handler(SimpleHTTPRequestHandler):
             if sep and key==name: return value
         return None
     def current_user(self):
-        if os.getenv("SKEIN_AUTH_DISABLED","0")=="1": return {"id":"test-admin","username":"test-admin","role":"admin","active":1,"profiles":[{"id":"super_admin","name":"Super Administrator"}],"permissions":["users.manage","settings.manage","models.manage","workflows.execute","workflows.read_own","workflows.read_all","server_stats.read"]}
+        if os.getenv("SKEIN_AUTH_DISABLED","0")=="1": return {"id":"test-admin","username":"test-admin","role":"admin","active":1,"profiles":[{"id":"super_admin","name":"Super Administrator"}],"permissions":["users.manage","settings.manage","models.manage","workflows.execute","workflows.read_own","workflows.read_all","workflows.delete_own","workflows.delete_all","server_stats.read"]}
         token=self.cookie("skein_session")
         if not token: return None
         with db() as conn:
@@ -1214,6 +1243,17 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path.startswith("/api/workflows/") and self.path.endswith("/run"):
             return self.json({"started":start_workflow(self.path.split("/")[-2])})
         return self.json({"error":"route inconnue"},404)
+
+    def do_DELETE(self):
+        parsed=urlparse(self.path)
+        if parsed.path!="/api/workflows/history": return self.json({"error":"Unknown route"},404)
+        scope=dict(part.split("=",1) for part in parsed.query.split("&") if "=" in part).get("scope","own")
+        if scope not in ("own","all"): return self.json({"error":"Invalid history deletion scope"},400)
+        permission="workflows.delete_all" if scope=="all" else "workflows.delete_own"
+        user=self.authorize(permission)
+        if not user: return
+        result,status=delete_workflow_history(user["id"],scope=="all")
+        return self.json(result,status)
 
 
 if __name__=="__main__":

@@ -46,6 +46,49 @@ class AuthTest(unittest.TestCase):
         with client.open(request, timeout=10) as response:
             return response.status, json.load(response)
 
+    def delete(self, client, path):
+        request = Request(self.base + path, method="DELETE")
+        with client.open(request, timeout=10) as response:
+            return response.status, json.load(response)
+
+    def test_history_deletion_respects_owner_and_global_permissions(self):
+        admin = self.client()
+        _, admin_session = self.request(admin, "/api/auth/login", {"username": "admin", "password": "admin-test-password"})
+        self.assertIn("workflows.delete_all", admin_session["user"]["permissions"])
+        _, created = self.request(admin, "/api/users", {"username": "history-owner", "password": "history-password", "profiles": ["workflow_operator"]})
+        owner_id = created["id"]
+        owner = self.client()
+        _, owner_session = self.request(owner, "/api/auth/login", {"username": "history-owner", "password": "history-password"})
+        self.assertIn("workflows.delete_own", owner_session["user"]["permissions"])
+        self.assertNotIn("workflows.delete_all", owner_session["user"]["permissions"])
+
+        own_workflow = "history-own-workflow"
+        admin_workflow = "history-admin-workflow"
+        now = app.stamp()
+        with app.db() as conn:
+            conn.execute("INSERT INTO workflows(id,objective,status,created_at,updated_at,owner_id) VALUES(?,?,?,?,?,?)", (own_workflow,"Owner history","COMPLETED",now,now,owner_id))
+            conn.execute("INSERT INTO workflows(id,objective,status,created_at,updated_at,owner_id) VALUES(?,?,?,?,?,?)", (admin_workflow,"Admin history","COMPLETED",now,now,admin_session["user"]["id"]))
+            artifact_path = app.artifact_root(own_workflow) / "result.txt"
+            artifact_path.write_text("history deliverable", encoding="utf-8")
+            conn.execute("INSERT INTO artifacts(id,workflow_id,task_id,relative_path,disk_path,kind,validation,created_at) VALUES(?,?,?,?,?,?,?,?)", ("history-artifact",own_workflow,"task","result.txt",str(artifact_path),"text","{}",now))
+
+        with self.assertRaises(HTTPError) as global_denied:
+            self.delete(owner, "/api/workflows/history?scope=all")
+        self.assertEqual(global_denied.exception.code, 403)
+        status, own_result = self.delete(owner, "/api/workflows/history?scope=own")
+        self.assertEqual(status, 200)
+        self.assertEqual(own_result["deleted_workflows"], 1)
+        self.assertEqual(own_result["deleted_artifacts"], 1)
+        self.assertFalse((app.DB_PATH.parent / "workflows" / own_workflow).exists())
+        with app.db() as conn:
+            self.assertIsNone(conn.execute("SELECT 1 FROM workflows WHERE id=?", (own_workflow,)).fetchone())
+            self.assertIsNotNone(conn.execute("SELECT 1 FROM workflows WHERE id=?", (admin_workflow,)).fetchone())
+
+        _, all_result = self.delete(admin, "/api/workflows/history?scope=all")
+        self.assertGreaterEqual(all_result["deleted_workflows"], 1)
+        with app.db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM workflows").fetchone()[0], 0)
+
     def test_roles_policy_and_workflow_ownership(self):
         anonymous = self.client()
         with self.assertRaises(HTTPError) as denied:

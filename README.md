@@ -19,6 +19,7 @@ Skein favors mature, actively maintained libraries over custom security, protoco
 - Persistent users, session authentication, `admin` and `user` roles.
 - English/French interface with `Automatic`, `English`, and `Français` selection. Automatic follows a French browser locale and falls back to English.
 - Role-aware tab navigation that separates workflow execution, run history, and system administration.
+- Permission-aware history cleanup for the current user or, when authorized, every user.
 
 ## Navigation
 
@@ -39,7 +40,7 @@ Skein uses composable RBAC profiles rather than a single hard-coded administrato
 | Workflow Operator | Execute workflows and read only owned workflows |
 | Statistics Auditor | Read privacy-safe operational statistics only |
 
-Backend permissions are `users.manage`, `settings.manage`, `models.manage`, `workflows.execute`, `workflows.read_own`, `workflows.read_all`, and `server_stats.read`. UI visibility follows the same server-issued permission list; hiding a control is never the authorization boundary.
+Backend permissions are `users.manage`, `settings.manage`, `models.manage`, `workflows.execute`, `workflows.read_own`, `workflows.read_all`, `workflows.delete_own`, `workflows.delete_all`, and `server_stats.read`. UI visibility follows the same server-issued permission list; hiding a control is never the authorization boundary.
 
 Registration and email verification add `users.verify` and `email.manage` permissions. The default User Manager can manually approve pending registrations; the default Settings Manager can configure and test SMTP delivery.
 
@@ -51,6 +52,8 @@ Administrators can:
 - choose whether standard users may switch between Sandbox and Local execution.
 
 Standard users can create and inspect only their own workflows. They cannot change models or system settings. Local/Sandbox selection is available only when enabled by an administrator.
+
+The History tab lets Workflow Operators permanently delete their own workflow history and associated deliverables. Only profiles granted `workflows.delete_all` can delete history for every user. Both actions require an explicit browser confirmation, and running workflows block matching history deletion.
 
 The server statistics endpoint (`GET /api/server-stats`) exposes dated request-step metadata: anonymized request reference, model, role, status, token counts, tokens/s, duration, average/peak watts, and estimated Wh. It deliberately excludes objectives, prompts, usernames, user IDs, results, deliverables, and artifacts. The request reference is a truncated SHA-256 digest and cannot be used to retrieve workflow content through the statistics API.
 

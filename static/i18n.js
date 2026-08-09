@@ -18,6 +18,11 @@
       active: "Active",
       actions: "Actions",
       signedInAs: "Signed in as",
+      clearOwnHistory: "Clear my history",
+      clearAllHistory: "Clear all users' history",
+      confirmClearOwnHistory: "Permanently delete all of your workflow history and deliverables?",
+      confirmClearAllHistory: "Permanently delete workflow history and deliverables for every user?",
+      historyCleared: "Workflow history cleared.",
     },
     fr: {
       language: "Langue",
@@ -37,6 +42,11 @@
       active: "Actif",
       actions: "Actions",
       signedInAs: "Connecté en tant que",
+      clearOwnHistory: "Vider mon historique",
+      clearAllHistory: "Vider l’historique de tous les utilisateurs",
+      confirmClearOwnHistory: "Supprimer définitivement tout votre historique de workflows et vos livrables ?",
+      confirmClearAllHistory: "Supprimer définitivement l’historique et les livrables de tous les utilisateurs ?",
+      historyCleared: "Historique des workflows supprimé.",
     },
   };
   const pairs = {
