@@ -51,6 +51,15 @@ class FrontendLocalizationTest(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 self.assertNotIn(phrase, feature_source)
 
+    def test_workflow_generation_and_execution_are_distinct_actions(self):
+        markup = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        manager = (ROOT / "static" / "workflow-templates.js").read_text(encoding="utf-8")
+        self.assertRegex(markup, r'id="generate-workflow"[^>]+type="button"|type="button"[^>]+id="generate-workflow"')
+        self.assertIn('button type="submit" data-i18n="executePrompt"', markup)
+        self.assertIn('/api/workflow-templates/generate', manager)
+        self.assertIn('executionPayload()', manager)
+        self.assertIn('planning_mode', manager)
+
 
 if __name__ == "__main__":
     unittest.main()
