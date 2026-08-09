@@ -14,6 +14,7 @@ Development commits are protected by the checks documented in [CONTRIBUTING.md](
 - Reasoner, worker, and retrieval pools with explicit GPU assignment.
 - Local `llama.cpp` and compatible model profiles.
 - Real workflows for code, translation, and general tasks with dependency-aware steps.
+- A reusable workflow-template catalog with validated default, private, and shared DAGs.
 - Per-task tokens, output throughput, duration, average/peak GPU power, and estimated Wh.
 - End-of-workflow summary, Markdown audit report, individual artifacts, and project ZIP downloads.
 - Python, Node.js, Java, PHP, HTML, and CSS sandbox support.
@@ -47,6 +48,8 @@ Skein uses composable RBAC profiles rather than a single hard-coded administrato
 | Statistics Auditor | Read privacy-safe operational statistics only |
 
 Backend permissions are `users.manage`, `settings.manage`, `models.manage`, `workflows.execute`, `workflows.read_own`, `workflows.read_all`, `workflows.delete_own`, `workflows.delete_all`, and `server_stats.read`. UI visibility follows the same server-issued permission list; hiding a control is never the authorization boundary.
+
+Workflow-template permissions are `workflow_templates.read`, `workflow_templates.manage_own`, and `workflow_templates.manage_all`. See [WORKFLOW_TEMPLATES.md](WORKFLOW_TEMPLATES.md) for validation, ownership, sharing, and API rules.
 
 Registration and email verification add `users.verify` and `email.manage` permissions. The default User Manager can manually approve pending registrations; the default Settings Manager can configure and test SMTP delivery.
 

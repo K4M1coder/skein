@@ -91,6 +91,41 @@ class AuthTest(unittest.TestCase):
         with app.db() as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM workflows").fetchone()[0], 0)
 
+    def test_workflow_template_sharing_respects_ownership(self):
+        admin = self.client()
+        _, admin_session = self.request(admin, "/api/auth/login", {"username": "admin", "password": "admin-test-password"})
+        self.assertIn("workflow_templates.manage_all", admin_session["user"]["permissions"])
+        self.request(admin, "/api/users", {"username": "template-owner", "password": "template-password", "profiles": ["workflow_operator"]})
+        self.request(admin, "/api/users", {"username": "template-reader", "password": "template-password", "profiles": ["workflow_operator"]})
+        owner = self.client(); reader = self.client()
+        _, owner_session = self.request(owner, "/api/auth/login", {"username": "template-owner", "password": "template-password"})
+        self.request(reader, "/api/auth/login", {"username": "template-reader", "password": "template-password"})
+        self.assertIn("workflow_templates.manage_own", owner_session["user"]["permissions"])
+        payload = {
+            "name": "Owned review workflow", "description": "Private review flow", "objective_template": "Review the requested content", "tags": ["review"], "shared": False,
+            "tasks": [
+                {"key": "review", "title": "Review the content", "role": "reviewer", "dependencies": [], "complexity": .4, "risk": .3, "criticality": .6},
+                {"key": "deliver", "title": "Deliver the reviewed content", "role": "integrator", "dependencies": ["review"], "complexity": .3, "risk": .2, "criticality": .8},
+            ],
+        }
+        _, created = self.request(owner, "/api/workflow-templates", payload)
+        _, reader_private = self.request(reader, "/api/workflow-templates")
+        self.assertNotIn(created["id"], {template["id"] for template in reader_private})
+        _, shared = self.request(owner, f"/api/workflow-templates/{created['id']}", payload | {"shared": True})
+        self.assertTrue(shared["shared"])
+        _, reader_visible = self.request(reader, "/api/workflow-templates")
+        self.assertIn(created["id"], {template["id"] for template in reader_visible})
+        with self.assertRaises(HTTPError) as update_denied:
+            self.request(reader, f"/api/workflow-templates/{created['id']}", payload | {"name": "Unauthorized edit"})
+        self.assertEqual(update_denied.exception.code, 403)
+        _, admin_update = self.request(admin, f"/api/workflow-templates/{created['id']}", payload | {"name": "Administrator edit", "shared": True})
+        self.assertEqual(admin_update["name"], "Administrator edit")
+        with self.assertRaises(HTTPError) as delete_denied:
+            self.delete(reader, f"/api/workflow-templates/{created['id']}")
+        self.assertEqual(delete_denied.exception.code, 403)
+        _, deleted = self.delete(owner, f"/api/workflow-templates/{created['id']}")
+        self.assertTrue(deleted["deleted"])
+
     def test_roles_policy_and_workflow_ownership(self):
         anonymous = self.client()
         with self.assertRaises(HTTPError) as denied:

@@ -90,6 +90,11 @@ def init_db():
           expires_at REAL NOT NULL, used_at REAL, attempts INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS auth_rate_limits(
           id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, subject TEXT NOT NULL, created_at REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS workflow_templates(
+          id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL,
+          objective_template TEXT NOT NULL, tasks TEXT NOT NULL, tags TEXT NOT NULL,
+          owner_id TEXT, shared INTEGER NOT NULL DEFAULT 0, system INTEGER NOT NULL DEFAULT 0,
+          created_at REAL NOT NULL, updated_at REAL NOT NULL);
         """
     try:
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -103,6 +108,8 @@ def init_db():
         columns={r[1] for r in conn.execute("PRAGMA table_info(workflows)")}
         if "owner_id" not in columns: conn.execute("ALTER TABLE workflows ADD COLUMN owner_id TEXT")
         if "session_id" not in columns: conn.execute("ALTER TABLE workflows ADD COLUMN session_id TEXT")
+        if "template_id" not in columns: conn.execute("ALTER TABLE workflows ADD COLUMN template_id TEXT")
+        if "planning_mode" not in columns: conn.execute("ALTER TABLE workflows ADD COLUMN planning_mode TEXT DEFAULT 'legacy'")
         user_columns={r[1] for r in conn.execute("PRAGMA table_info(users)")}
         if "email" not in user_columns: conn.execute("ALTER TABLE users ADD COLUMN email TEXT")
         if "verified_at" not in user_columns: conn.execute("ALTER TABLE users ADD COLUMN verified_at REAL")
@@ -128,6 +135,9 @@ def init_db():
           "workflows.read_all":"Read all workflow reports and deliverables",
           "workflows.delete_own":"Delete workflows owned by the current user",
           "workflows.delete_all":"Delete workflows owned by any user",
+          "workflow_templates.read":"Read system, shared, and owned workflow templates",
+          "workflow_templates.manage_own":"Create, update, share, and delete owned workflow templates",
+          "workflow_templates.manage_all":"Manage every non-system workflow template",
           "server_stats.read":"Read privacy-preserving server and inference statistics",
           "email.manage":"Configure and test the outbound SMTP server",
           "users.verify":"Manually approve pending user registrations",
@@ -138,7 +148,7 @@ def init_db():
           "user_manager":("User Manager","Manage users, profile assignments, and account verification",["users.manage","users.verify"]),
           "settings_manager":("Settings Manager","Manage execution policy, GPU pools, stack controls, and SMTP",["settings.manage","email.manage"]),
           "model_manager":("Model Manager","Manage model registry and runtimes",["models.manage","server_stats.read"]),
-          "workflow_operator":("Workflow Operator","Execute, inspect, and delete owned workflows",["workflows.execute","workflows.read_own","workflows.delete_own"]),
+          "workflow_operator":("Workflow Operator","Execute workflows and manage owned workflow templates",["workflows.execute","workflows.read_own","workflows.delete_own","workflow_templates.read","workflow_templates.manage_own"]),
           "stats_auditor":("Statistics Auditor","Read anonymized operational statistics only",["server_stats.read"]),
         }
         for profile_id,(name,description,grants) in profiles.items():
@@ -147,6 +157,7 @@ def init_db():
         for user in conn.execute("SELECT id,role FROM users").fetchall():
             if not conn.execute("SELECT 1 FROM user_profiles WHERE user_id=?",(user["id"],)).fetchone():
                 conn.execute("INSERT OR IGNORE INTO user_profiles VALUES(?,?)",(user["id"],"super_admin" if user["role"]=="admin" else "workflow_operator"))
+        seed_default_workflow_templates(conn)
     discover_local_models()
 
 
@@ -462,12 +473,140 @@ def plan_for(objective):
       ("Deliver the final directly usable answer", "integrator", [0,1], .52, .25, .90)]
 
 
-def create_workflow(objective,owner_id=None,session_id=None):
+WORKFLOW_ROLES = {
+    "architect", "analyst", "coder", "executor", "integrator", "researcher",
+    "reviewer", "security-reviewer", "tester", "translator",
+}
+
+
+def task_specs_to_template(specs):
+    keys = [f"step_{index + 1}" for index in range(len(specs))]
+    return [
+        {
+            "key": keys[index],
+            "title": title,
+            "role": role,
+            "dependencies": [keys[dependency] for dependency in dependencies],
+            "complexity": complexity,
+            "risk": risk,
+            "criticality": criticality,
+        }
+        for index, (title, role, dependencies, complexity, risk, criticality) in enumerate(specs)
+    ]
+
+
+def validate_workflow_tasks(tasks):
+    errors = []
+    if not isinstance(tasks, list) or not 1 <= len(tasks) <= 12:
+        return {"valid": False, "errors": ["A workflow must contain between 1 and 12 tasks"]}
+    keys = []
+    for index, task in enumerate(tasks):
+        if not isinstance(task, dict):
+            errors.append(f"Task {index + 1} must be an object")
+            continue
+        key = str(task.get("key", "")).strip()
+        title = str(task.get("title", "")).strip()
+        role = str(task.get("role", "")).strip()
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{1,63}", key): errors.append(f"Task {index + 1} has an invalid key")
+        if not 3 <= len(title) <= 200: errors.append(f"Task {index + 1} title must contain 3 to 200 characters")
+        if role not in WORKFLOW_ROLES: errors.append(f"Task {index + 1} has an unsupported role")
+        for field in ("complexity", "risk", "criticality"):
+            try: value = float(task.get(field, 0.5))
+            except (TypeError, ValueError): errors.append(f"Task {index + 1} {field} must be a number"); continue
+            if not 0 <= value <= 1: errors.append(f"Task {index + 1} {field} must be between 0 and 1")
+        keys.append(key)
+    if len(set(keys)) != len(keys): errors.append("Task keys must be unique")
+    key_set = set(keys); edges = {key: [] for key in keys}; indegree = {key: 0 for key in keys}; referenced = set()
+    for index, task in enumerate(tasks):
+        if not isinstance(task, dict): continue
+        dependencies = task.get("dependencies", [])
+        if not isinstance(dependencies, list): errors.append(f"Task {index + 1} dependencies must be a list"); continue
+        if len(set(dependencies)) != len(dependencies): errors.append(f"Task {index + 1} dependencies must be unique")
+        for dependency in dependencies:
+            if dependency not in key_set: errors.append(f"Task {index + 1} references unknown dependency {dependency}"); continue
+            if dependency == task.get("key"): errors.append(f"Task {index + 1} cannot depend on itself"); continue
+            edges[dependency].append(task.get("key")); indegree[task.get("key")] += 1; referenced.add(dependency)
+    queue = deque(key for key, degree in indegree.items() if degree == 0); visited = []
+    while queue:
+        key = queue.popleft(); visited.append(key)
+        for dependent in edges.get(key, []):
+            indegree[dependent] -= 1
+            if indegree[dependent] == 0: queue.append(dependent)
+    if len(visited) != len(keys): errors.append("Task dependencies must form an acyclic graph")
+    terminals = [key for key in keys if key not in referenced]
+    if len(terminals) != 1: errors.append("A workflow must have exactly one terminal task")
+    elif tasks[keys.index(terminals[0])].get("role") != "integrator": errors.append("The terminal task must use the integrator role")
+    return {"valid": not errors, "errors": errors, "task_count": len(tasks), "terminal_task": terminals[0] if len(terminals) == 1 else None}
+
+
+DEFAULT_WORKFLOW_TEMPLATES = (
+    ("default-general", "General delivery", "Execute, verify, and deliver a general request", "Complete the user request", "general,answer,analysis", plan_for("general request")),
+    ("default-software", "Software implementation", "Design, implement, test, and deliver usable software", "Build the requested software", "code,software,python,javascript,api,app", plan_for("build a software application with code and tests")),
+    ("default-translation", "Translation and review", "Translate, review terminology, and deliver the final text", "Translate the requested content", "translate,translation,language,localization", plan_for("translate this content")),
+    ("default-security", "Security-sensitive change", "Design, implement, test, and review a security-sensitive change", "Implement the requested security change", "security,oauth,authentication,secrets,permissions", plan_for("build a secure OAuth API")),
+)
+
+
+def seed_default_workflow_templates(conn):
+    now = stamp()
+    for template_id, name, description, objective_template, tags, specs in DEFAULT_WORKFLOW_TEMPLATES:
+        tasks = task_specs_to_template(specs)
+        validation = validate_workflow_tasks(tasks)
+        if not validation["valid"]: raise RuntimeError(f"Invalid default workflow template {template_id}: {validation['errors']}")
+        conn.execute("""INSERT OR IGNORE INTO workflow_templates
+          (id,name,description,objective_template,tasks,tags,owner_id,shared,system,created_at,updated_at)
+          VALUES(?,?,?,?,?,?,NULL,1,1,?,?)""",
+          (template_id, name, description, objective_template, json.dumps(tasks), tags, now, now))
+
+
+def workflow_template_payload(row, user_id=None, manage_all=False):
+    item = dict(row); item["tasks"] = json.loads(item["tasks"]); item["tags"] = [tag for tag in item["tags"].split(",") if tag]
+    item["shared"] = bool(item["shared"]); item["system"] = bool(item["system"])
+    owned = bool(user_id and item["owner_id"] == user_id)
+    item["permissions"] = {"edit": not item["system"] and (owned or manage_all), "delete": not item["system"] and (owned or manage_all), "share": not item["system"] and (owned or manage_all)}
+    item["validation"] = validate_workflow_tasks(item["tasks"])
+    return item
+
+
+def visible_workflow_templates(user_id, manage_all=False):
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM workflow_templates ORDER BY system DESC,name" if manage_all else "SELECT * FROM workflow_templates WHERE system=1 OR shared=1 OR owner_id=? ORDER BY system DESC,name", () if manage_all else (user_id,)).fetchall()
+    return [workflow_template_payload(row, user_id, manage_all) for row in rows]
+
+
+def normalize_workflow_template(body):
+    name = str(body.get("name", "")).strip()
+    description = str(body.get("description", "")).strip()
+    objective_template = str(body.get("objective_template", "")).strip()
+    if not 3 <= len(name) <= 80: raise ValueError("Template name must contain 3 to 80 characters")
+    if len(description) > 500: raise ValueError("Template description must not exceed 500 characters")
+    if not 3 <= len(objective_template) <= 500: raise ValueError("Objective template must contain 3 to 500 characters")
+    tasks = body.get("tasks")
+    validation = validate_workflow_tasks(tasks)
+    if not validation["valid"]: raise ValueError("; ".join(validation["errors"]))
+    raw_tags = body.get("tags", [])
+    if isinstance(raw_tags, str): raw_tags = raw_tags.split(",")
+    if not isinstance(raw_tags, list): raise ValueError("Tags must be a list or comma-separated string")
+    tags = []
+    for raw_tag in raw_tags:
+        tag = re.sub(r"[^a-z0-9_-]", "", str(raw_tag).strip().lower())[:32]
+        if tag and tag not in tags: tags.append(tag)
+    return {"name":name,"description":description,"objective_template":objective_template,"tasks":tasks,"tags":tags[:20],"shared":bool(body.get("shared")),"validation":validation}
+
+
+def template_task_specs(tasks):
+    validation = validate_workflow_tasks(tasks)
+    if not validation["valid"]: raise ValueError("; ".join(validation["errors"]))
+    positions = {task["key"]: index for index, task in enumerate(tasks)}
+    return [(task["title"], task["role"], [positions[key] for key in task["dependencies"]], float(task.get("complexity", .5)), float(task.get("risk", .5)), float(task.get("criticality", .5))) for task in tasks]
+
+
+def create_workflow(objective,owner_id=None,session_id=None,specs=None,template_id=None,planning_mode="automatic"):
     wid, created = str(uuid.uuid4()), stamp()
-    specs = plan_for(objective)
+    specs = specs or plan_for(objective)
     ids = [str(uuid.uuid4()) for _ in specs]
     with db() as conn:
-        conn.execute("INSERT INTO workflows(id,objective,status,created_at,updated_at,owner_id,session_id) VALUES(?,?,?,?,?,?,?)", (wid, objective, "READY", created, created,owner_id,session_id))
+        conn.execute("INSERT INTO workflows(id,objective,status,created_at,updated_at,owner_id,session_id,template_id,planning_mode) VALUES(?,?,?,?,?,?,?,?,?)", (wid, objective, "READY", created, created,owner_id,session_id,template_id,planning_mode))
         for pos, spec in enumerate(specs):
             title, role, deps, complexity, risk, criticality = spec
             conn.execute("""INSERT INTO tasks(id,workflow_id,position,title,role,dependencies,
@@ -475,7 +614,7 @@ def create_workflow(objective,owner_id=None,session_id=None):
                (ids[pos], wid, pos, title, role, json.dumps([ids[i] for i in deps]),
                complexity, risk, criticality, "READY"))
     workflow_storage_root(wid,owner_id,session_id).mkdir(parents=True,exist_ok=True)
-    emit(wid, "workflow.created", {"objective": objective, "tasks": len(specs)})
+    emit(wid, "workflow.created", {"objective": objective, "tasks": len(specs), "template_id": template_id, "planning_mode": planning_mode})
     return wid
 
 
@@ -987,7 +1126,7 @@ class Handler(SimpleHTTPRequestHandler):
             if sep and key==name: return value
         return None
     def current_user(self):
-        if os.getenv("SKEIN_AUTH_DISABLED","0")=="1": return {"id":"test-admin","session_id":"test-session","username":"test-admin","role":"admin","active":1,"profiles":[{"id":"super_admin","name":"Super Administrator"}],"permissions":["users.manage","settings.manage","models.manage","workflows.execute","workflows.read_own","workflows.read_all","workflows.delete_own","workflows.delete_all","server_stats.read"]}
+        if os.getenv("SKEIN_AUTH_DISABLED","0")=="1": return {"id":"test-admin","session_id":"test-session","username":"test-admin","role":"admin","active":1,"profiles":[{"id":"super_admin","name":"Super Administrator"}],"permissions":["users.manage","settings.manage","models.manage","workflows.execute","workflows.read_own","workflows.read_all","workflows.delete_own","workflows.delete_all","workflow_templates.read","workflow_templates.manage_own","workflow_templates.manage_all","server_stats.read"]}
         token=self.cookie("skein_session")
         if not token: return None
         with db() as conn:
@@ -1013,6 +1152,12 @@ class Handler(SimpleHTTPRequestHandler):
         if "workflows.read_all" in user["permissions"]: return True
         with db() as conn: row=conn.execute("SELECT owner_id FROM workflows WHERE id=?",(wid,)).fetchone()
         return bool(row and row["owner_id"]==user["id"])
+    def template_row(self,template_id):
+        with db() as conn: return conn.execute("SELECT * FROM workflow_templates WHERE id=?",(template_id,)).fetchone()
+    def template_visible(self,user,row):
+        return bool(row and (row["system"] or row["shared"] or row["owner_id"]==user["id"] or "workflow_templates.manage_all" in user["permissions"]))
+    def template_editable(self,user,row):
+        return bool(row and not row["system"] and (row["owner_id"]==user["id"] and "workflow_templates.manage_own" in user["permissions"] or "workflow_templates.manage_all" in user["permissions"]))
     def send_session(self,user,token):
         raw=json.dumps({"user":user,"policy":{"users_can_choose_execution_mode":setting_bool("users_can_choose_execution_mode")}},ensure_ascii=False).encode()
         self.send_response(200); self.send_header("Content-Type","application/json; charset=utf-8")
@@ -1029,6 +1174,7 @@ class Handler(SimpleHTTPRequestHandler):
             elif self.path=="/api/admin/email": user=self.authorize("email.manage")
             elif self.path=="/api/admin/settings": user=self.authorize("settings.manage")
             elif self.path=="/api/models": user=self.authorize("models.manage")
+            elif self.path.startswith("/api/workflow-templates"): user=self.authorize("workflow_templates.read")
             elif self.path=="/api/hardware": user=self.authorize_any("server_stats.read","settings.manage","models.manage")
             elif self.path=="/api/server-stats": user=self.authorize("server_stats.read")
             else: user=self.authorize()
@@ -1073,6 +1219,12 @@ class Handler(SimpleHTTPRequestHandler):
                 elif proc and proc.poll() is not None: item["status"]="STOPPED"
                 models.append(item)
             return self.json(models)
+        if self.path=="/api/workflow-templates":
+            return self.json(visible_workflow_templates(user["id"],"workflow_templates.manage_all" in user["permissions"]))
+        if self.path.startswith("/api/workflow-templates/"):
+            template_id=self.path.rsplit("/",1)[-1]; row=self.template_row(template_id)
+            if not self.template_visible(user,row): return self.json({"error":"Workflow template not found"},404)
+            return self.json(workflow_template_payload(row,user["id"],"workflow_templates.manage_all" in user["permissions"]))
         if self.path=="/api/stack/status":
             result,status=supervisor_call("status"); return self.json(result,status)
         if self.path=="/api/workflows":
@@ -1155,6 +1307,7 @@ class Handler(SimpleHTTPRequestHandler):
                 with db() as conn: conn.execute("DELETE FROM sessions WHERE token=?",(token,))
             raw=b'{"ok":true}'; self.send_response(200); self.send_header("Content-Type","application/json"); self.send_header("Set-Cookie","skein_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"); self.send_header("Content-Length",str(len(raw))); self.end_headers(); return self.wfile.write(raw)
         if self.path.startswith("/api/models"): user=self.authorize("models.manage")
+        elif self.path.startswith("/api/workflow-templates"): user=self.authorize_any("workflow_templates.manage_own","workflow_templates.manage_all")
         elif self.path.startswith("/api/users") or self.path.startswith("/api/rbac"): user=self.authorize("users.manage")
         elif self.path.startswith("/api/admin/email"): user=self.authorize("email.manage")
         elif self.path.startswith(("/api/pools","/api/gpus","/api/stack","/api/admin")): user=self.authorize("settings.manage")
@@ -1168,6 +1321,27 @@ class Handler(SimpleHTTPRequestHandler):
             aid=self.path.split("/")[3]
             with db() as conn: artifact_owner=conn.execute("SELECT workflow_id FROM artifacts WHERE id=?",(aid,)).fetchone()
             if not artifact_owner or not self.workflow_allowed(user,artifact_owner["workflow_id"]): return self.deny(403,"Artifact access denied")
+        if self.path=="/api/workflow-templates":
+            try: template=normalize_workflow_template(body)
+            except ValueError as exc: return self.json({"error":str(exc)},400)
+            template_id=str(uuid.uuid4()); now=stamp()
+            with db() as conn:
+                conn.execute("""INSERT INTO workflow_templates
+                  (id,name,description,objective_template,tasks,tags,owner_id,shared,system,created_at,updated_at)
+                  VALUES(?,?,?,?,?,?,?,?,0,?,?)""",(template_id,template["name"],template["description"],template["objective_template"],json.dumps(template["tasks"],ensure_ascii=False),",".join(template["tags"]),user["id"],1 if template["shared"] else 0,now,now))
+                row=conn.execute("SELECT * FROM workflow_templates WHERE id=?",(template_id,)).fetchone()
+            return self.json(workflow_template_payload(row,user["id"],"workflow_templates.manage_all" in user["permissions"]),201)
+        if self.path.startswith("/api/workflow-templates/"):
+            template_id=self.path.rsplit("/",1)[-1]; row=self.template_row(template_id)
+            if not row: return self.json({"error":"Workflow template not found"},404)
+            if not self.template_editable(user,row): return self.deny(403,"Workflow template edit permission required")
+            merged={"name":body.get("name",row["name"]),"description":body.get("description",row["description"]),"objective_template":body.get("objective_template",row["objective_template"]),"tasks":body.get("tasks",json.loads(row["tasks"])),"tags":body.get("tags",row["tags"]),"shared":body.get("shared",bool(row["shared"]))}
+            try: template=normalize_workflow_template(merged)
+            except ValueError as exc: return self.json({"error":str(exc)},400)
+            with db() as conn:
+                conn.execute("""UPDATE workflow_templates SET name=?,description=?,objective_template=?,tasks=?,tags=?,shared=?,updated_at=? WHERE id=?""",(template["name"],template["description"],template["objective_template"],json.dumps(template["tasks"],ensure_ascii=False),",".join(template["tags"]),1 if template["shared"] else 0,stamp(),template_id))
+                updated=conn.execute("SELECT * FROM workflow_templates WHERE id=?",(template_id,)).fetchone()
+            return self.json(workflow_template_payload(updated,user["id"],"workflow_templates.manage_all" in user["permissions"]))
         if self.path=="/api/users":
             username=str(body.get("username","")).strip(); password=str(body.get("password","")); profiles=body.get("profiles") or ["workflow_operator"]
             if not isinstance(profiles,list) or not profiles: return self.json({"error":"At least one RBAC profile is required"},400)
@@ -1287,6 +1461,15 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_DELETE(self):
         parsed=urlparse(self.path)
+        if parsed.path.startswith("/api/workflow-templates/"):
+            user=self.authorize_any("workflow_templates.manage_own","workflow_templates.manage_all")
+            if not user: return
+            template_id=parsed.path.rsplit("/",1)[-1]; row=self.template_row(template_id)
+            if not row: return self.json({"error":"Workflow template not found"},404)
+            if row["system"]: return self.json({"error":"System workflow templates cannot be deleted"},409)
+            if not self.template_editable(user,row): return self.deny(403,"Workflow template delete permission required")
+            with db() as conn: conn.execute("DELETE FROM workflow_templates WHERE id=?",(template_id,))
+            return self.json({"deleted":True,"id":template_id})
         if parsed.path!="/api/workflows/history": return self.json({"error":"Unknown route"},404)
         scope=dict(part.split("=",1) for part in parsed.query.split("&") if "=" in part).get("scope","own")
         if scope not in ("own","all"): return self.json({"error":"Invalid history deletion scope"},400)
