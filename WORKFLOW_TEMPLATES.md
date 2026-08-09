@@ -6,6 +6,16 @@ Workflow templates are reusable DAG definitions. They are separate from workflow
 
 Each template stores a name, description, objective hint, search tags, owner, sharing state, and one to twelve tasks. Every task has a stable key, title, role, dependencies, and normalized complexity, risk, and criticality scores.
 
+Every task also has an executable contract:
+
+- `action_type`: `llm`, `command`, or `script`;
+- `action_config`: the command text, or the script runtime, path, and complete source;
+- `system_prompt`: a task-specific instruction for LLM actions;
+- `output_format`: `text`, `markdown`, `json`, `files`, `exit_code`, or `boolean`;
+- `output_schema`: a precise description of the expected result.
+
+An optional `action_config.condition` uses the same three action types and must declare a boolean output. A false condition completes the node as skipped without executing its main action. Existing templates that predate typed contracts are hydrated as LLM tasks with role-specific prompts and explicit output contracts when they are read.
+
 Validation requires:
 
 - unique task keys and supported roles;
@@ -13,6 +23,7 @@ Validation requires:
 - scores between zero and one;
 - an acyclic dependency graph;
 - exactly one terminal task using the `integrator` role.
+- valid action configuration, output format, and output schema for every task and condition.
 
 System templates are seeded for general delivery, software implementation, translation, security-sensitive changes, simple chat, daily assistance, research and synthesis, and specification derived from code. They are shared, immutable, and validated during database initialization.
 
@@ -55,6 +66,8 @@ The Execution tab exposes the same lifecycle without conflating design and runti
 4. Use **Execute prompt** to create a run with the selected planning mode.
 
 The workflow library lists system, private, and shared templates. Permission-aware controls let an owner or authorized administrator use, edit, share or unshare, and delete non-system templates. Every create or update request is validated again by the server, so editing JSON in the browser cannot bypass DAG validation.
+
+The execution form keeps planning controls on their own row and gives the user request a full-width, resizable editor. Selecting a saved workflow therefore never compresses the prompt into the remaining horizontal space.
 
 Every saved template has a **View graph** action. The graph lays tasks out by dependency depth and draws directed edges between them. The workflow editor includes the same visualization as a live preview: changing the task JSON redraws the DAG after a short debounce. Unknown dependencies, empty task sets, and cycles are displayed inside the preview instead of leaving a stale graph on screen. Generated proposals are visualized before they can be saved.
 
