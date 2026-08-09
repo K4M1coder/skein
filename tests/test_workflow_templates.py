@@ -62,7 +62,8 @@ class WorkflowTemplateTest(unittest.TestCase):
     def test_defaults_are_seeded_and_immutable(self):
         _, templates = self.request("/api/workflow-templates")
         defaults = [template for template in templates if template["system"]]
-        self.assertGreaterEqual(len(defaults), 4)
+        self.assertGreaterEqual(len(defaults), 8)
+        self.assertTrue({"default-chat", "default-daily-assistance", "default-research", "default-code-specification"}.issubset({template["id"] for template in defaults}))
         self.assertTrue(all(template["validation"]["valid"] for template in defaults))
         with self.assertRaises(HTTPError) as caught:
             self.request(f"/api/workflow-templates/{defaults[0]['id']}", method="DELETE")
@@ -92,11 +93,23 @@ class WorkflowTemplateTest(unittest.TestCase):
     def test_automatic_selection_and_generation_are_validated(self):
         _, selected = self.request("/api/workflow-templates/select", {"objective": "Build a Python API with complete tests"})
         self.assertEqual(selected["id"], "default-software")
+        self.assertEqual(selected["selection"]["method"], "deterministic-test")
         self.assertTrue(selected["validation"]["valid"])
         _, generated = self.request("/api/workflow-templates/generate", {"objective": "Translate a product announcement into French"})
         self.assertEqual(generated["mode"], "simulation")
         self.assertTrue(generated["validation"]["valid"])
         self.assertEqual(generated["validation"]["terminal_task"], generated["tasks"][-1]["key"])
+
+    def test_automatic_selection_covers_core_workflow_families(self):
+        cases = (
+            ("Chat and explain dependency injection simply", "default-chat"),
+            ("Help organize my day and draft an email", "default-daily-assistance"),
+            ("Research and compare sources about local inference", "default-research"),
+            ("Derive a technical specification from this codebase architecture", "default-code-specification"),
+        )
+        for objective, expected in cases:
+            _, selected = self.request("/api/workflow-templates/select", {"objective": objective})
+            self.assertEqual(selected["id"], expected)
 
     def test_execution_modes_report_their_planning_source(self):
         requests = (
@@ -110,6 +123,9 @@ class WorkflowTemplateTest(unittest.TestCase):
             self.assertEqual(status, 201)
             self.assertEqual(created["planning"]["mode"], expected_mode)
             self.assertEqual(created["planning"]["template_id"], expected_template)
+            if expected_mode == "automatic":
+                self.assertEqual(created["planning"]["selection_method"], "deterministic-test")
+                self.assertIn("reason", created["planning"])
             workflow_ids.append(created["id"])
         deadline = time.time() + 20
         while time.time() < deadline:

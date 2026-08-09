@@ -544,6 +544,23 @@ DEFAULT_WORKFLOW_TEMPLATES = (
     ("default-software", "Software implementation", "Design, implement, test, and deliver usable software", "Build the requested software", "code,software,python,javascript,api,app", plan_for("build a software application with code and tests")),
     ("default-translation", "Translation and review", "Translate, review terminology, and deliver the final text", "Translate the requested content", "translate,translation,language,localization", plan_for("translate this content")),
     ("default-security", "Security-sensitive change", "Design, implement, test, and review a security-sensitive change", "Implement the requested security change", "security,oauth,authentication,secrets,permissions", plan_for("build a secure OAuth API")),
+    ("default-chat", "Simple chat", "Answer a conversational question directly without unnecessary orchestration", "Answer the user clearly and concisely", "chat,conversation,question,explain,brainstorm", [
+      ("Answer the conversation directly", "integrator", [], .20, .10, .35)]),
+    ("default-daily-assistance", "Daily assistance", "Help with everyday planning, writing, organization, and practical decisions", "Provide practical daily assistance", "daily,assistant,planning,writing,organize,email,decision", [
+      ("Understand the practical request and constraints", "analyst", [], .28, .15, .45),
+      ("Prepare a useful and actionable response", "executor", [0], .35, .18, .55),
+      ("Deliver the concise final assistance", "integrator", [0,1], .25, .12, .65)]),
+    ("default-research", "Research and synthesis", "Investigate a question, compare reliable evidence, and produce a sourced synthesis", "Research and synthesize the requested topic", "research,compare,sources,evidence,investigate,analysis", [
+      ("Define the research questions and evidence criteria", "analyst", [], .42, .25, .65),
+      ("Collect and organize relevant evidence", "researcher", [0], .62, .32, .72),
+      ("Review contradictions, limitations, and source quality", "reviewer", [0,1], .58, .38, .78),
+      ("Deliver the sourced research synthesis", "integrator", [0,1,2], .52, .28, .85)]),
+    ("default-code-specification", "Specification from code", "Inspect an existing codebase and derive accurate functional and technical specifications", "Produce specifications grounded in the supplied codebase", "specification,spec,codebase,architecture,requirements,reverse-engineer", [
+      ("Map the codebase structure and entry points", "researcher", [], .58, .28, .72),
+      ("Trace behavior, contracts, data flows, and dependencies", "analyst", [0], .72, .38, .82),
+      ("Draft functional and technical specifications from evidence", "architect", [0,1], .68, .35, .86),
+      ("Review specifications against the code and identify unknowns", "reviewer", [0,1,2], .62, .32, .88),
+      ("Deliver the verified specification", "integrator", [0,1,2,3], .55, .25, .92)]),
 )
 
 
@@ -599,7 +616,7 @@ def objective_tokens(text):
     return {token for token in re.findall(r"[a-z0-9_-]{3,}", str(text).lower()) if token not in stop_words}
 
 
-def select_workflow_template(objective,user_id,manage_all=False):
+def score_workflow_template(objective,user_id,manage_all=False):
     objective_words = objective_tokens(objective)
     templates = visible_workflow_templates(user_id,manage_all)
     best = None
@@ -611,6 +628,17 @@ def select_workflow_template(objective,user_id,manage_all=False):
         if best is None or candidate[:3] > best[:3]: best = candidate
     if not best: return None
     selected = best[3]; selected["selection"]={"score":best[0],"matched_terms":sorted(objective_words & (set(selected["tags"])|objective_tokens(selected["name"]+" "+selected["description"]+" "+selected["objective_template"])))[:12]}
+    return selected
+
+
+def select_workflow_template(objective,user_id,manage_all=False):
+    templates=visible_workflow_templates(user_id,manage_all)
+    if not templates: return None
+    decision=ModelClient("reasoner-large").select_workflow_template(objective,templates)
+    if decision.get("error"): return {"error":decision["error"],"action":decision.get("action")}
+    selected=next((template for template in templates if template["id"]==decision.get("template_id")),None)
+    if not selected: return {"error":"The reasoner selected an unavailable workflow template"}
+    selected["selection"]={"method":"llm" if decision.get("mode")=="live" else "deterministic-test","reason":str(decision.get("reason") or ""),"confidence":max(0,min(1,float(decision.get("confidence",0))))}
     return selected
 
 
@@ -732,6 +760,34 @@ class ModelClient:
                 "assumptions": ["Demonstration without external tools"],
                 "evidence": ["Dependencies completed", f"Route: {self.tier}"],
                 "next_actions": ["Validate the produced artifact"], "mode": "simulation"}
+
+    def select_workflow_template(self, objective, templates, retry=False):
+        if not self.url:
+            if os.getenv("SKEIN_ALLOW_SIMULATION", "0") == "1":
+                selected=score_workflow_template(objective,None,True)
+                return {"template_id":selected["id"],"reason":"Deterministic test-mode routing","confidence":1.0,"mode":"simulation"}
+            return {"error":"No active endpoint for reasoner-large","action":"Load a reasoner model in Model Plane."}
+        candidates=[{"id":item["id"],"name":item["name"],"description":item["description"],"objective_template":item["objective_template"],"tags":item["tags"],"task_roles":[task["role"] for task in item["tasks"]]} for item in templates]
+        repair="The previous selection was invalid. Return corrected JSON only.\n" if retry else ""
+        prompt=("/no_think\n"+repair+"Choose exactly one available workflow template for the user request. "
+          "Always select the smallest specialized workflow that fully handles the request; General delivery is only a fallback when no specialized workflow applies. "
+          "A direct question, explanation, brainstorming request, or ordinary conversation MUST select default-chat. Practical everyday help, planning, writing, email, or organization MUST select default-daily-assistance. "
+          "A request requiring external facts, source comparison, or evidence gathering MUST select default-research. Requirements or documentation derived from an existing codebase MUST select default-code-specification. "
+          "Return only JSON with template_id, reason, and confidence from 0 to 1. The template_id must exactly match one candidate.\n"
+          "USER REQUEST:\n"+objective+"\nAVAILABLE WORKFLOWS:\n"+json.dumps(candidates,ensure_ascii=False))
+        body=json.dumps({"model":self.model,"messages":[{"role":"user","content":prompt}],"temperature":0,"max_tokens":512,"response_format":{"type":"json_object"},"chat_template_kwargs":{"enable_thinking":False}}).encode()
+        try:
+            with urlopen(Request(self.url,body,{"Content-Type":"application/json"}),timeout=120) as response:
+                payload=json.load(response); content=payload["choices"][0]["message"]["content"].strip()
+            if content.startswith("```"): content=content.split("\n",1)[1].rsplit("```",1)[0]
+            decision=json.loads(content)
+            if decision.get("template_id") not in {item["id"] for item in templates}:
+                if not retry: return self.select_workflow_template(objective,templates,True)
+                return {"error":"The reasoner did not select an available workflow template"}
+            decision["mode"]="live"; return decision
+        except (URLError,TimeoutError,KeyError,json.JSONDecodeError,TypeError,ValueError) as exc:
+            if not retry: return self.select_workflow_template(objective,templates,True)
+            return {"error":f"Workflow selection failed: {exc}","action":"Check the reasoner endpoint and retry."}
 
     def generate_workflow_template(self, objective, retry=False):
         if not self.url:
@@ -1389,7 +1445,9 @@ class Handler(SimpleHTTPRequestHandler):
             objective=str(body.get("objective","")).strip()
             if len(objective)<5: return self.json({"error":"Objective is too short"},400)
             selected=select_workflow_template(objective,user["id"],"workflow_templates.manage_all" in user["permissions"])
-            return self.json(selected or {"error":"No visible workflow template"},200 if selected else 404)
+            if not selected: return self.json({"error":"No visible workflow template"},404)
+            if selected.get("error"): return self.json(selected,502)
+            return self.json(selected)
         if self.path=="/api/workflow-templates":
             try: template=normalize_workflow_template(body)
             except ValueError as exc: return self.json({"error":str(exc)},400)
@@ -1493,7 +1551,8 @@ class Handler(SimpleHTTPRequestHandler):
             elif planning_mode=="automatic":
                 template=select_workflow_template(objective,user["id"],"workflow_templates.manage_all" in user["permissions"])
                 if not template: return self.json({"error":"No visible workflow template"},404)
-                template_id=template["id"]; specs=template_task_specs(template["tasks"]); selection={"template_id":template["id"],"template_name":template["name"],"mode":"automatic","score":template["selection"]["score"],"matched_terms":template["selection"]["matched_terms"]}
+                if template.get("error"): return self.json(template,502)
+                template_id=template["id"]; specs=template_task_specs(template["tasks"]); selection={"template_id":template["id"],"template_name":template["name"],"mode":"automatic","selection_method":template["selection"]["method"],"reason":template["selection"]["reason"],"confidence":template["selection"]["confidence"]}
             else:
                 generated,status=generate_validated_workflow_template(objective)
                 if status!=200: return self.json(generated,status)
