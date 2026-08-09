@@ -17,7 +17,7 @@
   <link rel="stylesheet" href="/navigation.css?v=3">
   <link rel="stylesheet" href="/rbac.css">
   <link rel="stylesheet" href="/shell.css?v=6">
-  <link rel="stylesheet" href="/workflow-templates.css?v=1">
+  <link rel="stylesheet" href="/workflow-templates.css?v=2">
 </head>
 <body>
   <header>
@@ -44,7 +44,7 @@
           <div id="workflow-planning-status" class="workflow-planning-status"></div>
         </div>
         <textarea id="objective" data-i18n-placeholder="objectivePlaceholder" data-i18n-value="objectivePlaceholder" placeholder="Add a robust OAuth2 API with refresh tokens and security tests">Add a robust OAuth2 API with refresh tokens and security tests</textarea>
-        <div class="workflow-submit-actions"><button type="button" class="outline" id="generate-workflow" data-i18n="generateWorkflow">Generate workflow</button><button type="submit" data-i18n="executePrompt">Execute prompt →</button></div>
+        <div class="workflow-submit-actions"><button type="submit" data-i18n="executePrompt">Execute prompt →</button></div>
       </form>
     </section>
     <aside class="models">
@@ -53,13 +53,16 @@
       <div class="model intel"><span>ARC DOMAIN</span><strong>worker-general</strong><small data-i18n="workerFunctions">code · tests · documentation</small></div>
     </aside>
     <section class="workflow-catalog workspace">
-      <div class="head"><div><p class="eyebrow" data-i18n="workflowLibrary">WORKFLOW LIBRARY</p><h2 data-i18n="workflowTemplates">Workflow templates</h2><small data-i18n="workflowTemplatesDescription">Choose a validated default, create your own, or use a shared workflow.</small></div><button class="outline" id="new-workflow-template" data-i18n="addWorkflow">+ Add workflow</button></div>
+      <div class="head"><div><p class="eyebrow" data-i18n="workflowLibrary">WORKFLOW LIBRARY</p><h2 data-i18n="workflowTemplates">Workflow templates</h2><small data-i18n="workflowTemplatesDescription">Choose a validated default, create your own, or use a shared workflow.</small></div><div class="workflow-library-actions"><button class="outline" id="show-workflow-generator" data-i18n="generateWorkflow">Generate workflow</button><button class="outline" id="new-workflow-template" data-i18n="addWorkflow">+ Add workflow</button></div></div>
       <div id="workflow-template-feedback" class="workflow-template-feedback hidden"></div>
+      <form id="workflow-generator" class="workflow-generator hidden"><label><span data-i18n="workflowGenerationRequest">Describe the workflow to generate</span><textarea id="workflow-generation-objective" data-i18n-placeholder="workflowGenerationPlaceholder" placeholder="Create a workflow that implements, tests, reviews, and documents a software change" required minlength="5" maxlength="4000"></textarea></label><div><button type="button" class="outline" id="cancel-workflow-generator" data-i18n="cancel">Cancel</button><button type="submit" id="generate-workflow" data-i18n="generateValidatedWorkflow">Generate and validate</button></div></form>
       <div id="workflow-template-list" class="workflow-template-list"></div>
+      <section id="workflow-graph-panel" class="workflow-graph-panel hidden"><div class="head"><div><p class="eyebrow" data-i18n="workflowGraph">WORKFLOW GRAPH</p><h3 id="workflow-graph-title"></h3></div><button type="button" class="outline" id="close-workflow-graph" data-i18n="close">Close</button></div><div id="workflow-graph" class="workflow-graph"></div></section>
       <form id="workflow-template-editor" class="workflow-template-editor hidden">
         <input type="hidden" name="id">
         <div class="head"><div><p class="eyebrow" data-i18n="workflowEditor">WORKFLOW EDITOR</p><h3 id="workflow-editor-title" data-i18n="addWorkflow">Add workflow</h3></div><button type="button" class="outline" id="cancel-workflow-editor" data-i18n="cancel">Cancel</button></div>
         <div class="workflow-editor-fields"><label><span data-i18n="name">Name</span><input name="name" required maxlength="80"></label><label><span data-i18n="tags">Tags</span><input name="tags" data-i18n-placeholder="tagsPlaceholder" placeholder="code, review, delivery"></label><label class="wide"><span data-i18n="description">Description</span><textarea name="description" maxlength="500"></textarea></label><label class="wide"><span data-i18n="objectiveTemplate">Objective template</span><textarea name="objective_template" required maxlength="500"></textarea></label><label class="wide"><span data-i18n="workflowTasksJson">Workflow tasks (validated JSON)</span><textarea name="tasks" class="workflow-json" required spellcheck="false"></textarea></label><label class="workflow-share"><input name="shared" type="checkbox"> <span data-i18n="shareWorkflow">Share this workflow with other users</span></label></div>
+        <section class="workflow-editor-preview"><div><p class="eyebrow" data-i18n="liveGraphPreview">LIVE GRAPH PREVIEW</p><small data-i18n="liveGraphPreviewDescription">The graph updates as you edit the task JSON.</small></div><div id="workflow-editor-graph" class="workflow-graph"></div></section>
         <div id="workflow-validation" class="workflow-validation"></div><button type="submit" data-i18n="saveWorkflow">Save workflow</button>
       </form>
     </section>
@@ -109,6 +112,6 @@
   <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js" integrity="sha384-aBQXj4hK6Jm05i7aQAsUV3bLdSUrHX1BGYfMB0166TtWt/RRaw+h0Eelme9OCOvy" crossorigin="anonymous"></script>
   <script src="https://cdn.jsdelivr.net/npm/lucide@1.31.0/dist/umd/lucide.min.js" integrity="sha384-/ApD3KXMqTmTxEJjuldaZDgdJj7/Hox2LRuKqV3rC7Bu/wE4obLaJRjF1rLHNP57" crossorigin="anonymous"></script>
   <script src="https://cdn.jsdelivr.net/npm/i18next@26.3.6/dist/umd/i18next.min.js" integrity="sha384-Z1BkLD/GT4ASQ3WKNxEI6cZMvXfpFLOmzVsco+KnLr/x1S3DeHkRFEW4OsrlUir1" crossorigin="anonymous"></script>
-  <script src="/i18n.js?v=8"></script><script src="/navigation.js?v=6"></script><script src="/workflow-templates.js?v=1"></script><script src="/auth.js?v=5"></script>
+  <script src="/i18n.js?v=9"></script><script src="/navigation.js?v=6"></script><script src="/workflow-templates.js?v=2"></script><script src="/auth.js?v=5"></script>
 </body>
 </html>

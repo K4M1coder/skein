@@ -54,11 +54,25 @@ class FrontendLocalizationTest(unittest.TestCase):
     def test_workflow_generation_and_execution_are_distinct_actions(self):
         markup = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
         manager = (ROOT / "static" / "workflow-templates.js").read_text(encoding="utf-8")
-        self.assertRegex(markup, r'id="generate-workflow"[^>]+type="button"|type="button"[^>]+id="generate-workflow"')
+        self.assertRegex(markup, r'id="generate-workflow"[^>]+type="submit"|type="submit"[^>]+id="generate-workflow"')
         self.assertIn('button type="submit" data-i18n="executePrompt"', markup)
+        execution_form = markup.split('<form id="create">', 1)[1].split('</form>', 1)[0]
+        catalog = markup.split('<section class="workflow-catalog workspace">', 1)[1].split('<section class="runtime-gate">', 1)[0]
+        self.assertNotIn('id="generate-workflow"', execution_form)
+        self.assertIn('id="workflow-generator"', catalog)
+        self.assertIn('id="generate-workflow"', catalog)
         self.assertIn('/api/workflow-templates/generate', manager)
         self.assertIn('executionPayload()', manager)
         self.assertIn('planning_mode', manager)
+
+    def test_workflow_editor_has_live_graph_preview(self):
+        markup = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        manager = (ROOT / "static" / "workflow-templates.js").read_text(encoding="utf-8")
+        self.assertIn('id="workflow-editor-graph"', markup)
+        self.assertIn('id="workflow-graph-panel"', markup)
+        self.assertIn('const drawGraph=', manager)
+        self.assertIn('graphCycleDetected', manager)
+        self.assertIn('addEventListener("input",updateEditorGraph)', manager)
 
 
 if __name__ == "__main__":
