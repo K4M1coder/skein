@@ -70,7 +70,7 @@
       if(administrationAccess) await renderAdmin(session);
       window.skeinNavigation.init(session);
       await window.skeinWorkflowTemplates.init(session);
-      const script=document.createElement("script"); script.src="/app.js?v=9"; document.body.appendChild(script);
+      const script=document.createElement("script"); script.src="/app.js?v=10"; document.body.appendChild(script);
     } catch (error) { showLogin(); }
   };
   addEventListener("DOMContentLoaded", boot);

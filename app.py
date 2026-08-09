@@ -387,6 +387,31 @@ def host_power_sensors():
       "source":"LibreHardwareMonitor/OpenHardwareMonitor WMI" if rows else None}
 
 
+def system_resource_snapshot():
+    cached=getattr(system_resource_snapshot,"_cache",None)
+    if cached and time.monotonic()-cached[0]<1: return dict(cached[1])
+    script=("$cpu=Get-CimInstance Win32_Processor; $os=Get-CimInstance Win32_OperatingSystem; "
+      "[pscustomobject]@{cpu_load=($cpu|Measure-Object LoadPercentage -Average).Average; cores=($cpu|Measure-Object NumberOfLogicalProcessors -Sum).Sum; "
+      "ram_total_kb=[double]$os.TotalVisibleMemorySize; ram_free_kb=[double]$os.FreePhysicalMemory} | ConvertTo-Json -Compress")
+    output=run_text(["powershell","-NoProfile","-Command",script],6)
+    try: data=json.loads(output) if output else {}
+    except json.JSONDecodeError: data={}
+    cpu=float(data.get("cpu_load") or 0); cores=max(1,float(data.get("cores") or 1)); total=float(data.get("ram_total_kb") or 0); used=max(0,total-float(data.get("ram_free_kb") or total))
+    used_gb=used/1048576; total_gb=total/1048576
+    result={"cpu_utilization":round(cpu,2),"ram_used_gb":round(used_gb,2),"ram_total_gb":round(total_gb,2),
+      "estimated_cpu_w":round(max(35,cores*8)*(.15+.85*cpu/100),2),"estimated_ram_w":round(used_gb*.375,2),
+      "estimation_method":"Host CPU load with logical-core power envelope; used RAM at 0.375 W/GB"}
+    system_resource_snapshot._cache=(time.monotonic(),result); return dict(result)
+
+
+def resource_window(start,end,duration,scope):
+    average={key:round((float(start.get(key) or 0)+float(end.get(key) or 0))/2,2) for key in ("cpu_utilization","ram_used_gb","estimated_cpu_w","estimated_ram_w")}
+    average.update({"ram_total_gb":end.get("ram_total_gb"),"estimated_cpu_energy_wh":round(average["estimated_cpu_w"]*duration/3600,4),
+      "estimated_ram_energy_wh":round(average["estimated_ram_w"]*duration/3600,4),"resource_scope":scope,
+      "resource_estimation_method":end.get("estimation_method")})
+    return average
+
+
 RUNTIMES, ACTIVE_ENDPOINTS = {}, {}
 
 
@@ -899,22 +924,23 @@ ACTIVE, WORKFLOW_QUEUE, ACTIVE_LOCK = set(), deque(), threading.Lock()
 
 class PowerSampler:
     """Best-effort GPU power attribution for one task; shared GPU load remains an estimate."""
-    def __init__(self): self.samples=[]; self.stop_event=threading.Event(); self.thread=None
+    def __init__(self): self.samples=[]; self.stop_event=threading.Event(); self.thread=None; self.resources=None
     def start(self):
+        self.resources=system_resource_snapshot()
         def sample():
             while not self.stop_event.is_set():
                 watts=sum(float(g.get("power_w") or 0) for g in nvidia_gpus())
                 if watts>0: self.samples.append((time.monotonic(),watts))
                 self.stop_event.wait(.5)
         self.thread=threading.Thread(target=sample,daemon=True); self.thread.start(); return self
-    def stop(self,duration):
+    def stop(self,duration,scope="model_runtime"):
         self.stop_event.set()
         if self.thread: self.thread.join(2)
         values=[x[1] for x in self.samples]
         avg=sum(values)/len(values) if values else 0
-        return {"average_power_w":round(avg,2),"peak_power_w":round(max(values,default=0),2),
+        return {"average_power_w":round(avg,2),"average_gpu_power_w":round(avg,2),"peak_power_w":round(max(values,default=0),2),
           "energy_wh":round(avg*duration/3600,4),"power_samples":len(values),
-          "energy_method":"estimated_nvidia_smi_task_window"}
+          "energy_method":"measured_nvidia_smi_task_window",**resource_window(self.resources,system_resource_snapshot(),duration,scope)}
 
 
 def workflow_storage_root(wid,owner_id=None,session_id=None):
@@ -1020,7 +1046,7 @@ def execute_in_sandbox(artifact_id,timeout=20,mode=None):
     if not artifact: return {"error":"artifact introuvable"},404
     runtime=runtime_for(artifact["relative_path"])
     if not runtime: return {"error":"runtime non supporté","extension":Path(artifact["relative_path"]).suffix},400
-    eid=str(uuid.uuid4()); cfg=SANDBOXES[runtime]; started=time.time()
+    eid=str(uuid.uuid4()); cfg=SANDBOXES[runtime]; started=time.time(); resource_start=system_resource_snapshot()
     if runtime=="html":
         result={"id":eid,"status":"PREVIEW_READY","runtime":runtime,"exit_code":0,"stdout":"Aperçu isolé disponible","stderr":"","duration":0}
     elif mode=="local":
@@ -1057,13 +1083,14 @@ def execute_in_sandbox(artifact_id,timeout=20,mode=None):
             result={"id":eid,"status":"TIMEOUT","runtime":runtime,"exit_code":None,"stdout":(exc.stdout or "")[-20000:] if isinstance(exc.stdout,str) else "",
               "stderr":"Limite de temps dépassée","duration":round(time.time()-started,3)}
         finally: shutil.rmtree(scratch,ignore_errors=True)
+    result["resources"]=resource_window(resource_start,system_resource_snapshot(),float(result.get("duration") or 0),"local_machine" if mode=="local" else "docker_container_host_window")
     with db() as conn: conn.execute("INSERT INTO executions VALUES(?,?,?,?,?,?,?,?,?,?,?)",
       (eid,artifact["workflow_id"],artifact_id,runtime,cfg["image"] if mode=="sandbox" else "LOCAL",result["status"],result["exit_code"],result["stdout"],result["stderr"],result["duration"],stamp()))
     return result,200
 
 
 def execute_command(wid,command,timeout=20,mode=None):
-    mode=mode or EXECUTION_MODE; root=artifact_root(wid); eid=str(uuid.uuid4()); started=time.time()
+    mode=mode or EXECUTION_MODE; root=artifact_root(wid); eid=str(uuid.uuid4()); started=time.time(); resource_start=system_resource_snapshot()
     if not command or len(command)>4000: return {"error":"commande vide ou trop longue"},400
     if mode=="local":
         args=["powershell","-NoProfile","-Command",command]; cwd=root; image="LOCAL"
@@ -1082,6 +1109,7 @@ def execute_command(wid,command,timeout=20,mode=None):
         result={"id":eid,"status":"TIMEOUT","mode":mode,"exit_code":None,"stdout":"","stderr":"Limite de temps dépassée","duration":round(time.time()-started,3)}
     finally:
         if mode=="sandbox": shutil.rmtree(scratch,ignore_errors=True)
+    result["resources"]=resource_window(resource_start,system_resource_snapshot(),float(result.get("duration") or 0),"local_machine" if mode=="local" else "docker_container_host_window")
     with db() as conn: conn.execute("INSERT INTO executions VALUES(?,?,?,?,?,?,?,?,?,?,?)",
       (eid,wid,"command",f"shell-{mode}",image,result["status"],result["exit_code"],result["stdout"],result["stderr"],result["duration"],stamp()))
     return result,200
@@ -1168,7 +1196,8 @@ def execute_task(wid, tid, objective):
         model, result = "reasoner-large", ModelClient("reasoner-large").generate(task, objective, dependency_results)
     duration=max(.001,time.perf_counter()-task_started)
     metrics=result.setdefault("metrics",{})
-    metrics.update({"execution_seconds":round(duration,3),**power.stop(duration)})
+    scope="local_machine" if task["action_type"] in ("command","script") and EXECUTION_MODE=="local" else ("docker_container_host_window" if task["action_type"] in ("command","script") else "model_runtime")
+    metrics.update({"execution_seconds":round(duration,3),**power.stop(duration,scope)})
     if task["action_type"]!="script": result["artifacts"]=persist_artifacts(wid,tid,result.get("files",[])) if result.get("files") else []
     confidence = float(result.get("confidence", 0))
     status = "COMPLETED" if confidence >= .55 else "FAILED"
@@ -1265,9 +1294,13 @@ def workflow_data(wid):
       "wall_clock_seconds":round(workflow_seconds,3),
       "average_tokens_per_second":round(completion_tokens/execution_seconds,2) if execution_seconds else 0,
       "average_power_w":round(sum(float(m.get("average_power_w") or 0)*float(m.get("execution_seconds") or 0) for m in task_metrics)/execution_seconds,2) if execution_seconds else 0,
+      "estimated_cpu_power_w":round(sum(float(m.get("estimated_cpu_w") or 0)*float(m.get("execution_seconds") or 0) for m in task_metrics)/execution_seconds,2) if execution_seconds else 0,
+      "estimated_ram_power_w":round(sum(float(m.get("estimated_ram_w") or 0)*float(m.get("execution_seconds") or 0) for m in task_metrics)/execution_seconds,2) if execution_seconds else 0,
+      "average_cpu_utilization":round(sum(float(m.get("cpu_utilization") or 0)*float(m.get("execution_seconds") or 0) for m in task_metrics)/execution_seconds,2) if execution_seconds else 0,
+      "average_ram_used_gb":round(sum(float(m.get("ram_used_gb") or 0)*float(m.get("execution_seconds") or 0) for m in task_metrics)/execution_seconds,2) if execution_seconds else 0,
       "peak_power_w":round(max([float(m.get("peak_power_w") or 0) for m in task_metrics] or [0]),2),
       "energy_wh":round(sum(float(m.get("energy_wh") or 0) for m in task_metrics),4),
-      "energy_note":"Estimated from nvidia-smi samples; simultaneous GPU load may be attributed to more than one task."}
+      "energy_note":"GPU power is measured from nvidia-smi. CPU and RAM watts are host-window estimates; Docker attribution is not a direct container power measurement."}
     workflow=dict(wf)
     with ACTIVE_LOCK:
         workflow["queue_position"]=(list(WORKFLOW_QUEUE).index(wid)+1) if wid in WORKFLOW_QUEUE else None
@@ -1299,12 +1332,14 @@ def runtime_overview():
         state.update({"connected":bool(endpoints[tier]) and endpoint_ready(endpoints[tier]),"endpoint":endpoints[tier] or None,"parallel_capacity":TASK_WORKER_LIMIT,
           "recent_tasks":len(metrics),"average_tokens_per_second":round(completion/seconds,2) if seconds else 0,
           "average_execution_seconds":round(seconds/len(metrics),3) if metrics else 0})
-    gpus=nvidia_gpus(); gpu_watts=round(sum(float(gpu.get("power_w") or 0) for gpu in gpus),2) if gpus else None; host_power=host_power_sensors()
+    gpus=nvidia_gpus(); gpu_watts=round(sum(float(gpu.get("power_w") or 0) for gpu in gpus),2) if gpus else None; host_power=host_power_sensors(); resources=system_resource_snapshot()
     with ACTIVE_LOCK: workflow_state={"active":len(ACTIVE),"queued":len(WORKFLOW_QUEUE),"parallel_capacity":MAX_PARALLEL_WORKFLOWS}
     return {"roles":roles,"workflows":workflow_state,"power":{
       "gpu_w":gpu_watts,"gpu_source":"nvidia-smi" if gpus else "No supported GPU power sensor",
       "cpu_w":host_power["cpu_w"],"cpu_source":host_power["source"] or "No reliable CPU package power sensor is available",
-      "ram_w":host_power["ram_w"],"ram_source":host_power["source"] or "No reliable RAM power sensor is available"},"timestamp":stamp()}
+      "ram_w":host_power["ram_w"],"ram_source":host_power["source"] or "No reliable RAM power sensor is available",
+      "cpu_utilization":resources["cpu_utilization"],"ram_used_gb":resources["ram_used_gb"],"ram_total_gb":resources["ram_total_gb"],
+      "estimated_cpu_w":resources["estimated_cpu_w"],"estimated_ram_w":resources["estimated_ram_w"],"estimation_method":resources["estimation_method"]},"timestamp":stamp()}
 
 
 def workflow_report(wid):
@@ -1314,6 +1349,8 @@ def workflow_report(wid):
       "## Execution summary","",f"- Tokens: **{s['total_tokens']}** ({s['prompt_tokens']} input, {s['completion_tokens']} output)",
       f"- Average throughput: **{s['average_tokens_per_second']} tokens/s**",f"- Cumulative task time: **{s['execution_seconds']} s**",
       f"- Workflow wall time: **{s['wall_clock_seconds']} s**",f"- Average / peak GPU power: **{s['average_power_w']} W / {s['peak_power_w']} W**",
+      f"- Estimated CPU / RAM power: **{s['estimated_cpu_power_w']} W / {s['estimated_ram_power_w']} W**",
+      f"- Average CPU utilization / RAM used: **{s['average_cpu_utilization']}% / {s['average_ram_used_gb']} GB**",
       f"- Estimated GPU energy: **{s['energy_wh']} Wh**","",f"> {s['energy_note']}",""]
     for i,task in enumerate(data["tasks"],1):
         result=task["result"] or {}
@@ -1321,7 +1358,9 @@ def workflow_report(wid):
           f"- Status: `{task['status']}`",f"- Confidence: {task['confidence'] if task['confidence'] is not None else 'N/A'}"]
         metrics=result.get("metrics",{})
         if metrics: lines += [f"- Tokens: {metrics.get('total_tokens',0)} ({metrics.get('tokens_per_second',0)} tokens/s)",
-          f"- Duration: {metrics.get('execution_seconds',0)} s",f"- Average power: {metrics.get('average_power_w',0)} W",
+          f"- Duration: {metrics.get('execution_seconds',0)} s",f"- Average GPU power: {metrics.get('average_gpu_power_w',metrics.get('average_power_w',0))} W",
+          f"- Estimated CPU / RAM power: {metrics.get('estimated_cpu_w',0)} W / {metrics.get('estimated_ram_w',0)} W",
+          f"- Resource scope: {metrics.get('resource_scope','unknown')}",
           f"- Estimated energy: {metrics.get('energy_wh',0)} Wh"]
         lines += [""]
         if result:

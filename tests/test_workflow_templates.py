@@ -192,6 +192,10 @@ class WorkflowTemplateTest(unittest.TestCase):
             self.assertEqual(workflow["workflow"]["status"], "COMPLETED")
             self.assertEqual(workflow["tasks"][0]["result"]["mode"], "command")
             self.assertIn("typed-action-ok", workflow["tasks"][0]["result"]["deliverable"])
+            resources = workflow["tasks"][0]["result"]["execution"]["resources"]
+            self.assertEqual(resources["resource_scope"], "local_machine")
+            self.assertIn("estimated_cpu_w", resources)
+            self.assertIn("estimated_ram_w", resources)
         finally:
             app.EXECUTION_MODE = previous_mode
 
@@ -208,6 +212,10 @@ class WorkflowTemplateTest(unittest.TestCase):
         for component in ("gpu", "cpu", "ram"):
             self.assertIn(f"{component}_w", overview["power"])
             self.assertTrue(overview["power"][f"{component}_source"])
+        self.assertIn("cpu_utilization", overview["power"])
+        self.assertIn("ram_used_gb", overview["power"])
+        self.assertIn("estimated_cpu_w", overview["power"])
+        self.assertIn("estimated_ram_w", overview["power"])
 
 
 if __name__ == "__main__":
