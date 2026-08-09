@@ -47,13 +47,15 @@ The response identifies the chosen or generated planning source. Template genera
 
 ## Execution interface
 
-The Execution tab exposes the same lifecycle without conflating design and runtime actions:
+The Execution tab exposes the same lifecycle without conflating design and runtime actions. Workflow design lives in the workflow library, not in the execution request:
 
 1. Enter the user objective.
 2. Choose a saved workflow, automatic selection, or automatic generation.
-3. Use **Generate workflow** to request a validated proposal from the live reasoner. The proposal opens in the editor for review and optional saving; this action never creates a run.
+3. In the workflow library, use **Generate workflow** to open a dedicated generation request. The validated proposal opens in the editor for review and optional saving; this action never creates a run.
 4. Use **Execute prompt** to create a run with the selected planning mode.
 
 The workflow library lists system, private, and shared templates. Permission-aware controls let an owner or authorized administrator use, edit, share or unshare, and delete non-system templates. Every create or update request is validated again by the server, so editing JSON in the browser cannot bypass DAG validation.
+
+Every saved template has a **View graph** action. The graph lays tasks out by dependency depth and draws directed edges between them. The workflow editor includes the same visualization as a live preview: changing the task JSON redraws the DAG after a short debounce. Unknown dependencies, empty task sets, and cycles are displayed inside the preview instead of leaving a stale graph on screen. Generated proposals are visualized before they can be saved.
 
 When no real reasoner is loaded, generation returns an actionable error. Deterministic generation is available only when `SKEIN_ALLOW_SIMULATION=1`, which is reserved for tests and explicit development mode.
