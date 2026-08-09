@@ -154,6 +154,8 @@ def init_db():
           "settings_manager":("Settings Manager","Manage execution policy, GPU pools, stack controls, and SMTP",["settings.manage","email.manage"]),
           "model_manager":("Model Manager","Manage model registry and runtimes",["models.manage","server_stats.read"]),
           "workflow_operator":("Workflow Operator","Execute workflows and manage owned workflow templates",["workflows.execute","workflows.read_own","workflows.delete_own","workflow_templates.read","workflow_templates.manage_own"]),
+          "workflow_runner":("Workflow Runner","Execute workflows and manage personal run history",["workflows.execute","workflows.read_own","workflows.delete_own","workflow_templates.read"]),
+          "workflow_designer":("Workflow Designer","Read workflow templates and manage owned templates",["workflow_templates.read","workflow_templates.manage_own"]),
           "stats_auditor":("Statistics Auditor","Read anonymized operational statistics only",["server_stats.read"]),
         }
         for profile_id,(name,description,grants) in profiles.items():

@@ -171,7 +171,11 @@ class AuthTest(unittest.TestCase):
         self.assertIn("users.manage", session["user"]["permissions"])
         _, profiles = self.request(admin, "/api/rbac/profiles")
         profile_ids = {profile["id"] for profile in profiles}
-        self.assertTrue({"super_admin", "user_manager", "settings_manager", "model_manager", "workflow_operator", "stats_auditor"}.issubset(profile_ids))
+        self.assertTrue({"super_admin", "user_manager", "settings_manager", "model_manager", "workflow_operator", "workflow_runner", "workflow_designer", "stats_auditor"}.issubset(profile_ids))
+        profiles_by_id = {profile["id"]: profile for profile in profiles}
+        self.assertCountEqual(profiles_by_id["workflow_designer"]["permissions"], ["workflow_templates.manage_own", "workflow_templates.read"])
+        self.assertIn("workflows.execute", profiles_by_id["workflow_runner"]["permissions"])
+        self.assertNotIn("workflow_templates.manage_own", profiles_by_id["workflow_runner"]["permissions"])
 
         _, auditor_created = self.request(admin, "/api/users", {"username": "auditor", "password": "auditor-password", "profiles": ["stats_auditor"]})
         self.assertEqual([profile["id"] for profile in auditor_created["profiles"]], ["stats_auditor"])
