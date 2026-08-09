@@ -28,6 +28,7 @@ Dependencies are version-bounded, reviewed before upgrades, and never loaded dir
 | Authorization | PyCasbin | Evaluate through contract tests against the current permission matrix before replacing the existing RBAC evaluator. Domain-scoped roles are required for future multi-tenant pools. |
 | Rate limiting | A maintained backend-aware limiter | Adopt before multi-node deployment; the current SQLite limiter remains acceptable only for the single-node prototype. |
 | Frontend Markdown | GFM renderer, DOMPurify, Mermaid, syntax highlighter | Already uses specialized libraries; versions must be vendored or package-locked and covered by XSS regression tests. |
+| Interface icons | Lucide | Adopted at a pinned version for consistent, accessible SVG navigation icons. |
 
 ## Migration rules
 

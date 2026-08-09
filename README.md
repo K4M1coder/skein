@@ -21,12 +21,15 @@ Skein favors mature, actively maintained libraries over custom security, protoco
 - Role-aware tab navigation that separates workflow execution, run history, and system administration.
 - Permission-aware history cleanup for the current user or, when authorized, every user.
 - Parallel workflow scheduling with a visible FIFO queue and per-user, per-session workspaces.
+- Responsive desktop-style shell with permission-aware navigation and bilingual mobile layouts.
 
 ## Navigation
 
 - **Execution** contains workflow creation, the sandbox/local tool plane, the active DAG, step outputs, metrics, and deliverables.
 - **History** contains recent runs and the event stream. Selecting a run displays its complete report and artifacts without returning to the workflow launcher.
 - **Administration** contains access control, execution policy, GPU pools, telemetry, model selection, and runtime controls. This tab is rendered only for administrators.
+
+The interface uses a persistent sidebar on desktop, an icon rail on tablets, and bottom navigation on phones. See [UI_ARCHITECTURE.md](UI_ARCHITECTURE.md) for the layout rationale, reference patterns, responsive behavior, and visual dependency policy.
 
 ## RBAC access control
 
