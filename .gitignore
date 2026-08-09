@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.env
+.env.*
+!.env.example
+work/
+outputs/
+*.db
+*.db-wal
+*.db-shm
+*.log
+*.gguf
+static/vendor/*
+!static/vendor/.gitkeep

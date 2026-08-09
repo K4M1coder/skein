@@ -1,0 +1,7 @@
+.metric-summary{display:grid;grid-template-columns:repeat(5,minmax(100px,1fr));gap:8px;margin:16px 0}
+.metric-summary>div{border:1px solid var(--line);padding:11px;background:#fff2}
+.metric-summary b{display:block;color:var(--lime);font:16px monospace}
+.metric-summary span{font:9px monospace;color:var(--muted)}
+.energy-note{display:block;color:var(--muted);margin:-6px 0 20px}
+.archive-download{float:right;color:var(--lime);text-decoration:none}
+@media(max-width:800px){.metric-summary{grid-template-columns:repeat(2,1fr)}.archive-download{float:none;display:block;margin-top:8px}}
