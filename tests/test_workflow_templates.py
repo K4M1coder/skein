@@ -195,6 +195,20 @@ class WorkflowTemplateTest(unittest.TestCase):
         finally:
             app.EXECUTION_MODE = previous_mode
 
+    def test_runtime_overview_exposes_capacity_telemetry_and_power_sources(self):
+        _, overview = self.request("/api/runtime-overview")
+        self.assertEqual(set(overview["roles"]), {"reasoner", "worker"})
+        self.assertIn("parallel_capacity", overview["workflows"])
+        for role in overview["roles"].values():
+            self.assertIn("connected", role)
+            self.assertIn("active", role)
+            self.assertIn("waiting", role)
+            self.assertIn("average_tokens_per_second", role)
+            self.assertIn("average_execution_seconds", role)
+        for component in ("gpu", "cpu", "ram"):
+            self.assertIn(f"{component}_w", overview["power"])
+            self.assertTrue(overview["power"][f"{component}_source"])
+
 
 if __name__ == "__main__":
     unittest.main()

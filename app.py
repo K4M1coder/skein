@@ -371,6 +371,20 @@ def hardware_snapshot():
       "gpus":gpus,"pools":pools,"timestamp":stamp()}
 
 
+def host_power_sensors():
+    script=("$rows=@(); foreach($ns in @('root/LibreHardwareMonitor','root/OpenHardwareMonitor')) { "
+      "try { $rows += Get-CimInstance -Namespace $ns -ClassName Sensor -ErrorAction Stop | Where-Object SensorType -eq 'Power' | Select-Object Name,Value } catch {} }; "
+      "$rows | ConvertTo-Json -Compress")
+    output=run_text(["powershell","-NoProfile","-Command",script],5)
+    try: rows=json.loads(output) if output else []
+    except json.JSONDecodeError: rows=[]
+    if isinstance(rows,dict): rows=[rows]
+    cpu_values=[float(row["Value"]) for row in rows if row.get("Value") is not None and re.search(r"cpu package|package|cpu cores",str(row.get("Name","")),re.I)]
+    ram_values=[float(row["Value"]) for row in rows if row.get("Value") is not None and re.search(r"dram|memory|ram",str(row.get("Name","")),re.I)]
+    return {"cpu_w":round(sum(cpu_values),2) if cpu_values else None,"ram_w":round(sum(ram_values),2) if ram_values else None,
+      "source":"LibreHardwareMonitor/OpenHardwareMonitor WMI" if rows else None}
+
+
 RUNTIMES, ACTIVE_ENDPOINTS = {}, {}
 
 
@@ -875,7 +889,8 @@ class ModelClient:
             return {"error":f"Workflow generation backend unavailable: {exc}","action":"Check the reasoner runtime and retry."}
 
 
-POOL = ThreadPoolExecutor(max_workers=max(1,int(os.getenv("SKEIN_TASK_WORKERS","4"))), thread_name_prefix="skein-worker")
+TASK_WORKER_LIMIT=max(1,int(os.getenv("SKEIN_TASK_WORKERS","4")))
+POOL = ThreadPoolExecutor(max_workers=TASK_WORKER_LIMIT, thread_name_prefix="skein-worker")
 MAX_PARALLEL_WORKFLOWS=max(1,int(os.getenv("SKEIN_MAX_PARALLEL_WORKFLOWS","2")))
 ACTIVE, WORKFLOW_QUEUE, ACTIVE_LOCK = set(), deque(), threading.Lock()
 
@@ -1260,6 +1275,36 @@ def workflow_data(wid):
             "artifact_notice":f"{len(artifacts)} file(s) produced and validated." if artifacts else "No file was required or produced for this request."}
 
 
+def runtime_overview():
+    endpoints={"reasoner":os.getenv("SKEIN_REASONER_URL") or ACTIVE_ENDPOINTS.get("reasoner", ""),"worker":os.getenv("SKEIN_WORKER_URL") or ACTIVE_ENDPOINTS.get("worker", "")}
+    with db() as conn:
+        running=[dict(row) for row in conn.execute("SELECT role,model FROM tasks WHERE status='RUNNING'")]
+        waiting=[dict(row) for row in conn.execute("SELECT t.* FROM tasks t JOIN workflows w ON w.id=t.workflow_id WHERE t.status='READY' AND w.status IN ('QUEUED','RUNNING')")]
+        completed=conn.execute("SELECT model,result,started_at,finished_at FROM tasks WHERE status='COMPLETED' AND result IS NOT NULL ORDER BY finished_at DESC LIMIT 100").fetchall()
+    roles={"reasoner":{"active":0,"waiting":0},"worker":{"active":0,"waiting":0}}
+    for task in running:
+        tier="reasoner" if task.get("model")=="reasoner-large" else "worker"; roles[tier]["active"]+=1
+    for task in waiting:
+        tier="reasoner" if route(task)[0]=="reasoner-large" else "worker"; roles[tier]["waiting"]+=1
+    aggregates={"reasoner":[],"worker":[]}
+    for row in completed:
+        tier="reasoner" if row["model"]=="reasoner-large" else "worker"
+        try: metrics=json.loads(row["result"]).get("metrics",{})
+        except (json.JSONDecodeError,TypeError): metrics={}
+        aggregates[tier].append(metrics)
+    for tier,state in roles.items():
+        metrics=aggregates[tier]; seconds=sum(float(item.get("execution_seconds") or 0) for item in metrics); completion=sum(int(item.get("completion_tokens") or 0) for item in metrics)
+        state.update({"connected":bool(endpoints[tier]) and endpoint_ready(endpoints[tier]),"endpoint":endpoints[tier] or None,"parallel_capacity":TASK_WORKER_LIMIT,
+          "recent_tasks":len(metrics),"average_tokens_per_second":round(completion/seconds,2) if seconds else 0,
+          "average_execution_seconds":round(seconds/len(metrics),3) if metrics else 0})
+    gpus=nvidia_gpus(); gpu_watts=round(sum(float(gpu.get("power_w") or 0) for gpu in gpus),2) if gpus else None; host_power=host_power_sensors()
+    with ACTIVE_LOCK: workflow_state={"active":len(ACTIVE),"queued":len(WORKFLOW_QUEUE),"parallel_capacity":MAX_PARALLEL_WORKFLOWS}
+    return {"roles":roles,"workflows":workflow_state,"power":{
+      "gpu_w":gpu_watts,"gpu_source":"nvidia-smi" if gpus else "No supported GPU power sensor",
+      "cpu_w":host_power["cpu_w"],"cpu_source":host_power["source"] or "No reliable CPU package power sensor is available",
+      "ram_w":host_power["ram_w"],"ram_source":host_power["source"] or "No reliable RAM power sensor is available"},"timestamp":stamp()}
+
+
 def workflow_report(wid):
     data=workflow_data(wid)
     if not data: return None
@@ -1372,6 +1417,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Content-Length",str(len(raw))); self.end_headers(); self.wfile.write(raw)
     def do_GET(self):
         if self.path=="/api/health": return self.json({"status":"ok","active":len(ACTIVE),"queued":len(WORKFLOW_QUEUE),"parallel_workflow_limit":MAX_PARALLEL_WORKFLOWS,"database":str(DB_PATH),"execution_mode":EXECUTION_MODE,"active_models":ACTIVE_ENDPOINTS,"backends":{"worker":bool(os.getenv("SKEIN_WORKER_URL") or ACTIVE_ENDPOINTS.get("worker")),"reasoner":bool(os.getenv("SKEIN_REASONER_URL") or ACTIVE_ENDPOINTS.get("reasoner"))}})
+        if self.path=="/api/runtime-overview": return self.json(runtime_overview())
         if self.path=="/api/auth/me":
             user=self.current_user()
             if not user: return self.deny()

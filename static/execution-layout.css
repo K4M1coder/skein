@@ -44,3 +44,14 @@
   .hero form#create .execution-prompt,
   .hero form#create .workflow-submit-actions { margin-top: 12px; }
 }
+
+.runtime-overview .model[data-connected="false"] { opacity: .72; }
+.runtime-overview .model[data-connected="false"]::before { background: var(--danger); }
+.runtime-overview .model[data-connected="true"]::after { content: ""; position: absolute; top: 16px; right: 16px; width: 8px; height: 8px; border-radius: 50%; background: var(--lime); box-shadow: 0 0 0 4px #b8f36a16; }
+.runtime-counters { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin-top: 14px; }
+.runtime-counters b { display: block; font: 600 13px ui-monospace, monospace; color: var(--text); }
+.runtime-counters span { display: block; padding: 7px; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); font-size: 9px; }
+.runtime-recap { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin-top: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
+.runtime-recap div { min-width: 0; }
+.runtime-recap b { display: block; overflow: hidden; color: var(--lime); font: 600 12px ui-monospace, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.runtime-recap span { color: var(--muted); font-size: 9px; }
