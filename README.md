@@ -6,6 +6,8 @@ Skein is a local, GPU-aware multi-agent workflow orchestrator. It separates reas
 
 Skein favors mature, actively maintained libraries over custom security, protocol, parsing, and persistence code. Dependencies are selected for maintenance health, tests, documentation, license compatibility, supply-chain cost, and safe upgrade paths. Framework migrations remain incremental and test-backed so that existing users, workflows, and artifacts continue to work. See [DEPENDENCY_POLICY.md](DEPENDENCY_POLICY.md) for the selection checklist and current adoption roadmap.
 
+The repository includes a deterministic CycloneDX SBOM, a generated readable dependency list, and a Syft enrichment workflow. See [SBOM.md](SBOM.md) and verify it with `python scripts/generate_sbom.py --check`.
+
 Development commits are protected by the checks documented in [CONTRIBUTING.md](CONTRIBUTING.md). Install the repository hook with `pre-commit install`; each phase must pass the full hook before commit.
 
 ## Highlights

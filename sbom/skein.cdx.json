@@ -1,0 +1,511 @@
+{
+  "bomFormat": "CycloneDX",
+  "components": [
+    {
+      "bom-ref": "pkg:docker/alpine@3.20",
+      "name": "alpine",
+      "properties": [
+        {
+          "name": "skein:source",
+          "value": "app.py"
+        },
+        {
+          "name": "skein:purpose",
+          "value": "Sandbox execution runtime"
+        }
+      ],
+      "purl": "pkg:docker/alpine@3.20",
+      "scope": "optional",
+      "type": "container",
+      "version": "3.20"
+    },
+    {
+      "bom-ref": "pkg:docker/eclipse-temurin@21-jdk-alpine",
+      "name": "eclipse-temurin",
+      "properties": [
+        {
+          "name": "skein:source",
+          "value": "app.py"
+        },
+        {
+          "name": "skein:purpose",
+          "value": "Sandbox execution runtime"
+        }
+      ],
+      "purl": "pkg:docker/eclipse-temurin@21-jdk-alpine",
+      "scope": "optional",
+      "type": "container",
+      "version": "21-jdk-alpine"
+    },
+    {
+      "bom-ref": "pkg:docker/node@22-alpine",
+      "name": "node",
+      "properties": [
+        {
+          "name": "skein:source",
+          "value": "app.py"
+        },
+        {
+          "name": "skein:purpose",
+          "value": "Sandbox execution runtime"
+        }
+      ],
+      "purl": "pkg:docker/node@22-alpine",
+      "scope": "optional",
+      "type": "container",
+      "version": "22-alpine"
+    },
+    {
+      "bom-ref": "pkg:docker/php@8.4-cli-alpine",
+      "name": "php",
+      "properties": [
+        {
+          "name": "skein:source",
+          "value": "app.py"
+        },
+        {
+          "name": "skein:purpose",
+          "value": "Sandbox execution runtime"
+        }
+      ],
+      "purl": "pkg:docker/php@8.4-cli-alpine",
+      "scope": "optional",
+      "type": "container",
+      "version": "8.4-cli-alpine"
+    },
+    {
+      "bom-ref": "pkg:docker/python@3.12-alpine",
+      "name": "python",
+      "properties": [
+        {
+          "name": "skein:source",
+          "value": "app.py"
+        },
+        {
+          "name": "skein:purpose",
+          "value": "Sandbox execution runtime"
+        }
+      ],
+      "purl": "pkg:docker/python@3.12-alpine",
+      "scope": "optional",
+      "type": "container",
+      "version": "3.12-alpine"
+    },
+    {
+      "bom-ref": "pkg:generic/docker-engine",
+      "name": "Docker Engine",
+      "properties": [
+        {
+          "name": "skein:purpose",
+          "value": "Isolated command and script execution"
+        },
+        {
+          "name": "skein:source",
+          "value": "sbom/dependency-inventory.json"
+        }
+      ],
+      "purl": "pkg:generic/docker-engine",
+      "scope": "optional",
+      "type": "application",
+      "version": "operator-provided"
+    },
+    {
+      "bom-ref": "pkg:generic/nvidia-driver",
+      "name": "NVIDIA driver and nvidia-smi",
+      "properties": [
+        {
+          "name": "skein:purpose",
+          "value": "GPU inference and telemetry"
+        },
+        {
+          "name": "skein:source",
+          "value": "sbom/dependency-inventory.json"
+        }
+      ],
+      "purl": "pkg:generic/nvidia-driver",
+      "scope": "optional",
+      "type": "device-driver",
+      "version": "operator-provided"
+    },
+    {
+      "bom-ref": "pkg:generic/powershell",
+      "name": "PowerShell",
+      "properties": [
+        {
+          "name": "skein:purpose",
+          "value": "Explicit local-mode command execution and operations"
+        },
+        {
+          "name": "skein:source",
+          "value": "sbom/dependency-inventory.json"
+        }
+      ],
+      "purl": "pkg:generic/powershell",
+      "scope": "optional",
+      "type": "application",
+      "version": "operator-provided"
+    },
+    {
+      "bom-ref": "pkg:generic/python@3.11",
+      "name": "python",
+      "properties": [
+        {
+          "name": "skein:purpose",
+          "value": "Skein backend and supervisor runtime"
+        },
+        {
+          "name": "skein:source",
+          "value": "sbom/dependency-inventory.json"
+        }
+      ],
+      "purl": "pkg:generic/python@3.11",
+      "scope": "required",
+      "type": "application",
+      "version": ">=3.11"
+    },
+    {
+      "bom-ref": "pkg:github/ggerganov/llama.cpp",
+      "name": "llama.cpp llama-server",
+      "properties": [
+        {
+          "name": "skein:purpose",
+          "value": "Local OpenAI-compatible reasoner and worker inference"
+        },
+        {
+          "name": "skein:source",
+          "value": "sbom/dependency-inventory.json"
+        }
+      ],
+      "purl": "pkg:github/ggerganov/llama.cpp",
+      "scope": "optional",
+      "type": "application",
+      "version": "operator-provided"
+    },
+    {
+      "bom-ref": "pkg:npm/dompurify@3.4.13",
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://cdn.jsdelivr.net/npm/dompurify@3.4.13/dist/purify.min.js"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-384",
+          "content": "66e0be0c8002a922194eca7eed8179edc47963eeaa5daed815b10a740fc41c0fd1d13fb8d5db68aeab9c625ef5669fad"
+        }
+      ],
+      "name": "dompurify",
+      "properties": [
+        {
+          "name": "skein:source",
+          "value": "static/index.html"
+        },
+        {
+          "name": "skein:sri",
+          "value": "sha384-ZuC+DIACqSIZTsp+7YF57cR5Y+6qXa7YFbEKdA/EHA/R0T+41dtorqucYl71Zp+t"
+        }
+      ],
+      "purl": "pkg:npm/dompurify@3.4.13",
+      "scope": "required",
+      "type": "library",
+      "version": "3.4.13"
+    },
+    {
+      "bom-ref": "pkg:npm/highlight.js@11.11.1",
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/styles/github-dark.min.css"
+        },
+        {
+          "type": "distribution",
+          "url": "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-384",
+          "content": "c07ef98facf5947f7b64ea4c3889ea8602b31640089d93cf48f959a582984ceaac6a2ccfbe1419980b4b70f297a4bc87"
+        },
+        {
+          "alg": "SHA-384",
+          "content": "447db18b878843f823b5bb3d7d45ccebcb0b4a2f7d0bb6560515f5bc3ad5bfa1905d189bc572dbc0ed8d19907be0c6d4"
+        }
+      ],
+      "name": "highlight.js",
+      "properties": [
+        {
+          "name": "skein:source",
+          "value": "static/index.html"
+        },
+        {
+          "name": "skein:sri",
+          "value": "sha384-wH75j6z1lH97ZOpMOInqhgKzFkAInZPPSPlZpYKYTOqsaizPvhQZmAtLcPKXpLyH"
+        },
+        {
+          "name": "skein:sri",
+          "value": "sha384-RH2xi4eIQ/gjtbs9fUXM68sLSi99C7ZWBRX1vDrVv6GQXRibxXLbwO2NGZB74MbU"
+        }
+      ],
+      "purl": "pkg:npm/highlight.js@11.11.1",
+      "scope": "required",
+      "type": "library",
+      "version": "11.11.1"
+    },
+    {
+      "bom-ref": "pkg:npm/i18next@26.3.6",
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://cdn.jsdelivr.net/npm/i18next@26.3.6/dist/umd/i18next.min.js"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-384",
+          "content": "6750642c3fc64f801243758a371108e9c64cbd77e914b3a6cd5b1ca3e2a72ebff1d52dc37879111445b83acae5522af5"
+        }
+      ],
+      "name": "i18next",
+      "properties": [
+        {
+          "name": "skein:source",
+          "value": "static/index.html"
+        },
+        {
+          "name": "skein:sri",
+          "value": "sha384-Z1BkLD/GT4ASQ3WKNxEI6cZMvXfpFLOmzVsco+KnLr/x1S3DeHkRFEW4OsrlUir1"
+        }
+      ],
+      "purl": "pkg:npm/i18next@26.3.6",
+      "scope": "required",
+      "type": "library",
+      "version": "26.3.6"
+    },
+    {
+      "bom-ref": "pkg:npm/lucide@1.31.0",
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://cdn.jsdelivr.net/npm/lucide@1.31.0/dist/umd/lucide.min.js"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-384",
+          "content": "fc0a43dca5cca93993c44263ba575a64381d263eff1e8c762d1b8aa95deb0bb06eff0138a1b2da2518c5d6b2c734fe7b"
+        }
+      ],
+      "name": "lucide",
+      "properties": [
+        {
+          "name": "skein:source",
+          "value": "static/index.html"
+        },
+        {
+          "name": "skein:sri",
+          "value": "sha384-/ApD3KXMqTmTxEJjuldaZDgdJj7/Hox2LRuKqV3rC7Bu/wE4obLaJRjF1rLHNP57"
+        }
+      ],
+      "purl": "pkg:npm/lucide@1.31.0",
+      "scope": "required",
+      "type": "library",
+      "version": "1.31.0"
+    },
+    {
+      "bom-ref": "pkg:npm/marked@18.0.0",
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://cdn.jsdelivr.net/npm/marked@18.0.0/lib/marked.umd.js"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-384",
+          "content": "d5a3008aa3d1e89a69da8bc35bf4eaadef01a00a420baae2b2aaa308e96fd3b08b95234a9e1faa15002296565de773c0"
+        }
+      ],
+      "name": "marked",
+      "properties": [
+        {
+          "name": "skein:source",
+          "value": "static/index.html"
+        },
+        {
+          "name": "skein:sri",
+          "value": "sha384-1aMAiqPR6Jpp2ovDW/Tqre8BoApCC6risqqjCOlv07CLlSNKnh+qFQAillZd53PA"
+        }
+      ],
+      "purl": "pkg:npm/marked@18.0.0",
+      "scope": "required",
+      "type": "library",
+      "version": "18.0.0"
+    },
+    {
+      "bom-ref": "pkg:npm/mermaid@11.16.1",
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-384",
+          "content": "6814178f884ae899b4e62eda400b145776cb75252b1d7d411987cc074d7ae93b56b7f4516b0fa1d047a599ef4e08ebf2"
+        }
+      ],
+      "name": "mermaid",
+      "properties": [
+        {
+          "name": "skein:source",
+          "value": "static/index.html"
+        },
+        {
+          "name": "skein:sri",
+          "value": "sha384-aBQXj4hK6Jm05i7aQAsUV3bLdSUrHX1BGYfMB0166TtWt/RRaw+h0Eelme9OCOvy"
+        }
+      ],
+      "purl": "pkg:npm/mermaid@11.16.1",
+      "scope": "required",
+      "type": "library",
+      "version": "11.16.1"
+    }
+  ],
+  "dependencies": [
+    {
+      "dependsOn": [
+        "pkg:docker/alpine@3.20",
+        "pkg:docker/eclipse-temurin@21-jdk-alpine",
+        "pkg:docker/node@22-alpine",
+        "pkg:docker/php@8.4-cli-alpine",
+        "pkg:docker/python@3.12-alpine",
+        "pkg:generic/docker-engine",
+        "pkg:generic/nvidia-driver",
+        "pkg:generic/powershell",
+        "pkg:generic/python@3.11",
+        "pkg:github/ggerganov/llama.cpp",
+        "pkg:npm/dompurify@3.4.13",
+        "pkg:npm/highlight.js@11.11.1",
+        "pkg:npm/i18next@26.3.6",
+        "pkg:npm/lucide@1.31.0",
+        "pkg:npm/marked@18.0.0",
+        "pkg:npm/mermaid@11.16.1"
+      ],
+      "ref": "pkg:github/K4M1coder/skein@0.1.0"
+    },
+    {
+      "dependsOn": [],
+      "ref": "pkg:docker/alpine@3.20"
+    },
+    {
+      "dependsOn": [],
+      "ref": "pkg:docker/eclipse-temurin@21-jdk-alpine"
+    },
+    {
+      "dependsOn": [],
+      "ref": "pkg:docker/node@22-alpine"
+    },
+    {
+      "dependsOn": [],
+      "ref": "pkg:docker/php@8.4-cli-alpine"
+    },
+    {
+      "dependsOn": [],
+      "ref": "pkg:docker/python@3.12-alpine"
+    },
+    {
+      "dependsOn": [],
+      "ref": "pkg:generic/docker-engine"
+    },
+    {
+      "dependsOn": [],
+      "ref": "pkg:generic/nvidia-driver"
+    },
+    {
+      "dependsOn": [],
+      "ref": "pkg:generic/powershell"
+    },
+    {
+      "dependsOn": [],
+      "ref": "pkg:generic/python@3.11"
+    },
+    {
+      "dependsOn": [],
+      "ref": "pkg:github/ggerganov/llama.cpp"
+    },
+    {
+      "dependsOn": [],
+      "ref": "pkg:npm/dompurify@3.4.13"
+    },
+    {
+      "dependsOn": [],
+      "ref": "pkg:npm/highlight.js@11.11.1"
+    },
+    {
+      "dependsOn": [],
+      "ref": "pkg:npm/i18next@26.3.6"
+    },
+    {
+      "dependsOn": [],
+      "ref": "pkg:npm/lucide@1.31.0"
+    },
+    {
+      "dependsOn": [],
+      "ref": "pkg:npm/marked@18.0.0"
+    },
+    {
+      "dependsOn": [],
+      "ref": "pkg:npm/mermaid@11.16.1"
+    }
+  ],
+  "metadata": {
+    "component": {
+      "bom-ref": "pkg:github/K4M1coder/skein@0.1.0",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/K4M1coder/skein"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "skein",
+      "purl": "pkg:github/K4M1coder/skein@0.1.0",
+      "supplier": {
+        "name": "K4M1coder"
+      },
+      "type": "application",
+      "version": "0.1.0"
+    },
+    "properties": [
+      {
+        "name": "skein:deterministic",
+        "value": "true"
+      },
+      {
+        "name": "skein:inventory-schema",
+        "value": "1"
+      }
+    ],
+    "tools": {
+      "components": [
+        {
+          "group": "K4M1coder",
+          "name": "Skein SBOM generator",
+          "type": "application",
+          "version": "0.1.0"
+        }
+      ]
+    }
+  },
+  "specVersion": "1.6",
+  "version": 1
+}

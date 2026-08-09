@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "project": {
+    "name": "skein",
+    "supplier": "K4M1coder",
+    "repository": "https://github.com/K4M1coder/skein",
+    "license": "MIT"
+  },
+  "runtime_components": [
+    {
+      "type": "application",
+      "name": "python",
+      "version": ">=3.11",
+      "scope": "required",
+      "purl": "pkg:generic/python@3.11",
+      "purpose": "Skein backend and supervisor runtime"
+    },
+    {
+      "type": "application",
+      "name": "llama.cpp llama-server",
+      "version": "operator-provided",
+      "scope": "optional",
+      "purl": "pkg:github/ggerganov/llama.cpp",
+      "purpose": "Local OpenAI-compatible reasoner and worker inference"
+    },
+    {
+      "type": "application",
+      "name": "Docker Engine",
+      "version": "operator-provided",
+      "scope": "optional",
+      "purl": "pkg:generic/docker-engine",
+      "purpose": "Isolated command and script execution"
+    },
+    {
+      "type": "application",
+      "name": "PowerShell",
+      "version": "operator-provided",
+      "scope": "optional",
+      "purl": "pkg:generic/powershell",
+      "purpose": "Explicit local-mode command execution and operations"
+    },
+    {
+      "type": "device-driver",
+      "name": "NVIDIA driver and nvidia-smi",
+      "version": "operator-provided",
+      "scope": "optional",
+      "purl": "pkg:generic/nvidia-driver",
+      "purpose": "GPU inference and telemetry"
+    }
+  ],
+  "sbom_tool": {
+    "vendor": "Anchore",
+    "name": "Syft",
+    "version": "1.50.0",
+    "purl": "pkg:github/anchore/syft@v1.50.0"
+  }
+}

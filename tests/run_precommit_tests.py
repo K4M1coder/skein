@@ -8,6 +8,7 @@ SUITES = (
     "tests.test_frontend_i18n",
     "tests.test_workflow_templates",
     "tests.test_manual_workflow_matrix",
+    "tests.test_sbom",
     "tests.test_smoke",
     "tests.test_auth",
 )

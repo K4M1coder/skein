@@ -16,6 +16,8 @@ A new dependency must satisfy the following checks before adoption:
 
 Dependencies are version-bounded and reviewed before upgrades. Browser dependencies loaded from a pinned CDN URL must also declare a SHA-384 Subresource Integrity hash and anonymous CORS mode; vendoring remains preferred for fully offline deployments. Security-sensitive defaults must fail closed. Secrets must not be logged or returned by APIs.
 
+The committed CycloneDX SBOM and generated dependency inventory are part of every dependency change. `python scripts/generate_sbom.py --check` is enforced by pre-commit. Syft is the approved discovery engine for enriched release and deployment SBOMs, including transitive packages inside locally available sandbox images. See [SBOM.md](SBOM.md).
+
 ## Current adoption plan
 
 | Area | Preferred maintained component | Decision |
