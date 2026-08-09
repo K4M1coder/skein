@@ -107,7 +107,9 @@ Open [http://127.0.0.1:8787/](http://127.0.0.1:8787/). The header controls resta
 
 Use **Auto-detect and load local models** to discover a local `llama-server.exe` and GGUF model, or register profiles manually. Normal workflows require active reasoner and worker endpoints. Simulation is disabled unless explicitly enabled for development:
 
-The Execution view reports live runtime state instead of static domain labels. For both reasoner and worker it shows endpoint health, active tasks versus shared task capacity, queued tasks, recent average tokens per second, and recent average execution time. The recap also shows active and queued workflows plus current GPU power from `nvidia-smi`. CPU package and RAM watts are read from LibreHardwareMonitor/OpenHardwareMonitor WMI sensors when available; otherwise Skein displays `N/A` rather than estimating unsupported measurements.
+The Execution view reports live runtime state instead of static domain labels. For both reasoner and worker it shows endpoint health, active tasks versus shared task capacity, queued tasks, recent average tokens per second, and recent average execution time. The recap also shows active and queued workflows, current GPU power from `nvidia-smi`, CPU utilization, and used/total RAM. CPU package and RAM watts are read from LibreHardwareMonitor/OpenHardwareMonitor WMI sensors when available. Without those sensors, Skein displays clearly marked estimates: CPU load applied to a logical-core power envelope and used RAM at 0.375 W/GB.
+
+Command and script executions record a resource window in their result. Local mode is labeled `local_machine`; sandbox execution is labeled `docker_container_host_window`. The Docker value is an attribution estimate from host load during that container's execution window, not a direct container power measurement. Reports include GPU watts, estimated CPU/RAM watts, CPU utilization, RAM usage, execution time, and the attribution scope.
 
 ```powershell
 $env:SKEIN_ALLOW_SIMULATION = "1"
