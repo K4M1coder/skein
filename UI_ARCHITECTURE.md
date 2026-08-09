@@ -59,4 +59,6 @@ The shell defines shared colors, spacing, radii, borders, and shadows in `static
 - **i18next 26.3.6** provides language resolution and explicit English fallback while translations remain bundled for local use.
 - Existing Markdown output continues to use pinned Marked, DOMPurify, Highlight.js, and Mermaid builds.
 
+Static interface copy uses English canonical markup with explicit `data-i18n`, `data-i18n-placeholder`, or `data-i18n-value` keys. Dynamic components call the same translation service directly. DOM text scanning remains only as a compatibility bridge for older workflow-result templates and should not be used for new interface copy.
+
 Future framework adoption should replace the current incremental DOM scripts only when it brings typed components, reliable state management, testability, and an accessible component system without blocking the working prototype.
