@@ -106,7 +106,11 @@ class SmokeTest(unittest.TestCase):
           "backend":"llama.cpp","model_path":"Z:/missing/model.gguf",
           "runtime_path":"Z:/missing/llama-server.exe","context_size":32768,"port":18001})
         self.assertEqual(status, 201)
-        _, activation = self.request(f"/api/models/{created['id']}/activate", {"pool_id":"reasoner"})
+        _, configured = self.request(f"/api/models/{created['id']}/configure", {"role":"worker","pool_id":"workers"})
+        self.assertEqual(configured["role"], "worker")
+        self.assertEqual(configured["pool_id"], "workers")
+        self.assertGreater(configured["port"], 0)
+        _, activation = self.request(f"/api/models/{created['id']}/activate", {"pool_id":"workers"})
         self.assertEqual(activation["status"], "CONFIGURED")
         self.assertIn("not found", activation["error"])
 

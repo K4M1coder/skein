@@ -298,7 +298,7 @@ def consume_rate_limit(action,subject,limit,window_seconds):
     return True
 
 
-def discover_local_models():
+def discover_local_models(include_available=False):
     home = Path.home()
     runtimes = [home / ".unsloth/llama.cpp/build/bin/Release/llama-server.exe"]
     runtimes += list((home / ".lmstudio/extensions/backends").glob("llama.cpp-win-*-nvidia-*/llama-server.exe")) if (home / ".lmstudio/extensions/backends").exists() else []
@@ -309,13 +309,22 @@ def discover_local_models():
     for root in roots:
         if root.exists(): candidates.extend(p for p in root.rglob("*.gguf") if "mmproj" not in p.name.lower() and p.stat().st_size > 1_000_000_000)
     model = min(candidates, key=lambda p:p.stat().st_size, default=None)
-    if not runtime or not model: return
+    if not runtime or not model: return []
     with db() as conn:
+        created=[]
+        if include_available:
+            for candidate in candidates:
+                if conn.execute("SELECT 1 FROM models WHERE model_path=? AND role='available'",(str(candidate),)).fetchone(): continue
+                mid=str(uuid.uuid4())
+                conn.execute("INSERT INTO models VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (mid,f"Available · {candidate.stem}","available","llama.cpp",str(candidate),str(runtime),8192,0,None,"STOPPED",None,None,None,stamp()))
+                created.append({"id":mid,"name":candidate.stem,"model_path":str(candidate)})
         for role,port in (("reasoner",8001),("worker",8002)):
             if conn.execute("SELECT 1 FROM models WHERE role=?",(role,)).fetchone(): continue
             mid=str(uuid.uuid4())
             conn.execute("INSERT INTO models VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
               (mid,f"Auto {role} · {model.stem}",role,"llama.cpp",str(model),str(runtime),8192,port,None,"STOPPED",None,None,None,stamp()))
+    return created
 
 
 def run_text(args, timeout=4):
@@ -442,7 +451,29 @@ def resource_window(start,end,duration,scope):
 RUNTIMES, ACTIVE_ENDPOINTS = {}, {}
 
 
-def activate_model(model_id, pool_id):
+MODEL_ROLES=("reasoner","worker","embedding","reranker")
+
+
+def configure_model(model_id, role=None, pool_id=None):
+    with db() as conn:
+        model=conn.execute("SELECT * FROM models WHERE id=?",(model_id,)).fetchone()
+        if not model: return {"error":"Model not found"},404
+        role=str(role or model["role"]).strip().lower()
+        if role not in MODEL_ROLES: return {"error":"Choose a model role before loading"},400
+        if pool_id and not conn.execute("SELECT 1 FROM pools WHERE id=?",(pool_id,)).fetchone(): return {"error":"Pool not found"},404
+        port=int(model["port"] or 0)
+        if not port or role!=model["role"]:
+            port={"reasoner":8001,"worker":8002,"embedding":8003,"reranker":8004}[role]
+            occupied={row[0] for row in conn.execute("SELECT port FROM models WHERE id<>? AND port>0",(model_id,))}
+            while port in occupied: port+=1
+        conn.execute("UPDATE models SET role=?,pool_id=?,port=?,updated_at=? WHERE id=?",(role,pool_id or model["pool_id"],port,stamp(),model_id))
+    return {"id":model_id,"role":role,"pool_id":pool_id or model["pool_id"],"port":port},200
+
+
+def activate_model(model_id, pool_id, role=None):
+    if role:
+        configured,status=configure_model(model_id,role,pool_id)
+        if status!=200: return configured,status
     with db() as conn:
         model = conn.execute("SELECT * FROM models WHERE id=?",(model_id,)).fetchone()
         gpu_rows = conn.execute("SELECT gpu_id FROM gpu_assignments WHERE pool_id=?",(pool_id,)).fetchall()
@@ -1868,10 +1899,15 @@ class Handler(SimpleHTTPRequestHandler):
             return self.json({"id":mid},201)
         if self.path=="/api/models/autoload":
             result,status=autoload_models(); return self.json(result,status)
+        if self.path=="/api/models/discover":
+            discovered=discover_local_models(True); return self.json({"discovered":discovered,"count":len(discovered)})
         if self.path in ("/api/stack/start","/api/stack/stop","/api/stack/restart"):
             result,status=supervisor_call(self.path.rsplit("/",1)[-1],"POST"); return self.json(result,status)
         if self.path.startswith("/api/models/") and self.path.endswith("/activate"):
-            mid=self.path.split("/")[-2]; result,status=activate_model(mid,str(body.get("pool_id",body.get("role","workers"))))
+            mid=self.path.split("/")[-2]; result,status=activate_model(mid,str(body.get("pool_id",body.get("role","workers"))),body.get("role"))
+            return self.json(result,status)
+        if self.path.startswith("/api/models/") and self.path.endswith("/configure"):
+            mid=self.path.split("/")[-2]; result,status=configure_model(mid,body.get("role"),body.get("pool_id"))
             return self.json(result,status)
         if self.path.startswith("/api/models/") and self.path.endswith("/stop"):
             return self.json(stop_model(self.path.split("/")[-2]))
