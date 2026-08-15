@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-import base64, csv, ctypes, io, json, mimetypes, os, re, shlex, shutil, sqlite3, subprocess, sys, tempfile, threading, time, uuid, zipfile, hashlib, hmac, secrets, smtplib, ssl
+import base64, csv, ctypes, io, json, mimetypes, os, re, shlex, shutil, signal, sqlite3, subprocess, sys, tempfile, threading, time, uuid, zipfile, hashlib, hmac, secrets, smtplib, ssl
 from collections import deque
 from email.message import EmailMessage
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.error import URLError
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
@@ -298,33 +298,159 @@ def consume_rate_limit(action,subject,limit,window_seconds):
     return True
 
 
-def discover_local_models(include_available=False):
-    home = Path.home()
-    runtimes = [home / ".unsloth/llama.cpp/build/bin/Release/llama-server.exe"]
-    runtimes += list((home / ".lmstudio/extensions/backends").glob("llama.cpp-win-*-nvidia-*/llama-server.exe")) if (home / ".lmstudio/extensions/backends").exists() else []
-    # Prefer the proven standalone build; LM Studio entries can be tiny launcher shims.
-    runtime = next((p for p in runtimes if p.is_file()), None)
-    roots = [home / ".cache/huggingface/hub", home / ".lmstudio/models"]
-    candidates=[]
-    for root in roots:
-        if root.exists(): candidates.extend(p for p in root.rglob("*.gguf") if "mmproj" not in p.name.lower() and p.stat().st_size > 1_000_000_000)
-    model = min(candidates, key=lambda p:p.stat().st_size, default=None)
-    if not runtime or not model: return []
+MODEL_LIBRARY = DB_PATH.parent / "models"
+DISCOVERY_ROOTS = [Path.home()/".cache/huggingface/hub", Path.home()/".lmstudio/models"]
+DEFAULT_MODEL_ROOTS = DISCOVERY_ROOTS + [MODEL_LIBRARY]
+MIN_MODEL_MB = max(1, int(os.getenv("SKEIN_MIN_MODEL_MB", "64")))
+MAX_SCANNED_MODEL_FILES = 2000
+QUANTIZATION_PATTERN = re.compile(r"(?<![A-Za-z0-9])(IQ\d+(?:_[A-Z0-9]+)*|Q\d+(?:_[A-Z0-9]+)*|BF16|F16|F32|MXFP\d+)(?![A-Za-z0-9])", re.IGNORECASE)
+
+
+def setting_text(key, default=None):
+    with db() as conn: row=conn.execute("SELECT value FROM settings WHERE key=?",(key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(key, value):
     with db() as conn:
-        created=[]
-        if include_available:
-            for candidate in candidates:
-                if conn.execute("SELECT 1 FROM models WHERE model_path=? AND role='available'",(str(candidate),)).fetchone(): continue
+        conn.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(key,str(value)))
+
+
+def unique_paths(paths):
+    seen, ordered = set(), []
+    for path in paths:
+        try: key=str(Path(path).expanduser().resolve(strict=False)).lower()
+        except (OSError, ValueError): continue
+        if key in seen: continue
+        seen.add(key); ordered.append(Path(path).expanduser())
+    return ordered
+
+
+def configured_model_roots():
+    """Model directories to scan: environment first, then operator-managed, then defaults."""
+    roots=[Path(raw.strip()) for raw in (os.getenv("SKEIN_MODEL_ROOTS","") or "").split(os.pathsep) if raw.strip()]
+    try: roots += [Path(raw) for raw in json.loads(setting_text("model_roots") or "[]") if str(raw).strip()]
+    except (json.JSONDecodeError, TypeError): pass
+    # The library is resolved through model_library_dir so it exists and never warns as missing.
+    return unique_paths(roots + DISCOVERY_ROOTS + [model_library_dir()])
+
+
+def save_model_roots(roots):
+    cleaned=[str(path) for path in unique_paths(Path(str(raw)) for raw in roots if str(raw).strip())]
+    set_setting("model_roots", json.dumps(cleaned, ensure_ascii=False))
+    return cleaned
+
+
+def model_library_dir():
+    """Writable directory that receives downloaded and uploaded weights."""
+    target=Path(os.getenv("SKEIN_MODEL_LIBRARY","") or MODEL_LIBRARY).expanduser()
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def find_llama_runtime():
+    home=Path.home()
+    candidates=[Path(raw.strip()) for raw in (os.getenv("SKEIN_RUNTIME_PATHS","") or "").split(os.pathsep) if raw.strip()]
+    candidates.append(home/".unsloth/llama.cpp/build/bin/Release/llama-server.exe")
+    backends=home/".lmstudio/extensions/backends"
+    # Prefer the proven standalone build; LM Studio entries can be tiny launcher shims.
+    if backends.exists(): candidates += sorted(backends.glob("llama.cpp-win-*-nvidia-*/llama-server.exe"))
+    discovered=shutil.which("llama-server") or shutil.which("llama-server.exe")
+    if discovered: candidates.append(Path(discovered))
+    return next((path for path in candidates if path.is_file()), None)
+
+
+def detect_quantization(filename):
+    matches=QUANTIZATION_PATTERN.findall(Path(filename).stem)
+    return matches[-1].upper() if matches else None
+
+
+def model_file_entries(limit=MAX_SCANNED_MODEL_FILES):
+    """Every GGUF file visible under the configured roots, with registration state."""
+    entries, warnings, truncated = [], [], False
+    with db() as conn: registered={str(row[0]).lower() for row in conn.execute("SELECT model_path FROM models")}
+    for root in configured_model_roots():
+        if not root.exists():
+            warnings.append(f"Model root not found: {root}"); continue
+        try: found=sorted(root.rglob("*.gguf"))
+        except OSError as exc:
+            warnings.append(f"Cannot read {root}: {exc}"); continue
+        for path in found:
+            if "mmproj" in path.name.lower(): continue
+            if len(entries)>=limit: truncated=True; break
+            try: info=path.stat()
+            except OSError: continue
+            entries.append({"path":str(path),"name":path.stem,"root":str(root),"size_bytes":info.st_size,
+              "size_gb":round(info.st_size/1073741824,2),"quantization":detect_quantization(path.name),
+              "modified_at":round(info.st_mtime,3),"registered":str(path).lower() in registered,
+              "too_small":info.st_size < MIN_MODEL_MB*1048576})
+        if truncated:
+            warnings.append(f"Scan stopped at {limit} files; narrow the configured model roots."); break
+    return entries, warnings
+
+
+def preferred_auto_model(entries):
+    """Largest weight file that plausibly fits detected VRAM, else the smallest available."""
+    usable=[entry for entry in entries if not entry["too_small"]]
+    if not usable: return None
+    vram_mb=sum(float(gpu.get("memory_total_mb") or 0) for gpu in nvidia_gpus())
+    if vram_mb:
+        budget=vram_mb*1048576*.8
+        fitting=[entry for entry in usable if entry["size_bytes"]<=budget]
+        if fitting: return max(fitting, key=lambda entry: entry["size_bytes"])
+    return min(usable, key=lambda entry: entry["size_bytes"])
+
+
+def register_model_file(path, role="available", pool_id=None, name=None, context_size=8192, runtime_path=None):
+    resolved=Path(str(path)).expanduser()
+    if resolved.suffix.lower()!=".gguf": return {"error":"Only .gguf weight files can be registered"},400
+    if not resolved.is_file(): return {"error":"Model file not found","details":str(resolved)},404
+    role=str(role or "available").strip().lower()
+    if role not in MODEL_ROLES: return {"error":f"Unsupported model role '{role}'"},400
+    with db() as conn:
+        existing=conn.execute("SELECT id FROM models WHERE model_path=? COLLATE NOCASE",(str(resolved),)).fetchone()
+        if existing: return {"error":"This weight file is already registered","id":existing["id"]},409
+    runtime=Path(runtime_path) if runtime_path else find_llama_runtime()
+    mid=str(uuid.uuid4())
+    with db() as conn:
+        conn.execute("INSERT INTO models VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+          (mid,str(name or resolved.stem),role,"llama.cpp",str(resolved),str(runtime or ""),
+           max(512,int(context_size or 8192)),0,None,"STOPPED",None,None,None,stamp()))
+    result,status=configure_model(mid,role,pool_id)
+    if status!=200: return result,status
+    return {"id":mid,"name":str(name or resolved.stem),"model_path":str(resolved),"role":role,
+            "quantization":detect_quantization(resolved.name),"runtime_path":str(runtime or "")},201
+
+
+def discover_local_models(include_available=False):
+    """Scan the configured roots. File discovery never depends on finding a runtime."""
+    entries, warnings = model_file_entries()
+    runtime = find_llama_runtime()
+    if not runtime:
+        warnings.append("No llama-server executable was found. Weights are still registered; set SKEIN_RUNTIME_PATHS or edit the runtime path before loading.")
+    created=[]
+    auto=preferred_auto_model(entries) if runtime else None
+    with db() as conn:
+        if auto:
+            for role,port in (("reasoner",8001),("worker",8002)):
+                if conn.execute("SELECT 1 FROM models WHERE role=?",(role,)).fetchone(): continue
                 mid=str(uuid.uuid4())
                 conn.execute("INSERT INTO models VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                  (mid,f"Available · {candidate.stem}","available","llama.cpp",str(candidate),str(runtime),8192,0,None,"STOPPED",None,None,None,stamp()))
-                created.append({"id":mid,"name":candidate.stem,"model_path":str(candidate)})
-        for role,port in (("reasoner",8001),("worker",8002)):
-            if conn.execute("SELECT 1 FROM models WHERE role=?",(role,)).fetchone(): continue
-            mid=str(uuid.uuid4())
-            conn.execute("INSERT INTO models VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-              (mid,f"Auto {role} · {model.stem}",role,"llama.cpp",str(model),str(runtime),8192,port,None,"STOPPED",None,None,None,stamp()))
-    return created
+                  (mid,f"Auto {role} · {auto['name']}",role,"llama.cpp",auto["path"],str(runtime),8192,port,None,"STOPPED",None,None,None,stamp()))
+                created.append({"id":mid,"name":auto["name"],"model_path":auto["path"],"role":role})
+        if include_available:
+            for entry in entries:
+                if entry["too_small"] or entry["registered"]: continue
+                if conn.execute("SELECT 1 FROM models WHERE model_path=? COLLATE NOCASE",(entry["path"],)).fetchone(): continue
+                mid=str(uuid.uuid4())
+                conn.execute("INSERT INTO models VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (mid,f"Available · {entry['name']}","available","llama.cpp",entry["path"],str(runtime or ""),8192,0,None,"STOPPED",None,None,None,stamp()))
+                created.append({"id":mid,"name":entry["name"],"model_path":entry["path"],"role":"available","quantization":entry["quantization"]})
+    skipped=[entry for entry in entries if entry["too_small"]]
+    if skipped: warnings.append(f"{len(skipped)} file(s) below {MIN_MODEL_MB} MB were ignored; lower SKEIN_MIN_MODEL_MB to include them.")
+    return {"discovered":created,"count":len(created),"scanned_files":len(entries),
+            "roots":[str(root) for root in configured_model_roots()],
+            "runtime":str(runtime) if runtime else None,"warnings":warnings}
 
 
 def run_text(args, timeout=4):
@@ -451,39 +577,117 @@ def resource_window(start,end,duration,scope):
 RUNTIMES, ACTIVE_ENDPOINTS = {}, {}
 
 
-MODEL_ROLES=("reasoner","worker","embedding","reranker")
+MODEL_ROLES=("available","reasoner","worker","embedding","reranker")
+RUNNABLE_MODEL_ROLES=("reasoner","worker","embedding","reranker")
+ROLE_PORTS={"reasoner":8001,"worker":8002,"embedding":8003,"reranker":8004}
+RUNTIME_LOG_DIR = DB_PATH.parent / "runtime-logs"
+UNCHANGED = object()
 
 
-def configure_model(model_id, role=None, pool_id=None):
+def running_pids(max_age=3.0):
+    """Cached pid -> image name map, so polling the model list stays cheap."""
+    cached=getattr(running_pids,"_cache",None)
+    if cached and time.monotonic()-cached[0]<max_age: return cached[1]
+    mapping={}
+    if os.name=="nt":
+        for row in csv.reader(io.StringIO(run_text(["tasklist","/FO","CSV","/NH"],8))):
+            if len(row)>=2:
+                try: mapping[int(row[1])]=row[0]
+                except ValueError: continue
+    running_pids._cache=(time.monotonic(),mapping)
+    return mapping
+
+
+def process_alive(pid, expected_name=None):
+    """Verify the image name too: a recycled pid must never be mistaken for our runtime."""
+    try: pid=int(pid)
+    except (TypeError, ValueError): return False
+    if pid<=0: return False
+    if os.name=="nt":
+        image=running_pids().get(pid)
+        if not image: return False
+        return expected_name.lower() in image.lower() if expected_name else True
+    try: os.kill(pid, 0)
+    except (OSError, ValueError): return False
+    return True
+
+
+def model_running(model):
+    proc=RUNTIMES.get(model["id"])
+    if proc and proc.poll() is None: return True
+    runtime_name=Path(model["runtime_path"]).name if model["runtime_path"] else None
+    return process_alive(model["pid"], runtime_name)
+
+
+def terminate_pid(pid, expected_name=None):
+    if not process_alive(pid, expected_name): return False
+    if os.name=="nt":
+        run_text(["taskkill","/PID",str(int(pid)),"/T","/F"],15); return True
+    try:
+        os.kill(int(pid), signal.SIGTERM); return True
+    except OSError: return False
+
+
+def runtime_log_path(model_id):
+    return RUNTIME_LOG_DIR / f"{model_id}.log"
+
+
+def runtime_log_tail(model_id, limit=4000):
+    path=runtime_log_path(model_id)
+    try: return path.read_text("utf-8","replace")[-limit:].strip()
+    except OSError: return ""
+
+
+def configure_model(model_id, role=None, pool_id=UNCHANGED):
     with db() as conn:
         model=conn.execute("SELECT * FROM models WHERE id=?",(model_id,)).fetchone()
         if not model: return {"error":"Model not found"},404
         role=str(role or model["role"]).strip().lower()
-        if role not in MODEL_ROLES: return {"error":"Choose a model role before loading"},400
-        if pool_id and not conn.execute("SELECT 1 FROM pools WHERE id=?",(pool_id,)).fetchone(): return {"error":"Pool not found"},404
+        if role not in MODEL_ROLES: return {"error":f"Unsupported model role '{role}'","action":f"Choose one of: {', '.join(MODEL_ROLES)}."},400
+        if pool_id is UNCHANGED: effective_pool=model["pool_id"]
+        else:
+            effective_pool=str(pool_id).strip() or None if pool_id else None
+            if effective_pool and not conn.execute("SELECT 1 FROM pools WHERE id=?",(effective_pool,)).fetchone():
+                return {"error":"Pool not found"},404
         port=int(model["port"] or 0)
-        if not port or role!=model["role"]:
-            port={"reasoner":8001,"worker":8002,"embedding":8003,"reranker":8004}[role]
+        if role not in RUNNABLE_MODEL_ROLES: port=0
+        elif not port or role!=model["role"]:
+            port=ROLE_PORTS[role]
+            # Never drift onto another role's default port when this one is taken.
             occupied={row[0] for row in conn.execute("SELECT port FROM models WHERE id<>? AND port>0",(model_id,))}
+            occupied|={value for key,value in ROLE_PORTS.items() if key!=role}
             while port in occupied: port+=1
-        conn.execute("UPDATE models SET role=?,pool_id=?,port=?,updated_at=? WHERE id=?",(role,pool_id or model["pool_id"],port,stamp(),model_id))
-    return {"id":model_id,"role":role,"pool_id":pool_id or model["pool_id"],"port":port},200
+        conn.execute("UPDATE models SET role=?,pool_id=?,port=?,updated_at=? WHERE id=?",(role,effective_pool,port,stamp(),model_id))
+    return {"id":model_id,"role":role,"pool_id":effective_pool,"port":port},200
 
 
-def activate_model(model_id, pool_id, role=None):
+def activate_model(model_id, pool_id=None, role=None):
+    """Start the runtime for one model. An empty pool keeps the stored assignment."""
     if role:
-        configured,status=configure_model(model_id,role,pool_id)
+        configured,status=configure_model(model_id,role,pool_id if pool_id else UNCHANGED)
         if status!=200: return configured,status
     with db() as conn:
         model = conn.execute("SELECT * FROM models WHERE id=?",(model_id,)).fetchone()
-        gpu_rows = conn.execute("SELECT gpu_id FROM gpu_assignments WHERE pool_id=?",(pool_id,)).fetchall()
     if not model: return {"error":"Model not found"}, 404
-    if model_id in RUNTIMES and RUNTIMES[model_id].poll() is None:
-        return {"error":"Model already active"}, 409
-    runtime, model_path = Path(model["runtime_path"]), Path(model["model_path"])
+    if model["role"] not in RUNNABLE_MODEL_ROLES:
+        return {"error":"Choose a model role before loading",
+                "action":f"Select {', '.join(RUNNABLE_MODEL_ROLES)} for this model, then load it again."}, 400
+    effective_pool = (pool_id or None) or model["pool_id"]
+    with db() as conn:
+        if effective_pool and not conn.execute("SELECT 1 FROM pools WHERE id=?",(effective_pool,)).fetchone():
+            return {"error":"Pool not found"}, 404
+        gpu_rows = conn.execute("SELECT gpu_id FROM gpu_assignments WHERE pool_id=?",(effective_pool,)).fetchall() if effective_pool else []
+    if model_running(model):
+        return {"error":"Model already active","action":"Stop this runtime before loading it again.","pid":model["pid"]}, 409
+    runtime, model_path = Path(model["runtime_path"] or ""), Path(model["model_path"])
     error, pid, status = None, None, "CONFIGURED"
-    paths_valid = runtime.is_file() and (model_path.is_file() or model["backend"] == "vllm")
-    if paths_valid:
+    if not model["runtime_path"]:
+        error="No runtime executable is configured for this model; set its runtime path first."
+    elif not runtime.is_file():
+        error=f"Runtime executable not found: {runtime}"
+    elif not (model_path.is_file() or model["backend"]=="vllm"):
+        error=f"Weight file not found: {model_path}"
+    else:
         env = os.environ.copy(); gpu_ids = [r["gpu_id"] for r in gpu_rows]
         indices = [str(g["index"]) for g in nvidia_gpus() if g["id"] in gpu_ids]
         if indices: env["CUDA_VISIBLE_DEVICES"] = ",".join(indices)
@@ -492,28 +696,241 @@ def activate_model(model_id, pool_id, role=None):
                     "--host", "127.0.0.1", "--port", str(model["port"]), "--max-model-len", str(model["context_size"])]
         else:
             args = [str(runtime), "-m", str(model_path), "--host", "127.0.0.1", "--port", str(model["port"]), "-c", str(model["context_size"]), "-ngl", "999"]
+        RUNTIME_LOG_DIR.mkdir(parents=True, exist_ok=True)
         try:
-            proc = subprocess.Popen(args, cwd=str(runtime.parent), env=env, stdout=subprocess.DEVNULL,
-              stderr=subprocess.DEVNULL, creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
+            # Keep the runtime output: a crashed llama-server must be diagnosable from the UI.
+            with open(runtime_log_path(model_id),"wb") as handle:
+                proc = subprocess.Popen(args, cwd=str(runtime.parent), env=env, stdout=handle,
+                  stderr=subprocess.STDOUT, creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
             RUNTIMES[model_id]=proc; pid=proc.pid; status="STARTING"
+            try: proc.wait(timeout=1.5)
+            except subprocess.TimeoutExpired: pass
+            if proc.poll() is not None:
+                status, pid = "ERROR", None
+                error=runtime_log_tail(model_id,2000) or f"The runtime exited immediately with code {proc.returncode}."
+                RUNTIMES.pop(model_id,None)
         except OSError as exc: error=str(exc); status="ERROR"
-    else:
-        error="Runtime or model path not found; assignment saved without starting."
     endpoint=f"http://127.0.0.1:{model['port']}/v1/chat/completions"
     if status == "STARTING": ACTIVE_ENDPOINTS[model["role"]] = endpoint
     with db() as conn:
         conn.execute("UPDATE models SET pool_id=?,status=?,pid=?,endpoint=?,last_error=?,updated_at=? WHERE id=?",
-          (pool_id,status,pid,endpoint,error,stamp(),model_id))
-    return {"id":model_id,"status":status,"pid":pid,"endpoint":endpoint,"error":error}, 200
+          (effective_pool,status,pid,endpoint,error,stamp(),model_id))
+    payload={"id":model_id,"status":status,"pid":pid,"endpoint":endpoint,"pool_id":effective_pool,
+             "gpu_indices":indices if status=="STARTING" else [],"error":error}
+    # The role and pool are saved either way, but a runtime that did not start must never look like a success.
+    if status=="STARTING": return payload,200
+    payload["action"]="The role and pool assignment was saved. Correct the runtime or weight path, then load again."
+    return payload,502
 
 
 def stop_model(model_id):
+    """Unload a runtime, including one that outlived a previous Skein process."""
     with db() as conn: model=conn.execute("SELECT * FROM models WHERE id=?",(model_id,)).fetchone()
+    if not model: return {"error":"Model not found"},404
+    terminated=False
     proc=RUNTIMES.pop(model_id,None)
-    if proc and proc.poll() is None: proc.terminate()
-    if model and ACTIVE_ENDPOINTS.get(model["role"]) == model["endpoint"]: ACTIVE_ENDPOINTS.pop(model["role"],None)
+    if proc and proc.poll() is None:
+        proc.terminate()
+        try: proc.wait(timeout=10)
+        except subprocess.TimeoutExpired: proc.kill()
+        terminated=True
+    elif model["pid"]:
+        terminated=terminate_pid(model["pid"], Path(model["runtime_path"]).name if model["runtime_path"] else None)
+    if ACTIVE_ENDPOINTS.get(model["role"])==model["endpoint"]: ACTIVE_ENDPOINTS.pop(model["role"],None)
     with db() as conn: conn.execute("UPDATE models SET status='STOPPED',pid=NULL,updated_at=? WHERE id=?",(stamp(),model_id))
-    return {"id":model_id,"status":"STOPPED"}
+    return {"id":model_id,"status":"STOPPED","terminated":terminated},200
+
+
+def restore_active_endpoints():
+    """Re-attach to runtimes that survived a Skein restart instead of reporting no model."""
+    restored=[]
+    with db() as conn:
+        rows=conn.execute("SELECT * FROM models WHERE endpoint IS NOT NULL AND endpoint<>'' AND role<>'available'").fetchall()
+    for row in rows:
+        if row["role"] not in RUNNABLE_MODEL_ROLES: continue
+        if endpoint_ready(row["endpoint"]):
+            ACTIVE_ENDPOINTS.setdefault(row["role"], row["endpoint"])
+            with db() as conn: conn.execute("UPDATE models SET status='RUNNING',updated_at=? WHERE id=?",(stamp(),row["id"]))
+            restored.append({"id":row["id"],"role":row["role"],"endpoint":row["endpoint"]})
+        elif row["status"] in ("STARTING","RUNNING"):
+            with db() as conn: conn.execute("UPDATE models SET status='STOPPED',pid=NULL,updated_at=? WHERE id=?",(stamp(),row["id"]))
+    return restored
+
+
+HF_HOST = os.getenv("SKEIN_HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+HF_REPO_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
+WEIGHT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.gguf$", re.IGNORECASE)
+MAX_UPLOAD_BYTES = int(float(os.getenv("SKEIN_MAX_UPLOAD_GB", "80")) * 1073741824)
+DOWNLOAD_CHUNK = 1048576
+DOWNLOADS, DOWNLOADS_LOCK = {}, threading.Lock()
+
+
+def huggingface_token():
+    return (os.getenv("SKEIN_HF_TOKEN") or os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN") or "").strip()
+
+
+def huggingface_headers():
+    headers={"User-Agent":"skein-model-manager"}
+    token=huggingface_token()
+    if token: headers["Authorization"]=f"Bearer {token}"
+    return headers
+
+
+def huggingface_api(path, query=None):
+    url=f"{HF_HOST}{path}"+(f"?{urlencode(query)}" if query else "")
+    try:
+        with urlopen(Request(url, headers=huggingface_headers()), timeout=25) as response: return json.load(response),200
+    except HTTPError as exc:
+        if exc.code in (401,403):
+            return {"error":"Hugging Face refused access to this repository",
+                    "action":"Set SKEIN_HF_TOKEN (or HF_TOKEN) with an account that accepted the model licence.","details":f"HTTP {exc.code}"},exc.code
+        if exc.code==404: return {"error":"Repository or file not found on Hugging Face","details":f"HTTP {exc.code}"},404
+        return {"error":"Hugging Face returned an error","details":f"HTTP {exc.code}"},502
+    except (URLError,TimeoutError,json.JSONDecodeError,ValueError) as exc:
+        return {"error":"Hugging Face is unreachable","details":str(exc),
+                "action":"Check network access or proxy configuration; Skein never downloads weights without an explicit request."},503
+
+
+def huggingface_search(query, limit=20):
+    query=str(query or "").strip()
+    if not query: return {"error":"Enter a search term"},400
+    payload,status=huggingface_api("/api/models",{"search":query,"filter":"gguf","sort":"downloads","direction":-1,
+                                                 "limit":max(1,min(int(limit or 20),50))})
+    if status!=200: return payload,status
+    results=[{"repo":item.get("modelId") or item.get("id"),"downloads":item.get("downloads"),"likes":item.get("likes"),
+              "updated_at":item.get("lastModified"),"gated":bool(item.get("gated")),
+              "tags":[tag for tag in (item.get("tags") or []) if isinstance(tag,str)][:8]}
+             for item in payload if isinstance(item,dict) and (item.get("modelId") or item.get("id"))]
+    return {"query":query,"results":results,"authenticated":bool(huggingface_token())},200
+
+
+def huggingface_repo_files(repo):
+    repo=str(repo or "").strip().strip("/")
+    if not HF_REPO_PATTERN.fullmatch(repo): return {"error":"Invalid repository identifier","action":"Use the owner/name form."},400
+    payload,status=huggingface_api(f"/api/models/{repo}",{"blobs":"true"})
+    if status!=200: return payload,status
+    files=[]
+    for sibling in payload.get("siblings") or []:
+        name=str(sibling.get("rfilename") or "")
+        if not name.lower().endswith(".gguf"): continue
+        size=sibling.get("size") or (sibling.get("lfs") or {}).get("size")
+        files.append({"filename":name,"size_bytes":size,"size_gb":round(size/1073741824,2) if size else None,
+                      "quantization":detect_quantization(name),"downloadable":bool(WEIGHT_NAME_PATTERN.fullmatch(Path(name).name))})
+    files.sort(key=lambda item:item["filename"])
+    return {"repo":repo,"gated":bool(payload.get("gated")),"files":files,"authenticated":bool(huggingface_token())},200
+
+
+def safe_weight_filename(name):
+    """Reduce any client-supplied name to a bare .gguf file name inside the model library."""
+    candidate=Path(str(name or "").replace("\\","/")).name
+    return candidate if WEIGHT_NAME_PATTERN.fullmatch(candidate) else None
+
+
+def safe_remote_weight_path(value):
+    """Validate a repository-relative path segment by segment; `..` never reaches the request URL."""
+    parts=[part for part in str(value or "").replace("\\","/").split("/") if part and part!="."]
+    if not parts or any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*",part) or part==".." for part in parts): return None
+    return "/".join(parts) if WEIGHT_NAME_PATTERN.fullmatch(parts[-1]) else None
+
+
+def download_snapshot(job):
+    data={key:value for key,value in job.items() if key!="cancel"}
+    total, received = data.get("total_bytes"), data.get("received_bytes") or 0
+    data["progress"]=round(received/total,4) if total else None
+    return data
+
+
+def update_download(job_id, **fields):
+    with DOWNLOADS_LOCK:
+        job=DOWNLOADS.get(job_id)
+        if job: job.update(fields); job["updated_at"]=stamp()
+
+
+def list_downloads():
+    with DOWNLOADS_LOCK: return [download_snapshot(job) for job in DOWNLOADS.values()]
+
+
+def run_huggingface_download(job_id, repo, filename, target, cancel):
+    partial=target.with_name(target.name+".part")
+    received=partial.stat().st_size if partial.exists() else 0
+    headers=huggingface_headers()
+    if received: headers["Range"]=f"bytes={received}-"
+    url=f"{HF_HOST}/{repo}/resolve/main/{quote(filename)}"
+    try:
+        with urlopen(Request(url, headers=headers), timeout=60) as response:
+            if response.status!=206: received=0  # the server ignored our resume request
+            declared=response.headers.get("Content-Length")
+            total=(int(declared)+received) if declared and declared.isdigit() else None
+            update_download(job_id,total_bytes=total,received_bytes=received)
+            with open(partial,"ab" if received else "wb") as handle:
+                while True:
+                    if cancel.is_set():
+                        update_download(job_id,status="CANCELLED"); return
+                    chunk=response.read(DOWNLOAD_CHUNK)
+                    if not chunk: break
+                    handle.write(chunk); received+=len(chunk)
+                    update_download(job_id,received_bytes=received)
+        partial.replace(target)
+        registered,status=register_model_file(target,"available")
+        update_download(job_id,status="COMPLETED",received_bytes=received,
+                        model_id=registered.get("id") if status==201 else None,
+                        error=None if status==201 else registered.get("error"))
+    except (OSError,URLError,TimeoutError,ValueError) as exc:
+        update_download(job_id,status="FAILED",error=f"{type(exc).__name__}: {exc}")
+
+
+def start_huggingface_download(repo, filename):
+    repo=str(repo or "").strip().strip("/")
+    if not HF_REPO_PATTERN.fullmatch(repo): return {"error":"Invalid repository identifier","action":"Use the owner/name form."},400
+    remote=safe_remote_weight_path(filename)
+    if not remote: return {"error":"Invalid weight filename","action":"Only a .gguf path inside the repository can be downloaded."},400
+    safe=safe_weight_filename(remote)
+    target=model_library_dir()/f"{repo.replace('/','__')}__{safe}"
+    if target.exists(): return {"error":"This weight file is already present locally","path":str(target)},409
+    with DOWNLOADS_LOCK:
+        if any(job["path"]==str(target) and job["status"]=="RUNNING" for job in DOWNLOADS.values()):
+            return {"error":"This download is already running"},409
+        job_id=str(uuid.uuid4()); cancel=threading.Event()
+        DOWNLOADS[job_id]={"id":job_id,"kind":"huggingface","repo":repo,"filename":safe,"remote_path":remote,
+          "path":str(target),"status":"RUNNING","received_bytes":0,"total_bytes":None,"error":None,
+          "model_id":None,"started_at":stamp(),"updated_at":stamp(),"cancel":cancel}
+        snapshot=download_snapshot(DOWNLOADS[job_id])
+    threading.Thread(target=run_huggingface_download,args=(job_id,repo,remote,target,cancel),daemon=True).start()
+    return snapshot,202
+
+
+def cancel_download(job_id):
+    with DOWNLOADS_LOCK:
+        job=DOWNLOADS.get(job_id)
+        if not job: return {"error":"Download not found"},404
+        if job["status"]!="RUNNING": return download_snapshot(job),200
+        job["cancel"].set()
+        return {**download_snapshot(job),"status":"CANCELLING"},202
+
+
+def store_uploaded_weight(filename, stream, length):
+    safe=safe_weight_filename(filename)
+    if not safe: return {"error":"Invalid weight filename","action":"Send a bare .gguf file name with no path separator."},400
+    if not length or length<=0: return {"error":"A Content-Length header is required for uploads"},411
+    if length>MAX_UPLOAD_BYTES: return {"error":"Upload exceeds the configured size limit",
+      "limit_bytes":MAX_UPLOAD_BYTES,"action":"Raise SKEIN_MAX_UPLOAD_GB or copy the file into a configured model root."},413
+    target=model_library_dir()/safe
+    if target.exists(): return {"error":"A weight file with this name already exists","path":str(target)},409
+    partial=target.with_name(target.name+".part"); received=0
+    try:
+        with open(partial,"wb") as handle:
+            while received<length:
+                chunk=stream.read(min(DOWNLOAD_CHUNK,length-received))
+                if not chunk: break
+                handle.write(chunk); received+=len(chunk)
+        if received!=length:
+            partial.unlink(missing_ok=True)
+            return {"error":"Upload was interrupted before completion","received_bytes":received,"expected_bytes":length},400
+        partial.replace(target)
+    except OSError as exc:
+        partial.unlink(missing_ok=True)
+        return {"error":"Could not store the uploaded weight file","details":str(exc)},500
+    return register_model_file(target,"available")
 
 
 def endpoint_ready(endpoint, timeout=2):
@@ -533,16 +950,18 @@ def supervisor_call(action, method="GET"):
 
 
 def autoload_models():
-    discover_local_models()
+    discovery=discover_local_models()
     with db() as conn:
         rows=conn.execute("SELECT * FROM models WHERE role IN ('reasoner','worker') ORDER BY updated_at DESC").fetchall()
     selected={}
     for row in rows: selected.setdefault(row["role"],row)
     missing=[r for r in ("reasoner","worker") if r not in selected]
-    if missing: return {"error":"Local profiles not found","missing":missing},400
+    if missing: return {"error":"Local profiles not found","missing":missing,
+      "action":"Use Discover models, or register a runtime and weight file manually.",
+      "details":"\n".join(discovery.get("warnings") or [])},400
     started=[]
     for role,row in selected.items():
-        result,status=activate_model(row["id"],"reasoner" if role=="reasoner" else "workers")
+        result,status=activate_model(row["id"])
         if status not in (200,409): return result,status
         started.append({"role":role,"id":row["id"],"endpoint":row["endpoint"] or result.get("endpoint")})
     deadline=time.time()+90
@@ -1265,7 +1684,57 @@ def format_execution_report(auditor_result,dependency_results):
     return "\n".join(lines)
 
 
+CONFIDENCE_WORDS={"certain":1.0,"very high":.95,"high":.85,"good":.8,"medium":.6,"moderate":.6,"average":.6,"fair":.55,"low":.35,"very low":.2,"none":0.0}
+MAX_TASK_ATTEMPTS=max(1,int(os.getenv("SKEIN_MAX_TASK_ATTEMPTS","2")))
+TERMINAL_TASK_STATES=("COMPLETED","FAILED","BLOCKED")
+
+
+def parse_confidence(value):
+    """Return a 0..1 self-reported confidence, or None when the model gave none.
+
+    Confidence is reporting metadata, never a success criterion: an absent or
+    unparsable value means "unknown" and must not be collapsed to zero.
+    """
+    if isinstance(value,bool): return 1.0 if value else 0.0
+    if isinstance(value,(int,float)): number=float(value)
+    elif isinstance(value,str):
+        text=value.strip().lower()
+        if not text: return None
+        try: number=float(text.rstrip("%").replace(",",".").strip())
+        except ValueError: return CONFIDENCE_WORDS.get(text)
+        if text.endswith("%"): number/=100
+    else: return None
+    if number!=number or number in (float("inf"),float("-inf")): return None
+    if number>1: number/=100
+    return round(min(1.0,max(0.0,number)),3)
+
+
+def llm_result_usable(result):
+    """A task succeeded when it produced content, independently of its confidence."""
+    if not isinstance(result,dict): return False
+    if result.get("error") or result.get("mode")=="error": return False
+    return bool(str(result.get("deliverable") or result.get("summary") or "").strip() or result.get("files"))
+
+
 def execute_task(wid, tid, objective):
+    """Run one task. Never raises: a crash is recorded as a failed task so that
+    the orchestrator keeps scheduling the independent branches of the DAG."""
+    try:
+        return run_task(wid, tid, objective)
+    except Exception as exc:
+        detail=f"{type(exc).__name__}: {exc}"
+        result={"summary":"Task crashed during execution","deliverable":f"The orchestrator could not complete this task. {detail}","files":[],
+          "confidence":None,"assumptions":[],"evidence":[detail],"next_actions":["Inspect the Skein server log, then relaunch the workflow"],"mode":"error","error":detail}
+        with db() as conn:
+            # A crash before run_task claimed the task left the counter untouched; advance it here
+            # so a task that always crashes cannot be retried forever.
+            conn.execute("UPDATE tasks SET attempts=attempts+1 WHERE id=? AND status='READY'",(tid,))
+            conn.execute("UPDATE tasks SET status='FAILED',confidence=NULL,result=?,finished_at=? WHERE id=?",
+                         (json.dumps(result,ensure_ascii=False),stamp(),tid))
+        emit(wid,"task.failed",{"error":detail},tid)
+
+
+def run_task(wid, tid, objective):
     with db() as conn:
         task = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
         dependency_results=[]
@@ -1286,39 +1755,62 @@ def execute_task(wid, tid, objective):
     condition_passed,condition_result=evaluate_task_condition(wid,task,objective,dependency_results)
     if not condition_passed:
         result={"summary":"Task skipped because its condition evaluated to false","deliverable":"Condition false; the task action was not executed.","files":[],"confidence":1.0,"assumptions":[],"evidence":[condition_result],"next_actions":[],"mode":"condition"}
+        usable=True
     elif task["action_type"]=="command":
         execution,_=execute_command(wid,json.loads(task["action_config"]).get("command",""),60,EXECUTION_MODE)
         passed=execution.get("status")=="PASS"
         result={"summary":f"Command {execution.get('status','FAILED')}","deliverable":execution.get("stdout") or execution.get("stderr") or "No output","files":[],"confidence":1.0 if passed else 0.0,"assumptions":[],"evidence":[f"Exit code: {execution.get('exit_code')}"],"next_actions":[] if passed else ["Inspect stderr and correct the command"],"mode":"command","execution":execution}
+        usable=passed
     elif task["action_type"]=="script":
         config=json.loads(task["action_config"]); extensions={"python":"py","node":"js","java":"java","php":"php"}; runtime=config.get("runtime"); path=config.get("path") or f"workflow-scripts/{task['position']+1:02d}-{task['id'][:8]}.{extensions.get(runtime,'txt')}"
         artifacts=persist_artifacts(wid,tid,[{"path":path,"content":config.get("content","")}]); execution={"status":"FAIL","stderr":"Script artifact could not be created"}
         if artifacts: execution,_=execute_in_sandbox(artifacts[0]["id"],60,EXECUTION_MODE)
         passed=execution.get("status") in ("PASS","PREVIEW_READY")
         result={"summary":f"{runtime} script {execution.get('status','FAILED')}","deliverable":execution.get("stdout") or execution.get("stderr") or "No output","files":[],"confidence":1.0 if passed else 0.0,"assumptions":[],"evidence":[f"Exit code: {execution.get('exit_code')}"],"next_actions":[] if passed else ["Inspect stderr and correct the script"],"mode":"script","execution":execution,"artifacts":artifacts}
+        usable=passed
     else:
         result = ModelClient(model).generate(task, objective, dependency_results)
         if task["role"]=="workflow-reporter" and not result.get("error"):
             result["deliverable"]=format_execution_report(result,dependency_results)
             result["summary"]="Workflow execution report generated from task results, events, and execution logs"
-    if condition_passed and task["action_type"]=="llm" and model == "worker-general" and float(result.get("confidence", 0)) < .65:
-        emit(wid, "task.escalated", {"from": model, "confidence": result.get("confidence")}, tid)
-        model, result = "reasoner-large", ModelClient("reasoner-large").generate(task, objective, dependency_results)
+        usable=llm_result_usable(result)
+    confidence=parse_confidence(result.get("confidence"))
+    # A low or unknown confidence escalates to the reasoner; it never fails the task on its own.
+    if condition_passed and task["action_type"]=="llm" and model=="worker-general" and (not usable or (confidence is not None and confidence<.65)):
+        emit(wid, "task.escalated", {"from": model, "confidence": confidence, "usable": usable}, tid)
+        retried=ModelClient("reasoner-large").generate(task, objective, dependency_results)
+        if task["role"]=="workflow-reporter" and not retried.get("error"):
+            retried["deliverable"]=format_execution_report(retried,dependency_results)
+            retried["summary"]="Workflow execution report generated from task results, events, and execution logs"
+        retried_usable=llm_result_usable(retried)
+        if retried_usable or not usable:
+            model,result,usable,confidence="reasoner-large",retried,retried_usable,parse_confidence(retried.get("confidence"))
     duration=max(.001,time.perf_counter()-task_started)
     metrics=result.setdefault("metrics",{})
     scope="local_machine" if task["action_type"] in ("command","script") and EXECUTION_MODE=="local" else ("docker_container_host_window" if task["action_type"] in ("command","script") else "model_runtime")
     metrics.update({"execution_seconds":round(duration,3),**power.stop(duration,scope)})
     if task["action_type"]!="script": result["artifacts"]=persist_artifacts(wid,tid,result.get("files",[])) if result.get("files") else []
-    confidence = float(result.get("confidence", 0))
-    status = "COMPLETED" if confidence >= .55 else "FAILED"
+    result["confidence"]=confidence
+    status = "COMPLETED" if usable else "FAILED"
     with db() as conn:
         conn.execute("UPDATE tasks SET status=?,model=?,confidence=?,result=?,finished_at=? WHERE id=?",
                      (status, model, confidence, json.dumps(result, ensure_ascii=False), stamp(), tid))
     emit(wid, "task.completed" if status == "COMPLETED" else "task.failed",
-         {"model": model, "confidence": confidence}, tid)
+         {"model": model, "confidence": confidence, "error": result.get("error")}, tid)
+
+
+def blocked_task_result(reasons):
+    return {"summary":"Task blocked by an unmet dependency","deliverable":"Not executed because a dependency of this task did not complete.","files":[],
+      "confidence":None,"assumptions":[],"evidence":reasons,"next_actions":["Inspect the execution report and the failed dependency logs"],"mode":"blocked"}
 
 
 def orchestrate(wid):
+    """Drive one workflow DAG to completion.
+
+    A failed task only propagates to its own descendants; independent branches
+    keep running, and the workflow-reporter always runs last so the audit trail
+    covers what succeeded as well as what did not.
+    """
     try:
         with db() as conn:
             wf = conn.execute("SELECT * FROM workflows WHERE id=?", (wid,)).fetchone()
@@ -1330,26 +1822,49 @@ def orchestrate(wid):
             with db() as conn:
                 tasks = conn.execute("SELECT * FROM tasks WHERE workflow_id=? ORDER BY position", (wid,)).fetchall()
             state = {t["id"]: t["status"] for t in tasks}
-            if all(s == "COMPLETED" for s in state.values()):
-                emit(wid, "workflow.completed")
-                with db() as conn: conn.execute("UPDATE workflows SET status='COMPLETED',updated_at=? WHERE id=?", (stamp(),wid))
-                return
-            if any(s == "FAILED" for s in state.values()):
-                reporter=next((task for task in tasks if task["role"]=="workflow-reporter"),None)
-                if reporter and reporter["status"]=="READY":
-                    blocked={"summary":"Task blocked by an earlier failure","deliverable":"Not executed because a required workflow step failed.","files":[],"confidence":0.0,"assumptions":[],"evidence":["An earlier task failed"],"next_actions":["Inspect the execution report and failed task logs"],"mode":"blocked"}
-                    with db() as conn:
-                        conn.execute("UPDATE tasks SET status='FAILED',confidence=0,result=?,finished_at=? WHERE workflow_id=? AND status='READY' AND role!='workflow-reporter'",(json.dumps(blocked),stamp(),wid))
-                    execute_task(wid,reporter["id"],wf["objective"])
-                    continue
-                emit(wid, "workflow.failed")
-                with db() as conn: conn.execute("UPDATE workflows SET status='FAILED',updated_at=? WHERE id=?", (stamp(),wid))
-                return
-            ready = [t for t in tasks if t["status"] == "READY" and all(state[d] == "COMPLETED" for d in json.loads(t["dependencies"]))]
+            reporter = next((t for t in tasks if t["role"]=="workflow-reporter"), None)
+            steps = [t for t in tasks if not (reporter and t["id"]==reporter["id"])]
+
+            retryable = [t for t in steps if t["status"]=="FAILED" and t["action_type"]=="llm" and t["attempts"]<MAX_TASK_ATTEMPTS]
+            if retryable:
+                with db() as conn:
+                    conn.executemany("UPDATE tasks SET status='READY',finished_at=NULL WHERE id=?", [(t["id"],) for t in retryable])
+                for t in retryable: emit(wid,"task.retried",{"attempt":t["attempts"]+1,"max_attempts":MAX_TASK_ATTEMPTS},t["id"])
+                continue
+
+            broken = {t["id"] for t in steps if t["status"] in ("FAILED","BLOCKED")}
+            newly_blocked = []
+            for t in steps:
+                if t["status"]!="READY": continue
+                deps = json.loads(t["dependencies"])
+                reasons = [f"Unknown dependency {d}" for d in deps if d not in state]
+                reasons += [f"Dependency '{next((o['title'] for o in tasks if o['id']==d), d)}' did not complete" for d in deps if d in broken]
+                if reasons: newly_blocked.append((t["id"], reasons))
+            if newly_blocked:
+                with db() as conn:
+                    conn.executemany("UPDATE tasks SET status='BLOCKED',confidence=NULL,result=?,finished_at=? WHERE id=?",
+                                     [(json.dumps(blocked_task_result(reasons),ensure_ascii=False),stamp(),tid) for tid,reasons in newly_blocked])
+                for tid,reasons in newly_blocked: emit(wid,"task.blocked",{"reasons":reasons},tid)
+                continue
+
+            ready = [t for t in steps if t["status"]=="READY" and all(state.get(d)=="COMPLETED" for d in json.loads(t["dependencies"]))]
             if ready:
                 futures = [POOL.submit(execute_task, wid, t["id"], wf["objective"]) for t in ready]
                 for future in futures: future.result()
-            else: time.sleep(.15)
+                continue
+            if any(t["status"] not in TERMINAL_TASK_STATES for t in steps):
+                time.sleep(.15); continue
+            if reporter and reporter["status"]=="READY":
+                execute_task(wid, reporter["id"], wf["objective"]); continue
+            if reporter and reporter["status"] not in TERMINAL_TASK_STATES:
+                time.sleep(.15); continue
+
+            unfinished = [t for t in steps if t["status"] in ("FAILED","BLOCKED")]
+            status = "FAILED" if unfinished else "COMPLETED"
+            emit(wid, "workflow.completed" if status=="COMPLETED" else "workflow.failed",
+                 {"completed_tasks":sum(1 for t in steps if t["status"]=="COMPLETED"),"unfinished_tasks":len(unfinished)})
+            with db() as conn: conn.execute("UPDATE workflows SET status=?,updated_at=? WHERE id=?", (status,stamp(),wid))
+            return
     finally:
         with ACTIVE_LOCK: ACTIVE.discard(wid)
         dispatch_workflows()
@@ -1408,7 +1923,9 @@ def workflow_data(wid):
     completion_tokens=sum(int(m.get("completion_tokens") or 0) for m in task_metrics)
     execution_seconds=sum(float(m.get("execution_seconds") or 0) for m in task_metrics)
     workflow_seconds=max(0,float(wf["updated_at"])-(float(wf["created_at"])))
-    summary={"task_count":len(out),"completed_tasks":len(completed),"total_tokens":total_tokens,
+    summary={"task_count":len(out),"completed_tasks":len(completed),
+      "failed_tasks":sum(1 for t in out if t["status"]=="FAILED"),
+      "blocked_tasks":sum(1 for t in out if t["status"]=="BLOCKED"),"total_tokens":total_tokens,
       "prompt_tokens":sum(int(m.get("prompt_tokens") or 0) for m in task_metrics),
       "completion_tokens":completion_tokens,"execution_seconds":round(execution_seconds,3),
       "wall_clock_seconds":round(workflow_seconds,3),
@@ -1587,7 +2104,7 @@ class Handler(SimpleHTTPRequestHandler):
             if self.path in ("/api/users","/api/rbac/profiles"): user=self.authorize("users.manage")
             elif self.path=="/api/admin/email": user=self.authorize("email.manage")
             elif self.path=="/api/admin/settings": user=self.authorize("settings.manage")
-            elif self.path=="/api/models": user=self.authorize("models.manage")
+            elif urlparse(self.path).path.startswith("/api/models"): user=self.authorize("models.manage")
             elif self.path.startswith("/api/workflow-templates"): user=self.authorize("workflow_templates.read")
             elif self.path=="/api/hardware" or urlparse(self.path).path=="/api/hardware/telemetry": user=self.authorize_any("server_stats.read","settings.manage","models.manage")
             elif self.path=="/api/server-stats": user=self.authorize("server_stats.read")
@@ -1632,11 +2149,38 @@ class Handler(SimpleHTTPRequestHandler):
             with db() as conn: rows=conn.execute("SELECT * FROM models ORDER BY updated_at DESC").fetchall()
             models=[]
             for row in rows:
-                item=dict(row); proc=RUNTIMES.get(item["id"])
-                if proc and proc.poll() is None and item["status"]=="STARTING": item["status"]="RUNNING"
-                elif proc and proc.poll() is not None: item["status"]="STOPPED"
+                item=dict(row); item["running"]=model_running(row)
+                if item["running"] and item["status"] in ("STARTING","CONFIGURED","STOPPED"): item["status"]="RUNNING"
+                elif not item["running"] and item["status"] in ("STARTING","RUNNING"): item["status"]="STOPPED"
+                item["runnable"]=item["role"] in RUNNABLE_MODEL_ROLES
+                item["quantization"]=detect_quantization(item["model_path"])
+                item["log_available"]=runtime_log_path(item["id"]).exists()
                 models.append(item)
             return self.json(models)
+        if self.path=="/api/models/files":
+            entries,warnings=model_file_entries()
+            return self.json({"files":entries,"warnings":warnings,"roots":[str(root) for root in configured_model_roots()],
+                              "runtime":str(find_llama_runtime() or ""),"library":str(model_library_dir()),
+                              "minimum_size_mb":MIN_MODEL_MB})
+        if self.path=="/api/models/roots":
+            return self.json({"roots":[str(root) for root in configured_model_roots()],
+                              "managed":json.loads(setting_text("model_roots") or "[]"),
+                              "environment":[raw.strip() for raw in (os.getenv("SKEIN_MODEL_ROOTS","") or "").split(os.pathsep) if raw.strip()],
+                              "defaults":[str(root) for root in DEFAULT_MODEL_ROOTS],"library":str(model_library_dir())})
+        if self.path=="/api/models/downloads": return self.json({"downloads":list_downloads()})
+        if urlparse(self.path).path=="/api/models/huggingface/search":
+            query=parse_qs(urlparse(self.path).query)
+            result,status=huggingface_search((query.get("q") or [""])[0],(query.get("limit") or [20])[0])
+            return self.json(result,status)
+        if urlparse(self.path).path=="/api/models/huggingface/files":
+            query=parse_qs(urlparse(self.path).query)
+            result,status=huggingface_repo_files((query.get("repo") or [""])[0])
+            return self.json(result,status)
+        if self.path.startswith("/api/models/") and self.path.endswith("/logs"):
+            mid=self.path.split("/")[-2]
+            with db() as conn: row=conn.execute("SELECT id,name,last_error FROM models WHERE id=?",(mid,)).fetchone()
+            if not row: return self.json({"error":"Model not found"},404)
+            return self.json({"id":mid,"name":row["name"],"last_error":row["last_error"],"log":runtime_log_tail(mid,20000)})
         if self.path=="/api/workflow-templates":
             return self.json(visible_workflow_templates(user["id"],"workflow_templates.manage_all" in user["permissions"]))
         if self.path.startswith("/api/workflow-templates/"):
@@ -1684,8 +2228,19 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path.startswith("/api/workflows/"):
             data=workflow_data(self.path.rsplit("/",1)[-1]); return self.json(data or {"error":"introuvable"},200 if data else 404)
         return super().do_GET()
+    def upload_model_weight(self):
+        """Stream a .gguf upload straight to disk; never buffer multi-gigabyte weights in memory."""
+        user=self.authorize("models.manage")
+        if not user: return
+        try: length=int(self.headers.get("Content-Length",0))
+        except ValueError: return self.json({"error":"Invalid Content-Length header"},400)
+        filename=self.headers.get("X-Skein-Filename") or (parse_qs(urlparse(self.path).query).get("filename") or [""])[0]
+        result,status=store_uploaded_weight(unquote(filename),self.rfile,length)
+        return self.json(result,status)
+
     def do_POST(self):
         global EXECUTION_MODE
+        if urlparse(self.path).path=="/api/models/upload": return self.upload_model_weight()
         try: body=json.loads(self.rfile.read(int(self.headers.get("Content-Length",0))) or b"{}")
         except json.JSONDecodeError: return self.json({"error":"JSON invalide"},400)
         if self.path=="/api/auth/register":
@@ -1900,23 +2455,59 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path=="/api/models/autoload":
             result,status=autoload_models(); return self.json(result,status)
         if self.path=="/api/models/discover":
-            discovered=discover_local_models(True); return self.json({"discovered":discovered,"count":len(discovered)})
+            return self.json(discover_local_models(True))
+        if self.path=="/api/models/roots":
+            roots=body.get("roots")
+            if not isinstance(roots,list): return self.json({"error":"Send roots as a list of directories"},400)
+            saved=save_model_roots(roots)
+            return self.json({"managed":saved,"roots":[str(root) for root in configured_model_roots()]})
+        if self.path=="/api/models/files/register":
+            result,status=register_model_file(body.get("path"),body.get("role","available"),body.get("pool_id"),
+                                              body.get("name"),body.get("context_size",8192),body.get("runtime_path"))
+            return self.json(result,status)
+        if self.path=="/api/models/huggingface/download":
+            result,status=start_huggingface_download(body.get("repo"),body.get("filename")); return self.json(result,status)
+        if self.path.startswith("/api/models/downloads/") and self.path.endswith("/cancel"):
+            result,status=cancel_download(self.path.split("/")[-2]); return self.json(result,status)
         if self.path in ("/api/stack/start","/api/stack/stop","/api/stack/restart"):
             result,status=supervisor_call(self.path.rsplit("/",1)[-1],"POST"); return self.json(result,status)
         if self.path.startswith("/api/models/") and self.path.endswith("/activate"):
-            mid=self.path.split("/")[-2]; result,status=activate_model(mid,str(body.get("pool_id",body.get("role","workers"))),body.get("role"))
+            mid=self.path.split("/")[-2]
+            result,status=activate_model(mid,(body.get("pool_id") or None),(body.get("role") or None))
             return self.json(result,status)
         if self.path.startswith("/api/models/") and self.path.endswith("/configure"):
-            mid=self.path.split("/")[-2]; result,status=configure_model(mid,body.get("role"),body.get("pool_id"))
+            mid=self.path.split("/")[-2]
+            result,status=configure_model(mid,body.get("role"),body["pool_id"] if "pool_id" in body else UNCHANGED)
             return self.json(result,status)
         if self.path.startswith("/api/models/") and self.path.endswith("/stop"):
-            return self.json(stop_model(self.path.split("/")[-2]))
+            result,status=stop_model(self.path.split("/")[-2]); return self.json(result,status)
         if self.path.startswith("/api/workflows/") and self.path.endswith("/run"):
             return self.json({"started":start_workflow(self.path.split("/")[-2])})
         return self.json({"error":"route inconnue"},404)
 
     def do_DELETE(self):
         parsed=urlparse(self.path)
+        if parsed.path.startswith("/api/models/"):
+            user=self.authorize("models.manage")
+            if not user: return
+            mid=parsed.path.rsplit("/",1)[-1]
+            with db() as conn: row=conn.execute("SELECT * FROM models WHERE id=?",(mid,)).fetchone()
+            if not row: return self.json({"error":"Model not found"},404)
+            if model_running(row): return self.json({"error":"Stop this runtime before unregistering it"},409)
+            delete_weights=(parse_qs(parsed.query).get("delete_file") or ["false"])[0].lower()=="true"
+            removed=False
+            if delete_weights:
+                weights=Path(row["model_path"])
+                # Only ever remove a file Skein itself downloaded or received.
+                if weights.is_file() and str(weights.parent).lower()==str(model_library_dir()).lower():
+                    try: weights.unlink(); removed=True
+                    except OSError as exc: return self.json({"error":"Could not delete the weight file","details":str(exc)},500)
+                else:
+                    return self.json({"error":"Skein only deletes weight files it stores in its own model library",
+                                      "library":str(model_library_dir())},403)
+            with db() as conn: conn.execute("DELETE FROM models WHERE id=?",(mid,))
+            runtime_log_path(mid).unlink(missing_ok=True)
+            return self.json({"deleted":True,"id":mid,"weight_file_removed":removed})
         if parsed.path.startswith("/api/workflow-templates/"):
             user=self.authorize_any("workflow_templates.manage_own","workflow_templates.manage_all")
             if not user: return
@@ -1937,7 +2528,8 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 if __name__=="__main__":
-    init_db(); recover_pending_workflows(); server=ThreadingHTTPServer(("127.0.0.1",int(os.getenv("SKEIN_PORT","8787"))),Handler)
+    init_db(); restore_active_endpoints(); recover_pending_workflows()
+    server=ThreadingHTTPServer(("127.0.0.1",int(os.getenv("SKEIN_PORT","8787"))),Handler)
     print(f"Skein disponible sur http://127.0.0.1:{server.server_port}")
     try: server.serve_forever()
     except KeyboardInterrupt: pass

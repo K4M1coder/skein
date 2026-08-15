@@ -110,9 +110,14 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(configured["role"], "worker")
         self.assertEqual(configured["pool_id"], "workers")
         self.assertGreater(configured["port"], 0)
-        _, activation = self.request(f"/api/models/{created['id']}/activate", {"pool_id":"workers"})
+        # The paths do not exist, so loading must report a failure instead of a silent success.
+        with self.assertRaises(HTTPError) as failed_load:
+            self.request(f"/api/models/{created['id']}/activate", {"pool_id":"workers"})
+        self.assertEqual(failed_load.exception.code, 502)
+        activation = json.load(failed_load.exception)
         self.assertEqual(activation["status"], "CONFIGURED")
         self.assertIn("not found", activation["error"])
+        self.assertEqual(activation["pool_id"], "workers")
 
     def test_pool_telemetry_and_session_continuation(self):
         telemetry = app.pool_telemetry(300)

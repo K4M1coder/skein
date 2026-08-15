@@ -9,6 +9,8 @@ SUITES = (
     "tests.test_workflow_templates",
     "tests.test_manual_workflow_matrix",
     "tests.test_sbom",
+    "tests.test_model_manager",
+    "tests.test_workflow_resilience",
     "tests.test_smoke",
     "tests.test_auth",
 )

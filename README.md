@@ -14,7 +14,9 @@ Development commits are protected by the checks documented in [CONTRIBUTING.md](
 
 - NVIDIA GPU discovery, utilization, VRAM, temperature, and power telemetry.
 - Reasoner, worker, and retrieval pools with explicit GPU assignment.
-- Local `llama.cpp` and compatible model profiles.
+- Local `llama.cpp` and compatible model profiles, loaded and unloaded per GPU pool from the interface.
+- A weight-file library with configurable model roots, Hugging Face search and download, and local upload.
+- Dependency-scoped failure handling: a failed step blocks only its own descendants.
 - Real workflows for code, translation, and general tasks with dependency-aware steps.
 - A reusable workflow-template catalog with validated default, private, and shared DAGs.
 - Per-task tokens, output throughput, duration, average/peak GPU power, and estimated Wh.
@@ -109,7 +111,23 @@ Open [http://127.0.0.1:8787/](http://127.0.0.1:8787/). The header controls resta
 
 Use **Auto-detect and load local models** to discover a local `llama-server.exe` and GGUF model, or register profiles manually. Normal workflows require active reasoner and worker endpoints. Simulation is disabled unless explicitly enabled for development:
 
-The Model Plane also offers **Discover available models**. It scans the supported local model roots, stores discovered GGUF entries in the persistent registry, and lets a Model Manager assign a role and GPU pool before saving, loading, or stopping a runtime. Discovering a model does not load it; loading and stopping always update the persistent runtime state.
+The Model Plane also offers **Discover available models**. It scans the configured model roots, stores discovered GGUF entries in the persistent registry, and lets a Model Manager assign a role and GPU pool before saving, loading, or stopping a runtime. Discovering a model does not load it; loading and stopping always update the persistent runtime state. File discovery never depends on finding a runtime: weights are registered even when no `llama-server` executable is present, and the report states which roots were scanned, how many files were seen, and what was skipped.
+
+### Loading and unloading models manually
+
+Every registered model exposes **Save**, **Load**, **Unload**, **Runtime log**, and **Unregister**. Choose a runnable role (`reasoner`, `worker`, `embedding`, `reranker`) and, optionally, a GPU pool; a model kept as `available` stays in the registry without reserving a port. Leaving the pool on *Unassigned* keeps the stored assignment instead of clearing it. When a pool is selected, the GPUs assigned to it are passed to the runtime through `CUDA_VISIBLE_DEVICES`, which is how a model is pinned to specific GPU nodes.
+
+Runtime output is captured to a per-model log instead of being discarded, so a runtime that fails to start reports the real reason in the interface. Loading returns success only when the process actually started; a saved assignment whose runtime could not start is reported as an error rather than as a load.
+
+Unloading terminates the runtime even when it outlived a previous Skein process: the recorded PID is verified against the running image name before being terminated, so a recycled PID is never killed by mistake. On startup Skein re-attaches to runtimes that are still answering, instead of reporting that no model is loaded.
+
+### Model library, downloads, and uploads
+
+**Available weight files** lists every `.gguf` file under the configured roots with its size, quantization, and registration state, and registers any of them in one action. Model roots are configurable from the interface, or with `SKEIN_MODEL_ROOTS` (path-separated). `SKEIN_RUNTIME_PATHS` adds runtime executables, and `SKEIN_MIN_MODEL_MB` (default 64) sets the size floor below which a file is ignored.
+
+**Download from Hugging Face** searches GGUF repositories, lists the weight files of one repository with sizes and quantization, and downloads a selected file with live progress, cancellation, and resume of an interrupted transfer. Set `SKEIN_HF_TOKEN` (or `HF_TOKEN`) to reach gated repositories. Uploading a local `.gguf` file streams it to disk without buffering it in memory; `SKEIN_MAX_UPLOAD_GB` (default 80) bounds the accepted size. Downloaded and uploaded weights land in Skein's own model library, are registered automatically, and are the only files the **Unregister** action can delete from disk.
+
+Model endpoints are `GET/POST /api/models`, `POST /api/models/discover`, `GET /api/models/files`, `POST /api/models/files/register`, `GET/POST /api/models/roots`, `POST /api/models/{id}/configure`, `POST /api/models/{id}/activate`, `POST /api/models/{id}/stop`, `GET /api/models/{id}/logs`, `DELETE /api/models/{id}`, `GET /api/models/huggingface/search`, `GET /api/models/huggingface/files`, `POST /api/models/huggingface/download`, `GET /api/models/downloads`, `POST /api/models/downloads/{id}/cancel`, and `POST /api/models/upload`. All of them require `models.manage`.
 
 The Execution view reports live runtime state instead of static domain labels. For both reasoner and worker it shows endpoint health, active tasks versus shared task capacity, queued tasks, recent average tokens per second, and recent average execution time. The recap also shows active and queued workflows, current GPU power from `nvidia-smi`, CPU utilization, and used/total RAM. CPU package and RAM watts are read from LibreHardwareMonitor/OpenHardwareMonitor WMI sensors when available. Without those sensors, Skein displays clearly marked estimates: CPU load applied to a logical-core power envelope and used RAM at 0.375 W/GB. Pool charts only contain GPU telemetry after one or more GPUs have been assigned to that pool; unavailable readings are labelled explicitly instead of being fabricated.
 
@@ -126,6 +144,20 @@ python app.py
 - **Local**: native Windows runtimes and PowerShell with real host filesystem access from the workflow artifact directory. The UI requires confirmation before local execution.
 
 Supported sandbox images include Python 3.12, Node.js 22, Java 21, PHP 8.4, and Alpine for shell/HTML workflows.
+
+## Workflow execution and failure handling
+
+A task succeeds when it produced usable content. Self-reported confidence is reporting metadata, never a success criterion: a model that omits `confidence`, returns it as text such as `high`, or reports a low value still completes its task. Values are normalised from numbers, percentages, and common wordings; anything unrecognised is stored as unknown rather than as zero. A low or unknown confidence on a worker task escalates it to the reasoner instead of failing it.
+
+A task fails only when it returned nothing usable — a backend error, an unparsable answer, an empty result, or a failing command or script. Failure is then contained to the branch that depends on it:
+
+- an LLM task that failed is retried; `SKEIN_MAX_TASK_ATTEMPTS` (default 2) bounds the attempts;
+- once attempts are exhausted, only the transitive descendants of the failed task become `BLOCKED`, with the unmet dependency named in their result;
+- independent branches keep running to completion;
+- the `workflow-reporter` always runs last, so the audit covers what succeeded as well as what did not;
+- a task that raises is recorded as a failed task instead of stopping the orchestrator, and an unresolvable dependency blocks its task rather than aborting the run.
+
+A workflow ends `COMPLETED` when every task completed, and `FAILED` when any task failed or was blocked. `summary.failed_tasks` and `summary.blocked_tasks` report the split.
 
 ## Metrics
 
@@ -154,9 +186,13 @@ Queued workflows expose their queue position through the workflow API and Histor
 ```powershell
 python -B -m unittest tests.test_smoke -v
 python -B -m unittest tests.test_auth -v
+python -B -m unittest tests.test_workflow_resilience -v
+python -B -m unittest tests.test_model_manager -v
 python -B tests/sandbox_e2e.py
 python -B tests/live_e2e.py
 ```
+
+Each suite sets its own database path at import time, so suites must be run as separate processes. `python -B tests/run_precommit_tests.py` does this for the full pre-commit set.
 
 The live test requires loaded reasoner and worker endpoints. Sandbox tests require Docker and the runtime images listed above.
 

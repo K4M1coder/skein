@@ -29,6 +29,8 @@ Skein automatically appends a `workflow-reporter` LLM task to every non-chat tem
 
 The reporter is operational metadata, not the user's deliverable. The workflow API therefore exposes the last completed non-reporter result as `final_output` and the reporter result separately as `execution_report`. The Execution and History views present both independently.
 
+A failed task does not cancel the whole graph. Failure propagates along dependency edges only: the transitive descendants of a failed task are marked `BLOCKED` and every independent branch still runs. The reporter depends on every task and therefore always executes last, receiving the completed results, the blocked ones with their unmet dependency, the workflow events, and the execution logs. Task status reflects whether the task produced usable content, not the confidence the model reported about itself.
+
 System templates are seeded for general delivery, software implementation, translation, security-sensitive changes, simple chat, daily assistance, research and synthesis, and specification derived from code. They are shared, immutable, and validated during database initialization.
 
 ## Access rules

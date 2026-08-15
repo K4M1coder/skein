@@ -51,6 +51,8 @@ Reference documentation consulted during the audit: [Claude Desktop](https://doc
 ### Administration
 
 - User and profile management, execution policy, email, server statistics, hardware, and models are grouped into separate surfaces.
+- The model surfaces are ordered by intent: the registry and its runtime controls, then the local weight-file library, then remote acquisition from Hugging Face.
+- The model registry refreshes only when the server state actually changes, so periodic polling never discards a role or pool selection in progress. An edited row is marked until it is saved, and every load, unload, save, and removal reports its outcome in the incident panel rather than failing silently.
 - Forms use responsive grids on desktop and a single-column layout on narrow screens.
 - Administrative buttons use a consistent primary action treatment instead of browser defaults.
 

@@ -51,6 +51,15 @@ class AuthTest(unittest.TestCase):
         with client.open(request, timeout=10) as response:
             return response.status, json.load(response)
 
+    def wait_for_workflow(self, client, workflow_id, timeout=40):
+        """Each workflow gets its own budget: a shared deadline makes the second wait flaky."""
+        deadline = time.time() + timeout
+        while True:
+            _, data = self.request(client, f"/api/workflows/{workflow_id}")
+            if data["workflow"]["status"] in ("COMPLETED", "FAILED") or time.time() >= deadline:
+                return data
+            time.sleep(0.1)
+
     def test_history_deletion_respects_owner_and_global_permissions(self):
         admin = self.client()
         _, admin_session = self.request(admin, "/api/auth/login", {"username": "admin", "password": "admin-test-password"})
@@ -157,12 +166,7 @@ class AuthTest(unittest.TestCase):
         with self.assertRaises(HTTPError) as continuation_denied:
             self.request(admin, "/api/workflows", {"objective": "Attempt to access another user's session", "continue_workflow_id": workflow["id"]})
         self.assertEqual(continuation_denied.exception.code, 403)
-        deadline = time.time() + 15
-        while time.time() < deadline:
-            _, workflow_data = self.request(user, f"/api/workflows/{workflow['id']}")
-            if workflow_data["workflow"]["status"] in ("COMPLETED", "FAILED"):
-                break
-            time.sleep(0.1)
+        workflow_data = self.wait_for_workflow(user, workflow["id"])
         self.assertEqual(workflow_data["workflow"]["status"], "COMPLETED")
         _, continuation = self.request(user, "/api/workflows", {"objective": "Continue my own session", "continue_workflow_id": workflow["id"]})
         with app.db() as conn:
@@ -170,11 +174,7 @@ class AuthTest(unittest.TestCase):
             continued = conn.execute("SELECT session_id,continued_from FROM workflows WHERE id=?", (continuation["id"],)).fetchone()
         self.assertEqual(continued["session_id"], source_session)
         self.assertEqual(continued["continued_from"], workflow["id"])
-        while time.time() < deadline:
-            _, continuation_data = self.request(user, f"/api/workflows/{continuation['id']}")
-            if continuation_data["workflow"]["status"] in ("COMPLETED", "FAILED"):
-                break
-            time.sleep(0.1)
+        continuation_data = self.wait_for_workflow(user, continuation["id"])
         self.assertEqual(continuation_data["workflow"]["status"], "COMPLETED")
         _, user_runs = self.request(user, "/api/workflows")
         self.assertEqual([row["id"] for row in user_runs], [continuation["id"], workflow["id"]])

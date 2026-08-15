@@ -66,11 +66,13 @@
       document.querySelector(".stack-bar").insertAdjacentHTML("afterbegin", `<div class="user-bar"><span>${t("signedInAs")} <b>${session.user.username}</b> · ${session.user.profiles.map(profile=>profile.name).join(", ")}</span>${languageControl()}<button id="logout">${t("signOut")}</button></div>`);
       const language = document.querySelector("#language-choice"); language.value=window.skeinI18n.selected; language.onchange=()=>window.skeinI18n.set(language.value);
       document.querySelector("#logout").onclick=async()=>{await request("/api/auth/logout",{method:"POST",body:"{}"});location.reload();};
-      document.querySelector(".runtime-gate").classList.toggle("permission-hidden",!can("models.manage")); document.querySelector(".hardware").classList.toggle("permission-hidden",!session.user.permissions.some(permission=>["server_stats.read","settings.manage","models.manage"].includes(permission))); document.querySelector(".model-control").classList.toggle("permission-hidden",!can("models.manage")); document.querySelectorAll("[data-stack]").forEach(x=>x.classList.toggle("permission-hidden",!can("settings.manage")));
+      document.querySelector(".runtime-gate").classList.toggle("permission-hidden",!can("models.manage")); document.querySelector(".hardware").classList.toggle("permission-hidden",!session.user.permissions.some(permission=>["server_stats.read","settings.manage","models.manage"].includes(permission))); document.querySelectorAll(".model-control,.model-files,.model-hub").forEach(section=>section.classList.toggle("permission-hidden",!can("models.manage"))); document.querySelectorAll("[data-stack]").forEach(x=>x.classList.toggle("permission-hidden",!can("settings.manage")));
       if(administrationAccess) await renderAdmin(session);
       window.skeinNavigation.init(session);
       await window.skeinWorkflowTemplates.init(session);
-      const script=document.createElement("script"); script.src="/app.js?v=13"; document.body.appendChild(script);
+      const script=document.createElement("script"); script.src="/app.js?v=14"; document.body.appendChild(script);
+      // The model manager depends on app.js helpers, so it must load after it.
+      script.onload=()=>{const manager=document.createElement("script"); manager.src="/model-manager.js?v=1"; document.body.appendChild(manager);};
     } catch (error) { showLogin(); }
   };
   addEventListener("DOMContentLoaded", boot);

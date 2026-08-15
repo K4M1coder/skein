@@ -6,6 +6,7 @@
   <title>Skein</title>
   <link rel="stylesheet" href="/style.css">
   <link rel="stylesheet" href="/control.css?v=4">
+  <link rel="stylesheet" href="/model-manager.css?v=1">
   <link rel="stylesheet" href="/runtime.css">
   <style>.telemetry-unavailable{display:block;min-height:28px;padding:7px 0;color:var(--muted);font-size:11px}</style>
   <link rel="stylesheet" href="/incidents.css">
@@ -94,7 +95,40 @@
         <input name="runtime_path" placeholder="C:\...\llama-server.exe" required><input name="model_path" placeholder="D:\models\model.gguf" required>
         <input name="context_size" type="number" value="32768"><input name="port" type="number" value="8001"><button data-i18n="save">Save</button>
       </form>
+      <p id="discovery-report" class="discovery-report"></p><ul id="discovery-warnings" class="discovery-warnings"></ul>
       <div id="model-list" class="model-list"></div>
+    </section>
+    <section class="model-files workspace">
+      <div class="head"><div><p class="eyebrow" data-i18n="modelLibrary">MODEL LIBRARY</p><h2 data-i18n="modelFileExplorer">Available weight files</h2></div><div><button class="outline" id="refresh-model-files" data-i18n="refresh">Refresh</button></div></div>
+      <p id="model-file-summary" class="discovery-report"></p>
+      <details class="model-roots"><summary data-i18n="modelRoots">Model directories</summary>
+        <ul id="model-root-list" class="root-list"></ul>
+        <form id="model-roots-form">
+          <label for="model-roots-input" data-i18n="managedRoots">Additional directories, one per line</label>
+          <textarea id="model-roots-input" rows="3" data-i18n-placeholder="modelRootsPlaceholder" placeholder="D:\models"></textarea>
+          <small><span data-i18n="environmentRoots">From environment</span>: <span id="model-roots-environment"></span></small>
+          <button type="submit" data-i18n="save">Save</button>
+        </form>
+      </details>
+      <ul id="model-file-warnings" class="discovery-warnings"></ul>
+      <input id="model-file-filter" data-i18n-placeholder="filterWeightFiles" placeholder="Filter by name or quantization" autocomplete="off">
+      <div id="model-file-list" class="model-file-list"></div>
+      <form id="model-upload-form" class="upload-form">
+        <label for="model-upload-file" data-i18n="uploadWeights">Upload a .gguf file</label>
+        <input id="model-upload-file" type="file" accept=".gguf" required>
+        <button type="submit" data-i18n="upload">Upload</button>
+        <small id="model-upload-state"></small>
+      </form>
+    </section>
+    <section class="model-hub workspace">
+      <div class="head"><div><p class="eyebrow" data-i18n="modelHub">MODEL HUB</p><h2 data-i18n="huggingFaceDownload">Download from Hugging Face</h2></div><small id="hf-auth-state"></small></div>
+      <form id="hf-search-form" class="hf-search">
+        <input id="hf-query" data-i18n-placeholder="huggingFacePlaceholder" placeholder="Search GGUF repositories" autocomplete="off" required>
+        <button type="submit" data-i18n="search">Search</button>
+      </form>
+      <div id="hf-results" class="hf-results"></div>
+      <div id="hf-repo-files" class="hf-repo-files"></div>
+      <div id="download-list" class="download-list"></div>
     </section>
     <section class="workspace">
       <div class="head"><div><p class="eyebrow" data-i18n="activeWorkflow">ACTIVE WORKFLOW</p><h2 id="title" data-i18n="noWorkflowSelected">No workflow selected</h2></div><div id="status" class="pill">IDLE</div></div>
