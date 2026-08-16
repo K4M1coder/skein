@@ -58,7 +58,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS pools(
           id TEXT PRIMARY KEY, name TEXT NOT NULL, domain TEXT NOT NULL, color TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS gpu_assignments(
-          gpu_id TEXT PRIMARY KEY, pool_id TEXT, updated_at REAL NOT NULL);
+          gpu_id TEXT NOT NULL, pool_id TEXT NOT NULL, updated_at REAL NOT NULL, PRIMARY KEY(gpu_id,pool_id));
         CREATE TABLE IF NOT EXISTS pool_telemetry(
           id INTEGER PRIMARY KEY AUTOINCREMENT, created_at REAL NOT NULL, pool_id TEXT NOT NULL, domain TEXT NOT NULL,
           assigned_gpus INTEGER NOT NULL, utilization REAL, power_w REAL, memory_used_mb REAL, memory_total_mb REAL, temperature_c REAL);
@@ -124,6 +124,14 @@ def init_db():
         for column,definition in (("action_type","TEXT NOT NULL DEFAULT 'llm'"),("action_config","TEXT NOT NULL DEFAULT '{}'"),("system_prompt","TEXT NOT NULL DEFAULT ''"),("output_format","TEXT NOT NULL DEFAULT 'markdown'"),("output_schema","TEXT NOT NULL DEFAULT ''")):
             if column not in task_columns: conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} {definition}")
         if "storage_id" not in session_columns: conn.execute("ALTER TABLE sessions ADD COLUMN storage_id TEXT")
+        gpu_assignment_pk=[row["name"] for row in conn.execute("PRAGMA table_info(gpu_assignments)") if row["pk"]]
+        if gpu_assignment_pk==["gpu_id"]:
+            # A single physical GPU commonly serves every pool at once (reasoner, worker, and
+            # retrieval sharing the only card); the old schema only ever let it belong to one.
+            conn.execute("ALTER TABLE gpu_assignments RENAME TO gpu_assignments_legacy")
+            conn.execute("CREATE TABLE gpu_assignments(gpu_id TEXT NOT NULL, pool_id TEXT NOT NULL, updated_at REAL NOT NULL, PRIMARY KEY(gpu_id,pool_id))")
+            conn.execute("INSERT INTO gpu_assignments(gpu_id,pool_id,updated_at) SELECT gpu_id,pool_id,updated_at FROM gpu_assignments_legacy WHERE pool_id IS NOT NULL")
+            conn.execute("DROP TABLE gpu_assignments_legacy")
         for session in conn.execute("SELECT token FROM sessions WHERE storage_id IS NULL OR storage_id='' ").fetchall():
             conn.execute("UPDATE sessions SET storage_id=? WHERE token=?",(str(uuid.uuid4()),session["token"]))
         conn.execute("UPDATE users SET verified_at=created_at WHERE verified_at IS NULL AND email IS NULL")
@@ -489,6 +497,27 @@ def windows_video_controllers():
     return rows
 
 
+KV_CACHE_FRACTION_PER_4K_CONTEXT=0.03
+MODEL_COMPUTE_BUFFER_MB=350
+VRAM_ESTIMATION_METHOD=(
+  "Per-model VRAM is not measurable on this system: nvidia-smi reports no per-process "
+  "utilization or memory on Windows GeForce (WDDM) drivers, unlike Linux datacenter cards "
+  "in TCC mode. This is an estimate — GGUF file size (the weights fully offloaded with "
+  "-ngl 999) plus ~3% of that size per 4096 tokens of configured context (a rough KV-cache "
+  "proxy) plus a fixed 350 MB compute-buffer allowance. Actual usage varies by architecture, "
+  "batch size, and quantization; when a pool spans several GPUs the same running model is "
+  "not split between them.")
+
+
+def estimate_model_vram_mb(model):
+    """Rough per-model VRAM footprint from GGUF file size and context; see VRAM_ESTIMATION_METHOD."""
+    try: file_mb = Path(model["model_path"]).stat().st_size/1048576
+    except OSError: return None
+    context = int(model["context_size"] or 4096)
+    kv_estimate_mb = (context/4096) * (file_mb * KV_CACHE_FRACTION_PER_4K_CONTEXT)
+    return round(file_mb + kv_estimate_mb + MODEL_COMPUTE_BUFFER_MB, 1)
+
+
 def hardware_snapshot():
     gpus = nvidia_gpus(); known = {g["name"] for g in gpus}
     for pos, item in enumerate(windows_video_controllers()):
@@ -502,15 +531,45 @@ def hardware_snapshot():
           "utilization": None, "power_w": None, "power_limit_w": None, "temperature_c": None,
           "metrics_source": "Windows inventory"})
     with db() as conn:
-        assignments = {r["gpu_id"]: r["pool_id"] for r in conn.execute("SELECT * FROM gpu_assignments")}
+        # A GPU can serve several pools at once (one card running reasoner, worker, and
+        # retrieval together is the common single-GPU case), so this is many-to-many.
+        assignments = {}
+        for row in conn.execute("SELECT gpu_id, pool_id FROM gpu_assignments"):
+            assignments.setdefault(row["gpu_id"], []).append(row["pool_id"])
         pools = [dict(r) for r in conn.execute("SELECT * FROM pools ORDER BY rowid")]
-    for gpu in gpus: gpu["pool_id"] = assignments.get(gpu["id"])
+        running_by_pool = {row["pool_id"]: row["count"] for row in conn.execute(
+          "SELECT pool_id, COUNT(*) AS count FROM models WHERE status='RUNNING' AND pool_id IS NOT NULL GROUP BY pool_id")}
+        running_models = [dict(r) for r in conn.execute(
+          "SELECT id,name,role,pool_id,model_path,context_size FROM models WHERE status='RUNNING'")]
+    for gpu in gpus: gpu["pool_ids"] = assignments.get(gpu["id"], [])
+    gpus_by_pool = {}
+    for gpu in gpus:
+        for pool_id in gpu["pool_ids"]: gpus_by_pool.setdefault(pool_id, []).append(gpu)
+    estimated_by_gpu = {gpu["id"]: [] for gpu in gpus}
+    # A model can be running without a pool assignment at all (loaded before ever picking
+    # one); with exactly one physical GPU that is unambiguous, so it still gets attributed
+    # there — but only once that lone GPU actually belongs to a pool. A GPU checked into no
+    # pool at all is "not part of this monitoring", full stop; showing an estimate on it
+    # anyway would contradict that operator action.
+    lone_assigned_gpu = [gpus[0]] if len(gpus)==1 and gpus[0]["pool_ids"] else []
+    for model in running_models:
+        estimate_mb = estimate_model_vram_mb(model)
+        if estimate_mb is None: continue
+        target_gpus = gpus_by_pool.get(model["pool_id"]) if model["pool_id"] else lone_assigned_gpu
+        for gpu in target_gpus or []:
+            estimated_by_gpu[gpu["id"]].append({"model_id":model["id"],"name":model["name"],"role":model["role"],"estimated_vram_mb":estimate_mb})
+    for gpu in gpus:
+        gpu["estimated_models"] = estimated_by_gpu.get(gpu["id"], [])
+        gpu["vram_estimation_method"] = VRAM_ESTIMATION_METHOD if gpu["estimated_models"] else None
     cpu_script = "(Get-CimInstance Win32_Processor | Measure-Object LoadPercentage -Average).Average"
     try: cpu = float(run_text(["powershell","-NoProfile","-Command",cpu_script],6) or 0)
     except ValueError: cpu = None
     pool_metrics=[]
     for pool in pools:
-        members=[gpu for gpu in gpus if gpu.get("pool_id")==pool["id"]]
+        # Shared-GPU attribution: a card serving three pools reports its full load under
+        # each one, matching the same "shared activity may be attributed more than once"
+        # principle already used for per-task energy estimates.
+        members=[gpu for gpu in gpus if pool["id"] in gpu.get("pool_ids",())]
         values=lambda field:[float(gpu[field]) for gpu in members if gpu.get(field) is not None]
         utilization=values("utilization"); temperatures=values("temperature_c")
         pool_metrics.append({"pool_id":pool["id"],"name":pool["name"],"domain":pool["domain"],"color":pool["color"],"assigned_gpus":len(members),
@@ -518,7 +577,10 @@ def hardware_snapshot():
           "power_w":round(sum(values("power_w")),2) if members else 0,
           "memory_used_mb":round(sum(values("memory_used_mb")),2),"memory_total_mb":round(sum(values("memory_total_mb")),2),
           "temperature_c":round(sum(temperatures)/len(temperatures),2) if temperatures else None,
-          "gpu_ids":[gpu["id"] for gpu in members]})
+          "gpu_ids":[gpu["id"] for gpu in members],
+          # A model can run in this pool (its process is live, using whatever GPU the driver
+          # picks) even though no GPU is assigned here; surface that gap instead of a silent 0.
+          "running_models":running_by_pool.get(pool["id"],0)})
     return {"node":{"name":os.environ.get("COMPUTERNAME","local-node"),"cpu_utilization":cpu,
       "gpu_power_w":round(sum(g["power_w"] or 0 for g in gpus),1),"gpu_count":len(gpus)},
       "gpus":gpus,"pools":pools,"pool_metrics":pool_metrics,"timestamp":stamp()}
@@ -2439,12 +2501,21 @@ class Handler(SimpleHTTPRequestHandler):
             with db() as conn: conn.execute("INSERT INTO pools VALUES(?,?,?,?)",(pid,name,domain,color))
             return self.json({"id":pid,"name":name,"domain":domain,"color":color},201)
         if self.path.startswith("/api/gpus/") and self.path.endswith("/assign"):
+            # A GPU may belong to several pools at once (one card serving reasoner, worker,
+            # and retrieval together), so this toggles a single (gpu, pool) membership rather
+            # than replacing the whole assignment.
             gpu_id=unquote(self.path[len("/api/gpus/"):-len("/assign")].rstrip("/"))
             pool_id=body.get("pool_id")
+            assigned=bool(body.get("assigned",True))
+            if not pool_id: return self.json({"error":"pool_id requis"},400)
             with db() as conn:
-                if pool_id and not conn.execute("SELECT 1 FROM pools WHERE id=?",(pool_id,)).fetchone(): return self.json({"error":"pool introuvable"},404)
-                conn.execute("INSERT INTO gpu_assignments VALUES(?,?,?) ON CONFLICT(gpu_id) DO UPDATE SET pool_id=excluded.pool_id,updated_at=excluded.updated_at",(gpu_id,pool_id,stamp()))
-            return self.json({"gpu_id":gpu_id,"pool_id":pool_id})
+                if not conn.execute("SELECT 1 FROM pools WHERE id=?",(pool_id,)).fetchone(): return self.json({"error":"pool introuvable"},404)
+                if assigned:
+                    conn.execute("INSERT INTO gpu_assignments(gpu_id,pool_id,updated_at) VALUES(?,?,?) ON CONFLICT(gpu_id,pool_id) DO UPDATE SET updated_at=excluded.updated_at",(gpu_id,pool_id,stamp()))
+                else:
+                    conn.execute("DELETE FROM gpu_assignments WHERE gpu_id=? AND pool_id=?",(gpu_id,pool_id))
+                pool_ids=[row[0] for row in conn.execute("SELECT pool_id FROM gpu_assignments WHERE gpu_id=? ORDER BY pool_id",(gpu_id,))]
+            return self.json({"gpu_id":gpu_id,"pool_ids":pool_ids})
         if self.path=="/api/models":
             required=("name","role","backend","model_path","runtime_path")
             if any(not str(body.get(k,"")).strip() for k in required): return self.json({"error":"nom, rôle, backend et chemins requis"},400)

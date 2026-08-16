@@ -39,6 +39,46 @@ class FrontendLocalizationTest(unittest.TestCase):
         self.assertIn(".model-form,.model-row{grid-template-columns:1fr}", styles)
         self.assertIn(".model-row>*{min-width:0}", styles)
 
+    def test_a_gpu_card_offers_one_checkbox_per_pool_without_losing_a_toggle_to_polling(self):
+        """A single GPU commonly serves every pool at once (reasoner, worker, and retrieval
+        sharing one card), so the GPU card must not force an exclusive pool choice. It must
+        also survive the 2.5s poll: loadHardware() used to overwrite a just-picked assignment
+        with stale data mid-request (same class of bug already fixed once for the model list),
+        so each (gpu,pool) toggle keeps its own pending draft until the request settles."""
+        feature_source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("gpu-pool-check", feature_source)
+        self.assertIn("data-gpu=\"${encodeURIComponent(gpu.id)}\" data-pool=\"${pool.id}\"", feature_source)
+        self.assertIn("assigned:checked", feature_source)
+        self.assertNotIn("<select data-gpu=", feature_source)
+        self.assertIn("gpuDrafts", feature_source)
+        self.assertIn("gpuDrafts.set(key,checked)", feature_source)
+        self.assertIn("gpuDrafts.delete(key)", feature_source)
+        self.assertIn("catch(error){showError(error,tr('hardwareControlPlane'))}", feature_source)
+
+    def test_pool_telemetry_charts_are_interactive_and_freeze_on_hover(self):
+        """Each metric gets gridlines, an end-value label, and a hover crosshair/tooltip
+        instead of a bare polyline; a poll must not rebuild a chart the operator is
+        actively reading, or the tooltip would flicker away mid-hover."""
+        feature_source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        for marker in ("telemetry-grid", "telemetry-tooltip", "telemetry-crosshair", "telemetry-end-dot",
+                       "telemetryHovered", "pointerenter", "pointermove", "pointerleave"):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, feature_source)
+        self.assertIn("if(!target||telemetryHovered)return", feature_source)
+        styles = (ROOT / "static" / "control.css").read_text(encoding="utf-8")
+        self.assertIn(".telemetry-grid-2", styles)
+        self.assertIn(".telemetry-tooltip", styles)
+
+    def test_vram_estimate_discloses_its_method(self):
+        """Per-model VRAM is an estimate (no per-process nvidia-smi data on this stack), so
+        the breakdown must carry its disclosure as a visible affordance, not just a code comment."""
+        feature_source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("renderVramEstimate", feature_source)
+        self.assertIn("gpu.vram_estimation_method", feature_source)
+        self.assertIn("estimatedVramByModel", feature_source)
+        styles = (ROOT / "static" / "control.css").read_text(encoding="utf-8")
+        self.assertIn(".vram-estimate", styles)
+
     def test_legacy_dom_translation_scanner_is_removed(self):
         self.assertNotIn("TreeWalker", self.catalog_source)
         self.assertNotIn("MutationObserver", self.catalog_source)
@@ -64,6 +104,21 @@ class FrontendLocalizationTest(unittest.TestCase):
         self.assertIn('/api/workflow-templates/generate', manager)
         self.assertIn('executionPayload()', manager)
         self.assertIn('planning_mode', manager)
+
+    def test_administration_is_grouped_into_domain_submenu(self):
+        navigation = (ROOT / "static" / "navigation.js").read_text(encoding="utf-8")
+        auth = (ROOT / "static" / "auth.js").read_text(encoding="utf-8")
+        shell = (ROOT / "static" / "shell.css").read_text(encoding="utf-8")
+        for domain in ("access", "policy", "email", "stats", "hardware", "models"):
+            with self.subTest(domain=domain):
+                self.assertIn(f'key: "{domain}"', navigation)
+        self.assertIn("data-admin-view", navigation)
+        self.assertIn("sub-navigation", navigation)
+        for cls in ("admin-access", "admin-policy", "admin-email", "admin-stats"):
+            with self.subTest(cls=cls):
+                self.assertIn(f'"{cls}"', auth)
+        self.assertNotIn('id="rbac-users"></div><div id="rbac-settings">', auth)
+        self.assertIn(".sub-navigation", shell)
 
     def test_workflow_editor_has_live_graph_preview(self):
         markup = (ROOT / "static" / "index.html").read_text(encoding="utf-8")

@@ -99,9 +99,20 @@ class SmokeTest(unittest.TestCase):
         self.assertIn("gpus", hardware)
         self.assertGreaterEqual(len(hardware["pools"]), 3)
         if hardware["gpus"]:
+            # A GPU can belong to several pools at once (one card commonly serves reasoner,
+            # worker, and retrieval together), so assigning a second pool must add to the set.
             gpu_id = quote(hardware["gpus"][0]["id"], safe="")
-            _, assigned = self.request(f"/api/gpus/{gpu_id}/assign", {"pool_id": "reasoner"})
-            self.assertEqual(assigned["pool_id"], "reasoner")
+            _, assigned = self.request(f"/api/gpus/{gpu_id}/assign", {"pool_id": "reasoner", "assigned": True})
+            self.assertEqual(assigned["pool_ids"], ["reasoner"])
+            _, assigned = self.request(f"/api/gpus/{gpu_id}/assign", {"pool_id": "workers", "assigned": True})
+            self.assertEqual(sorted(assigned["pool_ids"]), ["reasoner", "workers"])
+            _, assigned = self.request(f"/api/gpus/{gpu_id}/assign", {"pool_id": "reasoner", "assigned": False})
+            self.assertEqual(assigned["pool_ids"], ["workers"])
+            # Leave the GPU unassigned again: the later assertion in this same test expects
+            # the "workers" pool to have no GPU, to prove a running model without one is
+            # still surfaced correctly.
+            _, assigned = self.request(f"/api/gpus/{gpu_id}/assign", {"pool_id": "workers", "assigned": False})
+            self.assertEqual(assigned["pool_ids"], [])
         status, created = self.request("/api/models", {"name":"Reasoner test","role":"reasoner",
           "backend":"llama.cpp","model_path":"Z:/missing/model.gguf",
           "runtime_path":"Z:/missing/llama-server.exe","context_size":32768,"port":18001})
@@ -118,6 +129,123 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(activation["status"], "CONFIGURED")
         self.assertIn("not found", activation["error"])
         self.assertEqual(activation["pool_id"], "workers")
+
+        # A model can be RUNNING in a pool that has no GPU assigned to it (the runtime
+        # started without CUDA_VISIBLE_DEVICES); the hardware snapshot must surface that
+        # gap instead of silently reporting the pool as empty.
+        with app.db() as conn:
+            conn.execute("UPDATE models SET status='RUNNING' WHERE id=?", (created["id"],))
+        _, hardware_after = self.request("/api/hardware")
+        workers_metrics = next(pool for pool in hardware_after["pool_metrics"] if pool["pool_id"] == "workers")
+        self.assertEqual(workers_metrics["assigned_gpus"], 0)
+        self.assertEqual(workers_metrics["running_models"], 1)
+
+    def test_a_gpu_can_serve_every_pool_at_once(self):
+        """The common single-GPU setup: one card runs reasoner, worker, and retrieval
+        together. Each pool must report the card's full telemetry, not a zero-sum split."""
+        fake_gpu = {"id": "GPU-smoke-fake", "index": 0, "vendor": "NVIDIA", "name": "Fake GPU",
+          "memory_total_mb": 24576.0, "memory_used_mb": 12000.0, "utilization": 42.0,
+          "power_w": 210.0, "power_limit_w": 350.0, "temperature_c": 57.0, "metrics_source": "nvidia-smi"}
+        original = app.nvidia_gpus
+        app.nvidia_gpus = lambda: [dict(fake_gpu)]
+        try:
+            gpu_id = quote(fake_gpu["id"], safe="")
+            for pool in ("reasoner", "workers", "retrieval"):
+                status, assigned = self.request(f"/api/gpus/{gpu_id}/assign", {"pool_id": pool, "assigned": True})
+                self.assertEqual(status, 200)
+            self.assertEqual(sorted(assigned["pool_ids"]), ["reasoner", "retrieval", "workers"])
+            _, hardware = self.request("/api/hardware")
+            by_pool = {row["pool_id"]: row for row in hardware["pool_metrics"]}
+            for pool in ("reasoner", "workers", "retrieval"):
+                self.assertEqual(by_pool[pool]["assigned_gpus"], 1)
+                self.assertEqual(by_pool[pool]["power_w"], 210.0)
+                self.assertEqual(by_pool[pool]["utilization"], 42.0)
+            _, unassigned = self.request(f"/api/gpus/{gpu_id}/assign", {"pool_id": "retrieval", "assigned": False})
+            self.assertEqual(sorted(unassigned["pool_ids"]), ["reasoner", "workers"])
+            _, hardware = self.request("/api/hardware")
+            by_pool = {row["pool_id"]: row for row in hardware["pool_metrics"]}
+            self.assertEqual(by_pool["retrieval"]["assigned_gpus"], 0)
+            self.assertEqual(by_pool["reasoner"]["assigned_gpus"], 1)
+        finally:
+            app.nvidia_gpus = original
+            with app.db() as conn: conn.execute("DELETE FROM gpu_assignments WHERE gpu_id=?", (fake_gpu["id"],))
+
+    def test_estimated_vram_by_model_is_labeled_and_disappears_when_nothing_runs(self):
+        """Per-process VRAM cannot be measured (no nvidia-smi per-process data on Windows
+        GeForce/WDDM), so the estimate must carry its method disclosure and vanish once no
+        model is actually running there — never a stray note on an idle GPU."""
+        fake_gpu = {"id": "GPU-vram-smoke", "index": 0, "vendor": "NVIDIA", "name": "Fake GPU",
+          "memory_total_mb": 24576.0, "memory_used_mb": 4000.0, "utilization": 5.0,
+          "power_w": 40.0, "power_limit_w": 350.0, "temperature_c": 45.0, "metrics_source": "nvidia-smi"}
+        original = app.nvidia_gpus
+        app.nvidia_gpus = lambda: [dict(fake_gpu)]
+        weight = Path(tempfile.gettempdir()) / f"skein-vram-smoke-{os.getpid()}.gguf"
+        weight.write_bytes(b"\0" * 10_000_000)
+        try:
+            gpu_id = quote(fake_gpu["id"], safe="")
+            self.request(f"/api/gpus/{gpu_id}/assign", {"pool_id": "workers", "assigned": True})
+            status, created = self.request("/api/models", {"name": "VRAM estimate test", "role": "worker",
+              "backend": "llama.cpp", "model_path": str(weight), "runtime_path": "Z:/missing/llama-server.exe",
+              "context_size": 8192, "port": 18099})
+            self.assertEqual(status, 201)
+            self.request(f"/api/models/{created['id']}/configure", {"role": "worker", "pool_id": "workers"})
+            with app.db() as conn: conn.execute("UPDATE models SET status='RUNNING' WHERE id=?", (created["id"],))
+            _, hardware = self.request("/api/hardware")
+            gpu = next(row for row in hardware["gpus"] if row["id"] == fake_gpu["id"])
+            self.assertEqual(len(gpu["estimated_models"]), 1)
+            self.assertEqual(gpu["estimated_models"][0]["name"], "VRAM estimate test")
+            self.assertGreater(gpu["estimated_models"][0]["estimated_vram_mb"], 0)
+            self.assertIn("estimate", gpu["vram_estimation_method"].lower())
+            self.assertIn("nvidia-smi", gpu["vram_estimation_method"])
+            with app.db() as conn: conn.execute("UPDATE models SET status='STOPPED' WHERE id=?", (created["id"],))
+            _, hardware = self.request("/api/hardware")
+            gpu = next(row for row in hardware["gpus"] if row["id"] == fake_gpu["id"])
+            self.assertEqual(gpu["estimated_models"], [])
+            self.assertIsNone(gpu["vram_estimation_method"])
+        finally:
+            app.nvidia_gpus = original
+            with app.db() as conn: conn.execute("DELETE FROM gpu_assignments WHERE gpu_id=?", (fake_gpu["id"],))
+            weight.unlink(missing_ok=True)
+
+    def test_a_pool_less_running_model_is_still_estimated_on_a_lone_gpu(self):
+        """A model can be running without ever having picked a pool. With exactly one
+        physical GPU that belongs to some pool, that is unambiguous and must still be
+        estimated; with several GPUs there is no honest way to guess which one, so it
+        must be left out; and a lone GPU assigned to no pool at all must show nothing,
+        since the operator has explicitly said it is not part of any monitored pool."""
+        gpu_a = {"id": "GPU-lone-a", "index": 0, "vendor": "NVIDIA", "name": "A",
+          "memory_total_mb": 24576.0, "memory_used_mb": 1000.0, "utilization": 5.0,
+          "power_w": 40.0, "power_limit_w": 350.0, "temperature_c": 40.0, "metrics_source": "nvidia-smi"}
+        gpu_b = {**gpu_a, "id": "GPU-lone-b", "index": 1, "name": "B"}
+        original_gpus, original_windows = app.nvidia_gpus, app.windows_video_controllers
+        app.windows_video_controllers = lambda: []  # isolate from this machine's own real GPU
+        weight = Path(tempfile.gettempdir()) / f"skein-vram-lone-{os.getpid()}.gguf"
+        weight.write_bytes(b"\0" * 5_000_000)
+        try:
+            status, created = self.request("/api/models", {"name": "Pool-less model", "role": "worker",
+              "backend": "llama.cpp", "model_path": str(weight), "runtime_path": "Z:/missing/llama-server.exe",
+              "context_size": 4096, "port": 18098})
+            self.assertEqual(status, 201)
+            with app.db() as conn: conn.execute("UPDATE models SET status='RUNNING' WHERE id=?", (created["id"],))
+
+            app.nvidia_gpus = lambda: [dict(gpu_a)]
+            _, hardware = self.request("/api/hardware")
+            self.assertEqual(hardware["gpus"][0]["estimated_models"], [],
+              "a lone GPU assigned to no pool must show no estimate at all")
+
+            gpu_id = quote(gpu_a["id"], safe="")
+            self.request(f"/api/gpus/{gpu_id}/assign", {"pool_id": "workers", "assigned": True})
+            _, hardware = self.request("/api/hardware")
+            self.assertEqual([m["name"] for m in hardware["gpus"][0]["estimated_models"]], ["Pool-less model"])
+
+            app.nvidia_gpus = lambda: [dict(gpu_a), dict(gpu_b)]
+            _, hardware = self.request("/api/hardware")
+            for gpu in hardware["gpus"]:
+                self.assertEqual(gpu["estimated_models"], [])
+        finally:
+            app.nvidia_gpus, app.windows_video_controllers = original_gpus, original_windows
+            with app.db() as conn: conn.execute("DELETE FROM gpu_assignments WHERE gpu_id=?", (gpu_a["id"],))
+            weight.unlink(missing_ok=True)
 
     def test_pool_telemetry_and_session_continuation(self):
         telemetry = app.pool_telemetry(300)

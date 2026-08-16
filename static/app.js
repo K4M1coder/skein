@@ -15,7 +15,26 @@ async function refreshHealth(){try{let health=await api('/api/health'),mode=heal
 
 let pools=[];
 const fmt=v=>v===null||v===undefined?'N/A':Math.round(v);
-async function loadHardware(){try{let h=await api('/api/hardware');pools=h.pools;$('#node').textContent=h.node.name+' · ONLINE';$('#node-stats').innerHTML=`<div class="stat"><b>${fmt(h.node.cpu_utilization)}%</b><span>CPU NODE</span></div><div class="stat"><b>${h.node.gpu_count}</b><span>${tr('detectedGpus')}</span></div><div class="stat"><b>${fmt(h.node.gpu_power_w)} W</b><span>${tr('gpuPower')}</span></div>`;$('#pool-legend').innerHTML=pools.map(pool=>`<span><i style="background:${pool.color}"></i>${esc(pool.name)} · ${pool.domain}</span>`).join('');$('#gpu-grid').innerHTML=h.gpus.map(gpu=>{let pct=gpu.memory_total_mb&&gpu.memory_used_mb!==null?gpu.memory_used_mb/gpu.memory_total_mb*100:0;return `<article class="gpu-card"><header><div><small>GPU ${gpu.index} · ${esc(gpu.vendor)} · ${esc(gpu.metrics_source)}</small><h3>${esc(gpu.name)}</h3></div><b>${fmt(gpu.utilization)}%</b></header><div class="meter"><i style="width:${pct}%"></i></div><small>${fmt(gpu.memory_used_mb)} / ${fmt(gpu.memory_total_mb)} MiB VRAM</small><div class="metrics"><div class="metric"><b>${fmt(gpu.temperature_c)}°</b><span>TEMP</span></div><div class="metric"><b>${fmt(gpu.power_w)} W</b><span>POWER</span></div><div class="metric"><b>${fmt(gpu.utilization)}%</b><span>LOAD</span></div></div><select data-gpu="${encodeURIComponent(gpu.id)}"><option value="">${tr('unassigned')}</option>${pools.map(pool=>`<option value="${pool.id}" ${pool.id===gpu.pool_id?'selected':''}>${esc(pool.name)}</option>`).join('')}</select></article>`}).join('')||`<div class="event">${tr('noGpu')}</div>`;document.querySelectorAll('[data-gpu]').forEach(x=>x.onchange=async()=>{await api('/api/gpus/'+x.dataset.gpu+'/assign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pool_id:x.value||null})});loadHardware()})}catch(e){$('#node').textContent='TELEMETRY ERROR'}}
+const gpuDrafts=new Map();
+const VRAM_ESTIMATE_COLORS=['var(--blue)','var(--amber)','var(--lime)','var(--danger)'];
+// Per-process VRAM is not measurable here (Windows GeForce/WDDM exposes no per-process
+// nvidia-smi data, unlike Linux datacenter cards in TCC mode) — this renders the
+// server's clearly-labeled size-based estimate instead of fabricating a real split.
+function renderVramEstimate(gpu){
+  let models=gpu.estimated_models||[]; if(!models.length)return '';
+  let total=Math.max(1,gpu.memory_total_mb||models.reduce((sum,m)=>sum+m.estimated_vram_mb,0));
+  let bar=models.map((model,index)=>{let color=VRAM_ESTIMATE_COLORS[index%VRAM_ESTIMATE_COLORS.length],pct=Math.min(100,model.estimated_vram_mb/total*100);return `<i style="width:${pct}%;background:${color}" title="${esc(model.name)} · ${esc(model.role)} ≈ ${fmt(model.estimated_vram_mb)} MB"></i>`}).join('');
+  let rows=models.map((model,index)=>`<li><i style="background:${VRAM_ESTIMATE_COLORS[index%VRAM_ESTIMATE_COLORS.length]}"></i><span>${esc(model.name)}</span><small>${esc(model.role)}</small><b>≈ ${fmt(model.estimated_vram_mb)} MB</b></li>`).join('');
+  return `<div class="vram-estimate"><div class="vram-estimate-head"><small>${tr('estimatedVramByModel')}</small><span class="info-dot" title="${esc(gpu.vram_estimation_method||'')}">?</span></div><div class="vram-estimate-bar">${bar}</div><ul class="vram-estimate-list">${rows}</ul></div>`;
+}
+async function loadHardware(){try{let h=await api('/api/hardware');pools=h.pools;$('#node').textContent=h.node.name+' · ONLINE';$('#node-stats').innerHTML=`<div class="stat"><b>${fmt(h.node.cpu_utilization)}%</b><span>CPU NODE</span></div><div class="stat"><b>${h.node.gpu_count}</b><span>${tr('detectedGpus')}</span></div><div class="stat"><b>${fmt(h.node.gpu_power_w)} W</b><span>${tr('gpuPower')}</span></div>`;$('#pool-legend').innerHTML=pools.map(pool=>`<span><i style="background:${pool.color}"></i>${esc(pool.name)} · ${pool.domain}</span>`).join('');$('#gpu-grid').innerHTML=h.gpus.map(gpu=>{let pct=gpu.memory_total_mb&&gpu.memory_used_mb!==null?gpu.memory_used_mb/gpu.memory_total_mb*100:0;
+  // A GPU can belong to several pools at once (one card serving reasoner, worker, and
+  // retrieval together). The periodic 2.5s poll must never show a stale checkbox state
+  // while a toggle is in flight, so each (gpu,pool) pair keeps its own pending draft.
+  let assignedPools=new Set(gpu.pool_ids||[]);
+  let checks=pools.map(pool=>{let key=gpu.id+'::'+pool.id,checked=gpuDrafts.has(key)?gpuDrafts.get(key):assignedPools.has(pool.id);return `<label class="gpu-pool-check"><input type="checkbox" data-gpu="${encodeURIComponent(gpu.id)}" data-pool="${pool.id}" ${checked?'checked':''}> ${esc(pool.name)}</label>`}).join('');
+  let vramEstimate=renderVramEstimate(gpu);
+  return `<article class="gpu-card"><header><div><small>GPU ${gpu.index} · ${esc(gpu.vendor)} · ${esc(gpu.metrics_source)}</small><h3>${esc(gpu.name)}</h3></div><b>${fmt(gpu.utilization)}%</b></header><div class="meter"><i style="width:${pct}%"></i></div><small>${fmt(gpu.memory_used_mb)} / ${fmt(gpu.memory_total_mb)} MiB VRAM</small><div class="metrics"><div class="metric"><b>${fmt(gpu.temperature_c)}°</b><span>TEMP</span></div><div class="metric"><b>${fmt(gpu.power_w)} W</b><span>POWER</span></div><div class="metric"><b>${fmt(gpu.utilization)}%</b><span>LOAD</span></div></div>${vramEstimate}<div class="gpu-pools">${checks}</div></article>`}).join('')||`<div class="event">${tr('noGpu')}</div>`;document.querySelectorAll('[data-gpu][data-pool]').forEach(box=>box.onchange=async()=>{let gpuId=decodeURIComponent(box.dataset.gpu),poolId=box.dataset.pool,checked=box.checked,key=gpuId+'::'+poolId;gpuDrafts.set(key,checked);try{await api('/api/gpus/'+box.dataset.gpu+'/assign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pool_id:poolId,assigned:checked})})}catch(error){showError(error,tr('hardwareControlPlane'))}finally{gpuDrafts.delete(key);await loadHardware()}})}catch(e){$('#node').textContent='TELEMETRY ERROR'}}
 const MODEL_ROLES=['available','reasoner','worker','embedding','reranker'];
 const modelDrafts=new Map();let modelListSignature=null,modelActionBusy=false;
 const jsonPost=(path,body)=>api(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
@@ -45,8 +64,73 @@ function renderModels(rows){
 }
 async function loadModels(){try{renderModels(await api('/api/models'))}catch(error){if(!error?.silent)showError(error,tr('modelSave'))}}
 
-const spark=(values,color)=>{let usable=values.filter(value=>Number.isFinite(value));if(!usable.length)return `<span class="telemetry-unavailable">${tr('telemetryUnavailable')}</span>`;let max=Math.max(...usable),min=Math.min(...usable),range=max-min||1,points=values.map((value,index)=>Number.isFinite(value)?`${index*100/Math.max(1,values.length-1)},${96-(value-min)*88/range}`:null).filter(Boolean).join(' ');return `<svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-label="telemetry chart"><polyline points="${points}" fill="none" stroke="${color}" stroke-width="3" vector-effect="non-scaling-stroke"/></svg>`};
-async function loadPoolTelemetry(){let target=$('#pool-telemetry');if(!target)return;try{let data=await api('/api/hardware/telemetry?window=900'),current=new Map(data.current.pool_metrics.map(item=>[item.pool_id,item])),byPool=new Map();data.history.forEach(item=>{if(!byPool.has(item.pool_id))byPool.set(item.pool_id,[]);byPool.get(item.pool_id).push(item)});target.innerHTML=data.current.pools.map(pool=>{let latest=current.get(pool.id)||{},points=byPool.get(pool.id)||[],memory=points.map(point=>point.memory_total_mb?100*point.memory_used_mb/point.memory_total_mb:null);return `<article class="pool-chart"><p class="eyebrow">${esc(pool.domain.toUpperCase())}</p><h3>${esc(pool.name)}</h3><div class="summary"><span><b>${latest.assigned_gpus||0}</b> ${tr('assignedGpus')}</span><span><b>${fmt(latest.power_w)} W</b> ${tr('telemetryPower')}</span><span><b>${fmt(latest.utilization)}%</b> ${tr('telemetryGpuLoad')}</span></div><small>${tr('telemetryPower')}</small>${spark(points.map(point=>point.power_w),pool.color)}<small>${tr('telemetryGpuLoad')}</small>${spark(points.map(point=>point.utilization),"#b9f45c")}<small>${tr('telemetryMemory')}</small>${spark(memory,"#ffb44c")}<small>${tr('telemetryTemperature')}</small>${spark(points.map(point=>point.temperature_c),"#ff6b6b")}</article>`}).join('')||`<div class="event">${tr('noPools')}</div>`}catch(error){target.innerHTML=`<div class="event">${esc(error.message)}</div>`}}
+const CHART_W=304,CHART_H=96,CHART_L=30,CHART_R=300,CHART_T=6,CHART_B=80;
+const roundUpTo=(value,step)=>Math.max(step,Math.ceil(value/step)*step);
+let telemetryHovered=false,telemetryChartSeq=0;
+// A metric chart: gridlines at nice round values, a soft area fill under a 2px line,
+// an end-dot with the latest value, and a hover crosshair + tooltip reading the exact
+// point. domain is [min,max], or "auto" to fit the observed power draw with headroom.
+function renderMetricChart(rawPoints,{valueKey,color,unit,decimals=0,domain,label}){
+  let series=rawPoints.map(point=>({time:point.created_at,value:point[valueKey]})).filter(point=>Number.isFinite(point.value));
+  if(!series.length) return `<div class="telemetry-metric"><div class="telemetry-metric-head"><small>${esc(label)}</small></div><p class="telemetry-empty">${tr('telemetryUnavailable')}</p></div>`;
+  let [dMin,dMax]=domain==='auto'?[0,roundUpTo(Math.max(...series.map(p=>p.value))*1.15,50)]:domain;
+  if(dMax<=dMin)dMax=dMin+1;
+  let tMin=series[0].time,tMax=series[series.length-1].time; if(tMax<=tMin)tMax=tMin+1;
+  let toX=t=>CHART_L+(t-tMin)/(tMax-tMin)*(CHART_R-CHART_L);
+  let toY=v=>CHART_B-(Math.min(Math.max(v,dMin),dMax)-dMin)/(dMax-dMin)*(CHART_B-CHART_T);
+  let screen=series.map(p=>({x:toX(p.time),y:toY(p.value),value:p.value,time:p.time}));
+  let line=screen.map((p,i)=>`${i?'L':'M'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
+  let area=`${line} L${screen[screen.length-1].x.toFixed(1)},${CHART_B} L${screen[0].x.toFixed(1)},${CHART_B} Z`;
+  let last=screen[screen.length-1];
+  let gridlines=[dMax,(dMax+dMin)/2,dMin].map(value=>{let y=toY(value);return `<line class="telemetry-grid" x1="${CHART_L}" x2="${CHART_R}" y1="${y.toFixed(1)}" y2="${y.toFixed(1)}" vector-effect="non-scaling-stroke"/><text class="telemetry-tick" x="${CHART_L-4}" y="${(y+3).toFixed(1)}">${Math.round(value)}</text>`}).join('');
+  let key='chart-'+(telemetryChartSeq++);
+  // The hover handler needs each point's screen x plus its original value/time to render
+  // the tooltip; stash it as JSON on the container rather than a separate live JS array,
+  // since the whole panel's HTML gets replaced wholesale on every poll tick.
+  let seriesForHover=screen.map(p=>({x:Number(p.x.toFixed(1)),y:Number(p.y.toFixed(1)),value:p.value,time:p.time,decimals,unit}));
+  return `<div class="telemetry-metric" data-metric-key="${key}" data-series='${esc(JSON.stringify(seriesForHover))}'><div class="telemetry-metric-head"><small>${esc(label)}</small><b class="telemetry-value" style="color:${color}">${last.value.toFixed(decimals)}${esc(unit)}</b></div><div class="telemetry-plot-wrap"><svg class="telemetry-plot" viewBox="0 0 ${CHART_W} ${CHART_H}" preserveAspectRatio="none" role="img" aria-label="${esc(label)}: ${last.value.toFixed(decimals)}${esc(unit)}">${gridlines}<path class="telemetry-area" d="${area}" fill="${color}"/><path class="telemetry-line" d="${line}" stroke="${color}" vector-effect="non-scaling-stroke"/><circle class="telemetry-end-dot" cx="${last.x.toFixed(1)}" cy="${last.y.toFixed(1)}" r="4" fill="${color}"/><line class="telemetry-crosshair" x1="0" x2="0" y1="${CHART_T}" y2="${CHART_B}" opacity="0" vector-effect="non-scaling-stroke"/><circle class="telemetry-crosshair-dot" r="4" opacity="0" fill="${color}"/><rect class="telemetry-hit" x="${CHART_L}" y="0" width="${CHART_R-CHART_L}" height="${CHART_H}" fill="transparent"/></svg><div class="telemetry-tooltip hidden"></div></div></div>`;
+}
+function wireMetricCharts(root){
+  root.querySelectorAll('.telemetry-metric[data-metric-key]').forEach(metricEl=>{
+    let svg=metricEl.querySelector('.telemetry-plot'); if(!svg)return;
+    let hit=svg.querySelector('.telemetry-hit'),crosshair=svg.querySelector('.telemetry-crosshair'),dot=svg.querySelector('.telemetry-crosshair-dot'),tooltip=metricEl.querySelector('.telemetry-tooltip');
+    let path=svg.querySelector('.telemetry-line'); if(!path)return;
+    // Recover each rendered point's (x,value,time) from the path's own coordinates plus a
+    // parallel data attribute, rather than keeping a separate JS array alive across re-renders.
+    let series=JSON.parse(metricEl.dataset.series);
+    let nearest=x=>{let lo=0,hi=series.length-1;while(lo<hi){let mid=(lo+hi)>>1;series[mid].x<x?lo=mid+1:hi=mid}return series[lo]};
+    let move=event=>{
+      let rect=svg.getBoundingClientRect(),clientX=event.touches?event.touches[0].clientX:event.clientX;
+      let point=nearest((clientX-rect.left)/rect.width*CHART_W);
+      crosshair.setAttribute('x1',point.x);crosshair.setAttribute('x2',point.x);crosshair.setAttribute('opacity',1);
+      dot.setAttribute('cx',point.x);dot.setAttribute('cy',point.y);dot.setAttribute('opacity',1);
+      let leftPct=point.x/CHART_W*100;
+      tooltip.textContent=`${new Date(point.time*1000).toLocaleTimeString(window.skeinI18n.language)} · ${point.value.toFixed(point.decimals)}${point.unit}`;
+      tooltip.classList.remove('hidden');
+      tooltip.style.left=leftPct+'%'; tooltip.style.transform=leftPct>65?'translate(-100%,-8px)':'translate(0,-8px)';
+    };
+    let enter=()=>{telemetryHovered=true};
+    let leave=()=>{telemetryHovered=false;crosshair.setAttribute('opacity',0);dot.setAttribute('opacity',0);tooltip.classList.add('hidden')};
+    hit.addEventListener('pointerenter',enter); hit.addEventListener('pointermove',move); hit.addEventListener('pointerleave',leave);
+  });
+}
+async function loadPoolTelemetry(){
+  let target=$('#pool-telemetry'); if(!target||telemetryHovered)return;
+  try{
+    let data=await api('/api/hardware/telemetry?window=900'),current=new Map(data.current.pool_metrics.map(item=>[item.pool_id,item])),byPool=new Map();
+    data.history.forEach(item=>{if(!byPool.has(item.pool_id))byPool.set(item.pool_id,[]);byPool.get(item.pool_id).push(item)});
+    target.innerHTML=data.current.pools.map(pool=>{
+      let latest=current.get(pool.id)||{},points=(byPool.get(pool.id)||[]).map(point=>({...point,memory_pct:point.memory_total_mb?100*point.memory_used_mb/point.memory_total_mb:null}));
+      return `<article class="pool-chart"><p class="eyebrow">${esc(pool.domain.toUpperCase())}</p><h3>${esc(pool.name)}</h3><div class="summary"><span><b>${latest.assigned_gpus||0}</b> ${tr('assignedGpus')}</span><span><b>${fmt(latest.power_w)} W</b> ${tr('telemetryPower')}</span><span><b>${fmt(latest.utilization)}%</b> ${tr('telemetryGpuLoad')}</span></div>${!latest.assigned_gpus&&latest.running_models?`<p class="pool-warning">${tr('poolRunningWithoutGpu').replace('{count}',latest.running_models)}</p>`:''}<div class="telemetry-grid-2">`
+        +renderMetricChart(points,{valueKey:'power_w',color:'var(--blue)',unit:' W',domain:'auto',label:tr('telemetryPower')})
+        +renderMetricChart(points,{valueKey:'utilization',color:'var(--lime)',unit:'%',domain:[0,100],label:tr('telemetryGpuLoad')})
+        +renderMetricChart(points,{valueKey:'memory_pct',color:'var(--amber)',unit:'%',domain:[0,100],label:tr('telemetryMemory')})
+        +renderMetricChart(points,{valueKey:'temperature_c',color:'var(--danger)',unit:'°C',domain:[20,100],label:tr('telemetryTemperature')})
+        +`</div></article>`;
+    }).join('')||`<div class="event">${tr('noPools')}</div>`;
+    wireMetricCharts(target);
+  }catch(error){target.innerHTML=`<div class="event">${esc(error.message)}</div>`}
+}
 if(can('server_stats.read')||can('settings.manage')||can('models.manage')){loadPoolTelemetry();setInterval(loadPoolTelemetry,5000)}
 $('#show-model-form').onclick=()=>$('#model-form').classList.toggle('hidden');$('#model-form').onsubmit=async e=>{e.preventDefault();let data=Object.fromEntries(new FormData(e.target));data.context_size=Number(data.context_size);data.port=Number(data.port);try{await api('/api/models',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});e.target.classList.add('hidden');loadModels()}catch(err){showError(err,tr('modelSave'))}};
 $('#discover-models').onclick=async()=>{let button=$('#discover-models');button.disabled=true;try{
