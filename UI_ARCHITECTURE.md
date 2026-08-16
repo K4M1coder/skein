@@ -50,17 +50,22 @@ Reference documentation consulted during the audit: [Claude Desktop](https://doc
 
 ### Administration
 
-- User and profile management, execution policy, email, server statistics, hardware, and models are grouped into separate surfaces.
-- The model surfaces are ordered by intent: the registry and its runtime controls, then the local weight-file library, then remote acquisition from Hugging Face.
+Administration is not one flat view: it is split into six independent domains — Access control, Execution policy, Email, Statistics, Models, and Hardware — each its own sub-page. The sidebar shows them as an expandable submenu nested under the Administration entry rather than as tabs inside the content area, so switching domains never scrolls past unrelated forms.
+
+- Every domain is gated by its own RBAC permission (or, for Hardware, any of the three permissions that read hardware telemetry) and simply does not appear for a role that lacks it. A role with access to exactly one domain (e.g. a Statistics Auditor) skips the submenu entirely and lands directly on that domain — there is nothing to expand.
+- The submenu expands automatically when any domain is active and collapses when navigating away to Execution, Workflows, or History; the Administration button stays highlighted the whole time so its parent context remains visible.
+- Returning to Administration (clicking its sidebar button again) reopens the last domain visited in the session, not always the first one.
+- Domain order favors a role's own destination over the shared one: Hardware is listed last so a Model Manager or Settings Manager lands on Models or Execution Policy first and reaches Hardware through the submenu, not the other way around.
+- The Models domain groups its own surfaces by intent: the registry and its runtime controls, then the local weight-file library, then remote acquisition from Hugging Face.
 - The model registry refreshes only when the server state actually changes, so periodic polling never discards a role or pool selection in progress. An edited row is marked until it is saved, and every load, unload, save, and removal reports its outcome in the incident panel rather than failing silently.
 - Forms use responsive grids on desktop and a single-column layout on narrow screens.
 - Administrative buttons use a consistent primary action treatment instead of browser defaults.
 
 ## Responsive behavior
 
-- At wide desktop sizes the sidebar is 248 px and content is centered within a 1600 px canvas.
-- At tablet sizes the sidebar collapses to icons and the content becomes a single column.
-- At phone sizes navigation becomes a fixed bottom bar, the header is simplified, and forms become single-column.
+- At wide desktop sizes the sidebar is 248 px and content is centered within a 1600 px canvas. The Administration submenu appears indented beneath its parent button with a connecting rule.
+- At tablet sizes the sidebar collapses to icons, the submenu drops its indent and text labels but keeps its own icons, and the content becomes a single column.
+- At phone sizes navigation becomes a fixed, horizontally scrollable bottom bar; an expanded Administration submenu appends its domain icons to that same bar instead of opening a second surface. The header is simplified and forms become single-column.
 
 ## Design tokens
 

@@ -41,6 +41,12 @@ body>header>.brand{display:none}
 .main-navigation button svg{width:18px;height:18px;stroke-width:1.8}
 .main-navigation button:hover{background:#ffffff08;color:var(--text)}
 .main-navigation button.active{border:0;background:#b8f36a12;color:var(--lime);box-shadow:inset 3px 0 0 var(--lime)}
+.submenu-chevron{margin-left:auto;width:14px!important;height:14px!important;flex-shrink:0;transition:transform .15s ease}
+[data-main-view="administration"].active .submenu-chevron{transform:rotate(180deg)}
+.sub-navigation{display:none;flex-direction:column;gap:2px;margin:2px 6px 8px 22px;padding-left:10px;border-left:1px solid var(--line)}
+.sub-navigation.expanded{display:flex}
+.sub-navigation button{height:36px;font-size:12px;color:var(--muted)}
+.sub-navigation button svg{width:15px;height:15px}
 .sidebar-status{margin:12px;padding:13px;border:1px solid var(--line);border-radius:12px;background:var(--panel-soft);color:var(--muted);font-size:11px}
 .sidebar-status b{display:flex;align-items:center;gap:8px;margin-bottom:5px;color:var(--text);font-size:12px}.sidebar-status i{width:8px;height:8px;border-radius:50%;background:var(--lime);box-shadow:0 0 0 4px #b8f36a12}
 
@@ -70,7 +76,7 @@ main{width:min(1600px,calc(100% - var(--shell-sidebar)));min-height:100vh;margin
 .history-view .workspace{grid-column:1/-1;order:2}
 .history-view .dag.empty{min-height:150px}
 
-.admin-panel>div[id]{margin-top:26px;padding-top:22px;border-top:1px solid var(--line)}
+.admin-panel>div[id]+div[id]{margin-top:26px;padding-top:22px;border-top:1px solid var(--line)}
 .admin-panel button{min-height:38px;border:1px solid #b8f36a55;border-radius:9px;background:#b8f36a12;color:var(--lime);padding:0 13px;font-weight:650;cursor:pointer}.admin-panel button:hover{background:#b8f36a20}
 .admin-panel input,.admin-panel select{min-height:40px;border:1px solid var(--line);background:#0e1114;color:var(--text);padding:0 12px}
 .admin-panel .rbac-create{grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;padding:16px;border:1px solid var(--line);border-radius:12px;background:var(--panel-soft)}
@@ -91,8 +97,9 @@ dialog{border-radius:16px!important;box-shadow:0 30px 100px #000a!important}
 @media(max-width:980px){
   :root{--shell-sidebar:76px}
   .app-sidebar .brand{padding:0 20px}.app-sidebar .brand>div{display:none}
-  .main-navigation:before,.main-navigation button span,.sidebar-status{display:none}
+  .main-navigation:before,.main-navigation button span,.sidebar-status,.submenu-chevron{display:none}
   .main-navigation button{justify-content:center;padding:0}.main-navigation button.active{box-shadow:inset 3px 0 0 var(--lime)}
+  .sub-navigation{margin-left:8px;padding-left:0;border-left:0}
   .user-bar>span{display:none}
   main{margin-left:var(--shell-sidebar);width:calc(100% - var(--shell-sidebar));padding-left:22px;padding-right:22px;grid-template-columns:1fr}.hero,.models{grid-column:1}.models{display:none}
   .admin-panel .rbac-create,.admin-panel .rbac-user,.admin-panel .smtp-form{grid-template-columns:1fr}.admin-panel .rbac-create>*,.admin-panel .rbac-user>*,.admin-panel .smtp-form>*{grid-column:1!important}
@@ -101,6 +108,7 @@ dialog{border-radius:16px!important;box-shadow:0 30px 100px #000a!important}
   :root{--shell-sidebar:0px;--shell-header:58px}
   body>header{left:0;padding:0 12px}.health{font-size:0}.health:before{content:"●";font-size:12px}.stack-bar>[data-stack]{display:none}
   .app-sidebar{inset:auto 0 0;width:100%;height:64px;flex-direction:row;border:1px solid var(--line);border-width:1px 0 0}.app-sidebar .brand,.sidebar-status{display:none}
-  .main-navigation{flex-direction:row;padding:8px;gap:6px}.main-navigation button{height:48px;justify-content:center}.main-navigation button span{display:block;font-size:11px}.main-navigation button.active{box-shadow:inset 0 -3px 0 var(--lime)}
+  .main-navigation{flex-direction:row;padding:8px;gap:6px;overflow-x:auto}.main-navigation button{height:48px;justify-content:center;flex-shrink:0}.main-navigation button span{display:block;font-size:11px}.main-navigation button.active{box-shadow:inset 0 -3px 0 var(--lime)}
+  .sub-navigation{flex-direction:row;margin:0;padding-left:0;border-left:0}.sub-navigation button{height:48px}
   main{margin-left:0;margin-right:0;width:auto;max-width:100%;padding:calc(var(--shell-header) + 20px) 14px 90px;grid-template-columns:minmax(0,1fr)!important}main>*{min-width:0}.history-view main{grid-template-columns:minmax(0,1fr)}.history-view .lower{grid-template-columns:minmax(0,1fr)}.hero{padding:22px}.hero h1{font-size:38px}.hero form{display:block}.hero button{width:100%;height:46px}.terminal-form{min-width:0}.terminal-form input{min-width:0}
 }
