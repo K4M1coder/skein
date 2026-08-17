@@ -116,6 +116,22 @@ class HttpDispatchLoggingTest(unittest.TestCase):
             if original is not None: os.environ["SKEIN_AUTH_DISABLED"] = original
         self.assertIn("GET /api/models 401", log_text())
 
+    def test_a_client_disconnect_is_not_logged_as_a_server_error(self):
+        # A closed tab or a navigation mid-request raises Connection*Error inside the
+        # handler; this is routine, not a bug, so it must never inflate ERROR-level noise.
+        # Exercised directly against dispatch() with a stub self: a real socket round-trip
+        # would just hang, since (unlike the real scenario) this test's client is still there
+        # waiting for a response that a genuine disconnect handler intentionally never sends.
+        class FakeHandler:
+            path = "/api/fake-disconnect-probe"
+            def send_response(self, code, *a, **kw): pass
+            def current_user(self): return None
+            def json(self, data, status=200): raise AssertionError("must not attempt a response after a client disconnect")
+        app.Handler.dispatch(FakeHandler(), "GET", lambda: (_ for _ in ()).throw(ConnectionAbortedError("synthetic")))
+        text = log_text()
+        self.assertIn("client disconnected", text)
+        self.assertNotIn("raised an unhandled exception", text.rsplit("client disconnected", 1)[-1])
+
 
 class AuthAndModelLifecycleLoggingTest(unittest.TestCase):
     @classmethod
@@ -156,6 +172,68 @@ class AuthAndModelLifecycleLoggingTest(unittest.TestCase):
         matches = [line for line in log_text().splitlines() if f"task.failed workflow={wid} task=task-1" in line]
         self.assertTrue(matches, "expected a log line for the emitted task.failed event")
         self.assertIn("ERROR", matches[-1])
+
+
+class AdminLogsEndpointTest(unittest.TestCase):
+    """The Administration > System log page reads through these two routes."""
+
+    @classmethod
+    def setUpClass(cls):
+        app.init_db()
+        app.logger_settings.info("distinctive-marker-for-admin-logs-test level=info")
+        app.logger_settings.warning("distinctive-marker-for-admin-logs-test level=warning")
+        cls.server = app.ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+        cls.base = f"http://127.0.0.1:{cls.server.server_port}"
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        app.POOL.shutdown(wait=True)
+
+    def get_bytes(self, path):
+        try:
+            with urlopen(self.base + path, timeout=20) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def get_json(self, path):
+        status, body = self.get_bytes(path)
+        return status, json.loads(body)
+
+    def test_records_and_file_summary_are_returned(self):
+        status, data = self.get_json("/api/admin/logs?limit=2000")
+        self.assertEqual(status, 200)
+        self.assertTrue(any("distinctive-marker-for-admin-logs-test" in r["message"] for r in data["records"]))
+        self.assertIn("skein.log", [f["name"] for f in data["files"]])
+        self.assertEqual(data["level_options"], list(app.LOG_LEVEL_NAMES))
+
+    def test_level_filter_excludes_other_levels(self):
+        status, data = self.get_json("/api/admin/logs?level=WARNING&limit=2000")
+        self.assertEqual(status, 200)
+        self.assertTrue(data["records"])
+        self.assertTrue(all(r["level"] == "WARNING" for r in data["records"]))
+
+    def test_an_unknown_level_is_rejected(self):
+        status, data = self.get_json("/api/admin/logs?level=NOPE")
+        self.assertEqual(status, 400)
+        self.assertIn("NOPE", data["error"])
+
+    def test_text_search_narrows_to_matching_lines(self):
+        status, data = self.get_json("/api/admin/logs?q=distinctive-marker-for-admin-logs-test&limit=2000")
+        self.assertEqual(status, 200)
+        self.assertTrue(data["records"])
+        self.assertTrue(all("distinctive-marker-for-admin-logs-test" in r["message"] for r in data["records"]))
+
+    def test_the_active_log_file_can_be_downloaded(self):
+        status, body = self.get_bytes("/api/admin/logs/download?file=skein.log")
+        self.assertEqual(status, 200)
+        self.assertIn("distinctive-marker-for-admin-logs-test", body.decode("utf-8", "replace"))
+
+    def test_a_path_outside_the_log_directory_is_rejected(self):
+        status, data = self.get_json("/api/admin/logs/download?file=../../../../etc/passwd")
+        self.assertEqual(status, 404)
 
 
 if __name__ == "__main__":
