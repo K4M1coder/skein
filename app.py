@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import base64, csv, ctypes, io, json, mimetypes, os, re, shlex, shutil, signal, sqlite3, struct, subprocess, sys, tempfile, threading, time, uuid, zipfile, hashlib, hmac, secrets, smtplib, ssl
+import base64, csv, ctypes, io, json, logging, mimetypes, os, re, shlex, shutil, signal, sqlite3, struct, subprocess, sys, tempfile, threading, time, uuid, zipfile, hashlib, hmac, secrets, smtplib, ssl
 from collections import deque
 from email.message import EmailMessage
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
@@ -34,6 +35,46 @@ def db():
             yield conn
     finally:
         conn.close()
+
+
+LOG_DIR = DB_PATH.parent / "logs"
+
+
+def configure_logging():
+    """One rotating file (exhaustive: every action, error, and workflow/model lifecycle
+    event) plus a quieter console echo, built on stdlib logging only per DEPENDENCY_POLICY.md.
+    Idempotent so re-importing app.py never stacks duplicate handlers. Logging must never be
+    the reason Skein fails to start: a file handler that can't be created (read-only disk,
+    permissions) degrades to console-only instead of raising."""
+    root = logging.getLogger("skein")
+    if root.handlers: return root
+    root.setLevel(logging.DEBUG)
+    root.propagate = False
+    formatter = logging.Formatter("%(asctime)s %(levelname)-8s %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S")
+    console = logging.StreamHandler()
+    console.setLevel(getattr(logging, os.getenv("SKEIN_LOG_CONSOLE_LEVEL", "WARNING").upper(), logging.WARNING))
+    console.setFormatter(formatter)
+    root.addHandler(console)
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(LOG_DIR / "skein.log",
+            maxBytes=int(os.getenv("SKEIN_LOG_MAX_BYTES", 5_000_000)),
+            backupCount=int(os.getenv("SKEIN_LOG_BACKUP_COUNT", 10)), encoding="utf-8")
+        file_handler.setLevel(getattr(logging, os.getenv("SKEIN_LOG_LEVEL", "INFO").upper(), logging.INFO))
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
+    except OSError as exc:
+        root.warning(f"Rotating log file unavailable ({exc}); logging to console only.")
+    return root
+
+
+logger = configure_logging()
+logger_http = logger.getChild("http")
+logger_auth = logger.getChild("auth")
+logger_models = logger.getChild("models")
+logger_workflow = logger.getChild("workflow")
+logger_settings = logger.getChild("settings")
+logger_system = logger.getChild("system")
 
 
 def init_db():
@@ -530,6 +571,7 @@ def register_model_file(path, role="available", pool_id=None, name=None, context
            max(512,int(context_size or 8192)),0,None,"STOPPED",None,None,None,stamp()))
     result,status=configure_model(mid,role,pool_id)
     if status!=200: return result,status
+    logger_models.info(f"registered id={mid} name={name or resolved.stem!r} role={role} path={resolved}")
     return {"id":mid,"name":str(name or resolved.stem),"model_path":str(resolved),"role":role,
             "quantization":detect_quantization(resolved.name),"runtime_path":str(runtime or "")},201
 
@@ -888,8 +930,11 @@ def activate_model(model_id, pool_id=None, role=None):
     payload={"id":model_id,"status":status,"pid":pid,"endpoint":endpoint,"pool_id":effective_pool,
              "gpu_indices":indices if status=="STARTING" else [],"error":error}
     # The role and pool are saved either way, but a runtime that did not start must never look like a success.
-    if status=="STARTING": return payload,200
+    if status=="STARTING":
+        logger_models.info(f"activated id={model_id} name={model['name']!r} role={model['role']} pid={pid} pool={effective_pool}")
+        return payload,200
     payload["action"]="The role and pool assignment was saved. Correct the runtime or weight path, then load again."
+    logger_models.error(f"activation failed id={model_id} name={model['name']!r}: {error}")
     return payload,502
 
 
@@ -907,6 +952,7 @@ def stop_model(model_id):
     elif model["pid"]:
         terminated=terminate_pid(model["pid"], Path(model["runtime_path"]).name if model["runtime_path"] else None)
     if ACTIVE_ENDPOINTS.get(model["role"])==model["endpoint"]: ACTIVE_ENDPOINTS.pop(model["role"],None)
+    logger_models.info(f"stopped id={model_id} name={model['name']!r} terminated={terminated}")
     with db() as conn: conn.execute("UPDATE models SET status='STOPPED',pid=NULL,updated_at=? WHERE id=?",(stamp(),model_id))
     return {"id":model_id,"status":"STOPPED","terminated":terminated},200
 
@@ -1045,8 +1091,10 @@ def run_huggingface_download(job_id, repo, filename, target, cancel):
         update_download(job_id,status="COMPLETED",received_bytes=received,
                         model_id=registered.get("id") if status==201 else None,
                         error=None if status==201 else registered.get("error"))
+        logger_models.info(f"huggingface download completed job={job_id} repo={repo} file={filename} bytes={received}")
     except (OSError,URLError,TimeoutError,ValueError) as exc:
         update_download(job_id,status="FAILED",error=f"{type(exc).__name__}: {exc}")
+        logger_models.error(f"huggingface download failed job={job_id} repo={repo} file={filename}: {exc}")
 
 
 def start_huggingface_download(repo, filename):
@@ -1065,6 +1113,7 @@ def start_huggingface_download(repo, filename):
           "path":str(target),"status":"RUNNING","received_bytes":0,"total_bytes":None,"error":None,
           "model_id":None,"started_at":stamp(),"updated_at":stamp(),"cancel":cancel}
         snapshot=download_snapshot(DOWNLOADS[job_id])
+    logger_models.info(f"huggingface download started job={job_id} repo={repo} file={safe}")
     threading.Thread(target=run_huggingface_download,args=(job_id,repo,remote,target,cancel),daemon=True).start()
     return snapshot,202
 
@@ -1141,10 +1190,23 @@ def autoload_models():
     return {"error":"Runtimes did not reach the READY state","models":started},503
 
 
+EVENT_LOG_LEVELS = {"task.failed": logging.ERROR, "workflow.failed": logging.ERROR,
+                    "task.blocked": logging.WARNING, "task.retried": logging.WARNING, "task.escalated": logging.WARNING}
+
+
 def emit(wid, kind, payload=None, tid=None):
-    with db() as conn:
-        conn.execute("INSERT INTO events(workflow_id,task_id,kind,payload,created_at) VALUES(?,?,?,?,?)",
-                     (wid, tid, kind, json.dumps(payload or {}, ensure_ascii=False), stamp()))
+    """Every workflow/task lifecycle transition already lands here for the events table the
+    UI reads; log it too (in a finally, so a DB hiccup on the insert still leaves a record)
+    rather than re-instrumenting orchestrate()/run_task() at each of their call sites."""
+    payload = payload or {}
+    try:
+        with db() as conn:
+            conn.execute("INSERT INTO events(workflow_id,task_id,kind,payload,created_at) VALUES(?,?,?,?,?)",
+                         (wid, tid, kind, json.dumps(payload, ensure_ascii=False), stamp()))
+    finally:
+        detail = f" {json.dumps(payload, ensure_ascii=False)}" if payload else ""
+        logger_workflow.log(EVENT_LOG_LEVELS.get(kind, logging.INFO),
+                            f"{kind} workflow={wid}" + (f" task={tid}" if tid else "") + detail)
 
 
 def plan_for(objective):
@@ -2207,6 +2269,35 @@ def privacy_safe_server_stats(limit=200):
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self,*args,**kwargs): super().__init__(*args,directory=str(STATIC),**kwargs)
     def log_message(self,fmt,*args): pass
+    def dispatch(self,method,handler):
+        """Every GET/POST/DELETE funnels through here: one place to time the request, catch
+        anything the ~60 route branches below don't handle themselves, and log the outcome.
+        This is the exhaustive layer — it logs every action and error without needing bespoke
+        instrumentation at each route, and turns an unhandled exception into a clean 500 JSON
+        response instead of a dead connection (previously nothing wrapped do_GET/POST/DELETE,
+        so a bug there crashed the connection with a bare traceback on stderr)."""
+        start=time.perf_counter(); status_box={"code":200}
+        if not hasattr(self,"_original_send_response"): self._original_send_response=self.send_response
+        def send_response(code,*a,**kw):
+            status_box["code"]=code; return self._original_send_response(code,*a,**kw)
+        self.send_response=send_response
+        try:
+            handler()
+        except Exception:
+            logger_http.exception(f"{method} {self.path} raised an unhandled exception")
+            status_box["code"]=500
+            try: self.json({"error":"Internal server error"},500)
+            except Exception: pass
+        finally:
+            duration_ms=(time.perf_counter()-start)*1000; code=status_box["code"]
+            try: user=self.current_user()
+            except Exception: user=None
+            who=user["username"] if user else "anonymous"
+            line=f"{method} {self.path} {code} {duration_ms:.1f}ms user={who}"
+            if code>=500: logger_http.error(line)
+            elif code>=400: logger_http.warning(line)
+            elif method=="GET": logger_http.debug(line)  # frequent UI polling; keep default INFO quiet
+            else: logger_http.info(line)
     def json(self,data,status=200):
         raw=json.dumps(data,ensure_ascii=False).encode(); self.send_response(status)
         self.send_header("Content-Type","application/json; charset=utf-8"); self.send_header("Content-Length",str(len(raw))); self.end_headers(); self.wfile.write(raw)
@@ -2263,7 +2354,8 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_response(200); self.send_header("Content-Type","application/json; charset=utf-8")
         self.send_header("Set-Cookie",f"skein_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200")
         self.send_header("Content-Length",str(len(raw))); self.end_headers(); self.wfile.write(raw)
-    def do_GET(self):
+    def do_GET(self): self.dispatch("GET",self._handle_get)
+    def _handle_get(self):
         if self.path=="/api/health": return self.json({"status":"ok","active":len(ACTIVE),"queued":len(WORKFLOW_QUEUE),"parallel_workflow_limit":MAX_PARALLEL_WORKFLOWS,"database":str(DB_PATH),"execution_mode":EXECUTION_MODE,"active_models":ACTIVE_ENDPOINTS,"backends":{"worker":bool(os.getenv("SKEIN_WORKER_URL") or ACTIVE_ENDPOINTS.get("worker")),"reasoner":bool(os.getenv("SKEIN_REASONER_URL") or ACTIVE_ENDPOINTS.get("reasoner"))}})
         if self.path=="/api/runtime-overview": return self.json(runtime_overview())
         if self.path=="/api/auth/me":
@@ -2412,14 +2504,17 @@ class Handler(SimpleHTTPRequestHandler):
         result,status=store_uploaded_weight(unquote(filename),self.rfile,length)
         return self.json(result,status)
 
-    def do_POST(self):
+    def do_POST(self): self.dispatch("POST",self._handle_post)
+    def _handle_post(self):
         global EXECUTION_MODE
         if urlparse(self.path).path=="/api/models/upload": return self.upload_model_weight()
         try: body=json.loads(self.rfile.read(int(self.headers.get("Content-Length",0))) or b"{}")
         except json.JSONDecodeError: return self.json({"error":"JSON invalide"},400)
         if self.path=="/api/auth/register":
             remote=self.client_address[0]
-            if not consume_rate_limit("register",remote,5,600): return self.json({"error":"Too many registration attempts; try again later"},429)
+            if not consume_rate_limit("register",remote,5,600):
+                logger_auth.warning(f"registration rate-limited for {remote}")
+                return self.json({"error":"Too many registration attempts; try again later"},429)
             username=str(body.get("username","")).strip(); email=str(body.get("email","")).strip().lower(); password=str(body.get("password","")); language=str(body.get("language","en"))
             if len(username)<3 or len(password)<8 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+",email): return self.json({"error":"Valid email, username of 3+ characters, and password of 8+ characters are required"},400)
             uid=str(uuid.uuid4()); created=stamp()
@@ -2427,21 +2522,27 @@ class Handler(SimpleHTTPRequestHandler):
                 with db() as conn:
                     conn.execute("INSERT INTO users(id,username,password_hash,role,active,created_at,email,verified_at) VALUES(?,?,?,?,?,?,?,NULL)",(uid,username,password_hash(password),"user",1,created,email))
                     conn.execute("INSERT INTO user_profiles VALUES(?,?)",(uid,"workflow_operator"))
-            except sqlite3.IntegrityError: return self.json({"error":"Username or email already registered"},409)
+            except sqlite3.IntegrityError:
+                logger_auth.info(f"registration rejected, already exists: username={username!r}")
+                return self.json({"error":"Username or email already registered"},409)
             delivery,status=issue_verification_code(uid,language,True)
             response={"registered":True,"verification_required":True,"email_sent":status==200,"expires_in_seconds":600}
             if status==200: response.update(delivery)
             else: response["message"]="Account created, but email delivery failed. Retry later or ask an authorized user manager for manual approval."
+            logger_auth.info(f"registered id={uid} username={username!r} email_sent={status==200}")
             return self.json(response,201)
         if self.path=="/api/auth/login":
             username=str(body.get("username","")).strip(); password=str(body.get("password",""))
             with db() as conn: row=conn.execute("SELECT * FROM users WHERE username=? COLLATE NOCASE",(username,)).fetchone()
-            if not row or not row["active"] or not password_valid(password,row["password_hash"]): return self.deny(401,"Invalid credentials")
+            if not row or not row["active"] or not password_valid(password,row["password_hash"]):
+                logger_auth.warning(f"login failed username={username!r} from {self.client_address[0]}")
+                return self.deny(401,"Invalid credentials")
             token=secrets.token_urlsafe(32)
             with db() as conn:
                 conn.execute("DELETE FROM sessions WHERE expires_at<=?",(stamp(),)); conn.execute("INSERT INTO sessions(token,user_id,expires_at,created_at,storage_id) VALUES(?,?,?,?,?)",(token,row["id"],stamp()+43200,stamp(),str(uuid.uuid4())))
             profiles,permissions=access_for_user(row["id"])
             verified=bool(row["verified_at"])
+            logger_auth.info(f"login succeeded id={row['id']} username={row['username']!r}")
             return self.send_session({"id":row["id"],"username":row["username"],"email":row["email"],"verified":verified,"role":row["role"],"profiles":profiles,"permissions":permissions if verified else []},token)
         if self.path in ("/api/auth/verify","/api/auth/resend"):
             user=self.current_user()
@@ -2453,6 +2554,7 @@ class Handler(SimpleHTTPRequestHandler):
             token=self.cookie("skein_session")
             if token:
                 with db() as conn: conn.execute("DELETE FROM sessions WHERE token=?",(token,))
+                logger_auth.info("logout: session invalidated")
             raw=b'{"ok":true}'; self.send_response(200); self.send_header("Content-Type","application/json"); self.send_header("Set-Cookie","skein_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"); self.send_header("Content-Length",str(len(raw))); self.end_headers(); return self.wfile.write(raw)
         if self.path.startswith("/api/models"): user=self.authorize("models.manage")
         elif self.path.startswith("/api/workflow-templates"): user=self.authorize_any("workflow_templates.manage_own","workflow_templates.manage_all")
@@ -2549,6 +2651,7 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path=="/api/admin/settings":
             allowed=bool(body.get("users_can_choose_execution_mode"))
             with db() as conn: conn.execute("INSERT INTO settings VALUES('users_can_choose_execution_mode',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",("true" if allowed else "false",))
+            logger_settings.info(f"users_can_choose_execution_mode set to {allowed} by {user['username']}")
             return self.json({"users_can_choose_execution_mode":allowed})
         if self.path=="/api/admin/email":
             host=str(body.get("host","")).strip(); from_address=str(body.get("from_address","")).strip(); security=str(body.get("security","starttls"))
@@ -2557,12 +2660,16 @@ class Handler(SimpleHTTPRequestHandler):
             if body.get("password"): values["smtp_password"]=protect_secret(str(body["password"]))
             with db() as conn:
                 for key,value in values.items(): conn.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(key,value))
+            logger_settings.info(f"SMTP configuration updated by {user['username']}: host={host} from={from_address} security={security}")
             return self.json(smtp_configuration())
         if self.path=="/api/admin/email/test":
             recipient=str(body.get("recipient","")).strip()
             if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+",recipient): return self.json({"error":"Valid recipient email required"},400)
             try: send_email(recipient,"Skein SMTP test","Your Skein SMTP configuration is working.")
-            except Exception as exc: return self.json({"error":"SMTP test failed","details":str(exc)},502)
+            except Exception as exc:
+                logger_settings.warning(f"SMTP test failed for {recipient}: {exc}")
+                return self.json({"error":"SMTP test failed","details":str(exc)},502)
+            logger_settings.info(f"SMTP test succeeded, sent to {recipient}")
             return self.json({"sent":True})
         if self.path=="/api/workflows":
             objective=str(body.get("objective","")).strip()
@@ -2599,7 +2706,9 @@ class Handler(SimpleHTTPRequestHandler):
             if "settings.manage" not in user["permissions"] and not setting_bool("users_can_choose_execution_mode"): return self.deny(403,"Execution mode selection is disabled by the administrator")
             mode=str(body.get("mode","")).lower()
             if mode not in ("sandbox","local"): return self.json({"error":"Invalid mode"},400)
-            EXECUTION_MODE=mode; return self.json({"mode":mode,"warning":"Unisolated local execution" if mode=="local" else None})
+            EXECUTION_MODE=mode
+            logger_settings.info(f"execution mode set to {mode} by {user['username']}")
+            return self.json({"mode":mode,"warning":"Unisolated local execution" if mode=="local" else None})
         if self.path.startswith("/api/artifacts/") and self.path.endswith("/execute"):
             aid=self.path.split("/")[-2]; result,status=execute_in_sandbox(aid,int(body.get("timeout",20)),EXECUTION_MODE)
             return self.json(result,status)
@@ -2611,6 +2720,7 @@ class Handler(SimpleHTTPRequestHandler):
             if not name: return self.json({"error":"nom requis"},400)
             pid=str(uuid.uuid4()); color=str(body.get("color","#b9f45c"))
             with db() as conn: conn.execute("INSERT INTO pools VALUES(?,?,?,?)",(pid,name,domain,color))
+            logger_settings.info(f"pool created id={pid} name={name!r} domain={domain}")
             return self.json({"id":pid,"name":name,"domain":domain,"color":color},201)
         if self.path.startswith("/api/gpus/") and self.path.endswith("/assign"):
             # A GPU may belong to several pools at once (one card serving reasoner, worker,
@@ -2627,6 +2737,7 @@ class Handler(SimpleHTTPRequestHandler):
                 else:
                     conn.execute("DELETE FROM gpu_assignments WHERE gpu_id=? AND pool_id=?",(gpu_id,pool_id))
                 pool_ids=[row[0] for row in conn.execute("SELECT pool_id FROM gpu_assignments WHERE gpu_id=? ORDER BY pool_id",(gpu_id,))]
+            logger_settings.info(f"gpu={gpu_id} {'assigned to' if assigned else 'unassigned from'} pool={pool_id} by {user['username']}")
             return self.json({"gpu_id":gpu_id,"pool_ids":pool_ids})
         if self.path=="/api/models":
             required=("name","role","backend","model_path","runtime_path")
@@ -2653,7 +2764,9 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path.startswith("/api/models/downloads/") and self.path.endswith("/cancel"):
             result,status=cancel_download(self.path.split("/")[-2]); return self.json(result,status)
         if self.path in ("/api/stack/start","/api/stack/stop","/api/stack/restart"):
-            result,status=supervisor_call(self.path.rsplit("/",1)[-1],"POST"); return self.json(result,status)
+            action=self.path.rsplit("/",1)[-1]
+            logger_settings.warning(f"stack {action} requested by {user['username']}")
+            result,status=supervisor_call(action,"POST"); return self.json(result,status)
         if self.path.startswith("/api/models/") and self.path.endswith("/activate"):
             mid=self.path.split("/")[-2]
             result,status=activate_model(mid,(body.get("pool_id") or None),(body.get("role") or None))
@@ -2668,7 +2781,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self.json({"started":start_workflow(self.path.split("/")[-2])})
         return self.json({"error":"route inconnue"},404)
 
-    def do_DELETE(self):
+    def do_DELETE(self): self.dispatch("DELETE",self._handle_delete)
+    def _handle_delete(self):
         parsed=urlparse(self.path)
         if parsed.path.startswith("/api/models/"):
             user=self.authorize("models.manage")
@@ -2690,6 +2804,7 @@ class Handler(SimpleHTTPRequestHandler):
                                       "library":str(model_library_dir())},403)
             with db() as conn: conn.execute("DELETE FROM models WHERE id=?",(mid,))
             runtime_log_path(mid).unlink(missing_ok=True)
+            logger_models.info(f"unregistered id={mid} name={row['name']!r} weight_file_removed={removed}")
             return self.json({"deleted":True,"id":mid,"weight_file_removed":removed})
         if parsed.path.startswith("/api/workflow-templates/"):
             user=self.authorize_any("workflow_templates.manage_own","workflow_templates.manage_all")
@@ -2710,9 +2825,28 @@ class Handler(SimpleHTTPRequestHandler):
         return self.json(result,status)
 
 
+def log_periodic_stats(interval_seconds):
+    """A periodic milestone distinct from per-action logging: how busy the process is right
+    now, so an operator tailing the rotating file sees load trends without wading through
+    every individual request."""
+    while True:
+        time.sleep(interval_seconds)
+        try:
+            with db() as conn:
+                active_models=conn.execute("SELECT COUNT(*) FROM models WHERE status IN ('RUNNING','STARTING')").fetchone()[0]
+        except Exception: active_models=None
+        logger_system.info(f"stats: active_workflows={len(ACTIVE)} queued_workflows={len(WORKFLOW_QUEUE)} "
+                           f"active_models={active_models} endpoints={sorted(ACTIVE_ENDPOINTS)} execution_mode={EXECUTION_MODE}")
+
+
 if __name__=="__main__":
-    init_db(); restore_active_endpoints(); recover_pending_workflows()
+    init_db()
+    restored=restore_active_endpoints(); recover_pending_workflows()
+    if restored: logger_system.info(f"restored {len(restored)} runtime endpoint(s) from a previous run: {[r['role'] for r in restored]}")
     server=ThreadingHTTPServer(("127.0.0.1",int(os.getenv("SKEIN_PORT","8787"))),Handler)
+    logger_system.info(f"Skein starting on http://127.0.0.1:{server.server_port} (db={DB_PATH}, logs={LOG_DIR})")
     print(f"Skein disponible sur http://127.0.0.1:{server.server_port}")
+    threading.Thread(target=log_periodic_stats,args=(int(os.getenv("SKEIN_STATS_LOG_INTERVAL_SECONDS","300")),),daemon=True).start()
     try: server.serve_forever()
     except KeyboardInterrupt: pass
+    finally: logger_system.info("Skein shutting down")
