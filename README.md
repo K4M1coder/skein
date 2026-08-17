@@ -187,6 +187,12 @@ $env:SKEIN_TASK_WORKERS = "4"
 
 Queued workflows expose their queue position through the workflow API and History/Execution interface. A workflow moves from `QUEUED` to `RUNNING` only when a workflow slot is available.
 
+## Logging
+
+Skein writes one rotating operational log under `<database directory>/logs/skein.log` (so `%LOCALAPPDATA%\Skein\logs\skein.log` by default, or `<SKEIN_DB_PATH's folder>/logs` when overridden), built on the standard library's `logging` module only — no new dependency. It rotates at `SKEIN_LOG_MAX_BYTES` (default 5,000,000) keeping `SKEIN_LOG_BACKUP_COUNT` backups (default 10); if the log directory cannot be created or written (read-only disk, permissions), Skein falls back to console-only logging instead of failing to start. `SKEIN_LOG_LEVEL` (default `INFO`) controls the file's verbosity; `SKEIN_LOG_CONSOLE_LEVEL` (default `WARNING`) controls what an interactive terminal also echoes.
+
+Every request that reaches the HTTP handler is logged with its method, path, status, duration, and calling user, whether or not the route that served it does anything else — this is the exhaustive layer, and an unhandled exception anywhere in a route now returns a clean `500` JSON body and a full traceback in the log instead of a dead connection. Frequent UI polling (`GET` requests) logs at `DEBUG` to keep the default file focused on real actions and errors; any request answered with a 4xx or 5xx status logs at `WARNING`/`ERROR` regardless of method. On top of that generic layer, richer domain lines are written for events that need more than a path to be legible: authentication (login success/failure, registration, logout, rate-limit trips — usernames are logged, passwords and session tokens never are), model lifecycle (register/configure/activate/stop/unregister, Hugging Face downloads), settings changes (execution mode, SMTP configuration, pool creation, GPU pool assignment, stack start/stop/restart), and the full workflow/task lifecycle (already recorded in the `events` table the UI reads; logging piggybacks on that same `emit()` call so no separate instrumentation was needed). A background thread also logs a periodic stats line (active/queued workflows, active models, execution mode) every `SKEIN_STATS_LOG_INTERVAL_SECONDS` (default 300).
+
 ## Tests
 
 ```powershell
