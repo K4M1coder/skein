@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import base64, csv, ctypes, io, json, mimetypes, os, re, shlex, shutil, signal, sqlite3, subprocess, sys, tempfile, threading, time, uuid, zipfile, hashlib, hmac, secrets, smtplib, ssl
+import base64, csv, ctypes, io, json, mimetypes, os, re, shlex, shutil, signal, sqlite3, struct, subprocess, sys, tempfile, threading, time, uuid, zipfile, hashlib, hmac, secrets, smtplib, ssl
 from collections import deque
 from email.message import EmailMessage
 from concurrent.futures import ThreadPoolExecutor
@@ -66,7 +66,10 @@ def init_db():
           id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, backend TEXT NOT NULL,
           model_path TEXT NOT NULL, runtime_path TEXT NOT NULL, context_size INTEGER NOT NULL,
           port INTEGER NOT NULL, pool_id TEXT, status TEXT NOT NULL, pid INTEGER,
-          endpoint TEXT, last_error TEXT, updated_at REAL NOT NULL);
+          endpoint TEXT, last_error TEXT, updated_at REAL NOT NULL,
+          architecture TEXT, total_params INTEGER, active_params INTEGER,
+          trained_context_length INTEGER, expert_count INTEGER, expert_used_count INTEGER,
+          gguf_parsed_at REAL);
         CREATE TABLE IF NOT EXISTS artifacts(
           id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, task_id TEXT NOT NULL,
           relative_path TEXT NOT NULL, disk_path TEXT NOT NULL, kind TEXT NOT NULL,
@@ -124,6 +127,11 @@ def init_db():
         for column,definition in (("action_type","TEXT NOT NULL DEFAULT 'llm'"),("action_config","TEXT NOT NULL DEFAULT '{}'"),("system_prompt","TEXT NOT NULL DEFAULT ''"),("output_format","TEXT NOT NULL DEFAULT 'markdown'"),("output_schema","TEXT NOT NULL DEFAULT ''")):
             if column not in task_columns: conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} {definition}")
         if "storage_id" not in session_columns: conn.execute("ALTER TABLE sessions ADD COLUMN storage_id TEXT")
+        model_columns={r[1] for r in conn.execute("PRAGMA table_info(models)")}
+        for column,definition in (("architecture","TEXT"),("total_params","INTEGER"),("active_params","INTEGER"),
+                                   ("trained_context_length","INTEGER"),("expert_count","INTEGER"),
+                                   ("expert_used_count","INTEGER"),("gguf_parsed_at","REAL")):
+            if column not in model_columns: conn.execute(f"ALTER TABLE models ADD COLUMN {column} {definition}")
         gpu_assignment_pk=[row["name"] for row in conn.execute("PRAGMA table_info(gpu_assignments)") if row["pk"]]
         if gpu_assignment_pk==["gpu_id"]:
             # A single physical GPU commonly serves every pool at once (reasoner, worker, and
@@ -373,6 +381,102 @@ def detect_quantization(filename):
     return matches[-1].upper() if matches else None
 
 
+GGUF_MAX_HEADER_BYTES=64*1024*1024
+GGUF_SCALAR_FORMATS={0:'<B',1:'<b',2:'<H',3:'<h',4:'<I',5:'<i',6:'<f',7:'<?',10:'<Q',11:'<q',12:'<d'}
+GGUF_STRING_TYPE,GGUF_ARRAY_TYPE=8,9
+
+
+def _read_gguf_string(buf,offset):
+    (length,)=struct.unpack_from('<Q',buf,offset); offset+=8
+    end=offset+length
+    if end>len(buf): raise EOFError("string exceeds header buffer")
+    return buf[offset:end].decode("utf-8",errors="replace"),end
+
+
+def _read_gguf_value(buf,offset,value_type):
+    if value_type==GGUF_STRING_TYPE: return _read_gguf_string(buf,offset)
+    if value_type==GGUF_ARRAY_TYPE:
+        (elem_type,)=struct.unpack_from('<I',buf,offset); offset+=4
+        (count,)=struct.unpack_from('<Q',buf,offset); offset+=8
+        values=[]
+        for _ in range(count):
+            value,offset=_read_gguf_value(buf,offset,elem_type); values.append(value)
+        return values,offset
+    fmt=GGUF_SCALAR_FORMATS.get(value_type)
+    if not fmt: raise ValueError(f"unsupported gguf value type {value_type}")
+    size=struct.calcsize(fmt)
+    if offset+size>len(buf): raise EOFError("scalar exceeds header buffer")
+    (value,)=struct.unpack_from(fmt,buf,offset)
+    return value,offset+size
+
+
+def parse_gguf_metadata(path):
+    """Read a GGUF file's own header: architecture, trained context length, MoE expert
+    counts, and an exact parameter count summed from tensor shapes (most GGUF files never
+    carry general.parameter_count, so the metadata alone cannot give a total). Reads only
+    a bounded prefix of the file, never the weight data, and degrades to partial results
+    instead of raising if a huge tokenizer vocabulary runs past that prefix."""
+    try:
+        with open(path,"rb") as handle: buf=handle.read(GGUF_MAX_HEADER_BYTES)
+    except OSError: return None
+    if buf[:4]!=b"GGUF": return None
+    offset=4
+    (_version,)=struct.unpack_from('<I',buf,offset); offset+=4
+    (tensor_count,)=struct.unpack_from('<Q',buf,offset); offset+=8
+    (kv_count,)=struct.unpack_from('<Q',buf,offset); offset+=8
+    metadata={}
+    try:
+        for _ in range(kv_count):
+            key,offset=_read_gguf_string(buf,offset)
+            (value_type,)=struct.unpack_from('<I',buf,offset); offset+=4
+            value,offset=_read_gguf_value(buf,offset,value_type)
+            if not key.startswith("tokenizer."): metadata[key]=value  # skip huge vocab arrays
+    except (EOFError,struct.error,IndexError,UnicodeError):
+        pass  # keep whatever scalar metadata was read before the truncation
+    architecture=metadata.get("general.architecture")
+    total_params=0; expert_params=0
+    try:
+        for _ in range(tensor_count):
+            name,offset=_read_gguf_string(buf,offset)
+            (n_dims,)=struct.unpack_from('<I',buf,offset); offset+=4
+            dims=struct.unpack_from(f'<{n_dims}Q',buf,offset); offset+=8*n_dims
+            offset+=4+8  # ggml_type, tensor data offset
+            count=1
+            for dim in dims: count*=dim
+            total_params+=count
+            if "exps" in name or "experts" in name: expert_params+=count
+    except (struct.error,IndexError):
+        total_params=None  # tensor section ran past the header prefix; size is unknowable
+    result={
+        "architecture":architecture,
+        "trained_context_length":metadata.get(f"{architecture}.context_length") if architecture else None,
+        "total_params":total_params,
+        "active_params":None,
+    }
+    expert_count=metadata.get(f"{architecture}.expert_count") if architecture else None
+    expert_used=metadata.get(f"{architecture}.expert_used_count") if architecture else None
+    result["expert_count"]=expert_count or None
+    result["expert_used_count"]=expert_used or None
+    if total_params and expert_count and expert_used and expert_params:
+        shared=total_params-expert_params
+        result["active_params"]=round(shared+expert_params*(expert_used/expert_count))
+    return result
+
+
+def model_gguf_metadata(model_id,model_path,parsed_at):
+    """Parse-once-and-cache: GGUF header parsing reads real file bytes, so it happens at
+    registration time and lazily for pre-existing rows, never on every /api/models poll."""
+    if parsed_at: return None  # already cached, nothing to do
+    info=parse_gguf_metadata(model_path) or {}
+    with db() as conn:
+        conn.execute("UPDATE models SET architecture=?,total_params=?,active_params=?,trained_context_length=?,"
+                     "expert_count=?,expert_used_count=?,gguf_parsed_at=? WHERE id=?",
+                     (info.get("architecture"),info.get("total_params"),info.get("active_params"),
+                      info.get("trained_context_length"),info.get("expert_count"),info.get("expert_used_count"),
+                      stamp(),model_id))
+    return info
+
+
 def model_file_entries(limit=MAX_SCANNED_MODEL_FILES):
     """Every GGUF file visible under the configured roots, with registration state."""
     entries, warnings, truncated = [], [], False
@@ -421,7 +525,7 @@ def register_model_file(path, role="available", pool_id=None, name=None, context
     runtime=Path(runtime_path) if runtime_path else find_llama_runtime()
     mid=str(uuid.uuid4())
     with db() as conn:
-        conn.execute("INSERT INTO models VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        conn.execute("INSERT INTO models(id,name,role,backend,model_path,runtime_path,context_size,port,pool_id,status,pid,endpoint,last_error,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
           (mid,str(name or resolved.stem),role,"llama.cpp",str(resolved),str(runtime or ""),
            max(512,int(context_size or 8192)),0,None,"STOPPED",None,None,None,stamp()))
     result,status=configure_model(mid,role,pool_id)
@@ -443,7 +547,7 @@ def discover_local_models(include_available=False):
             for role,port in (("reasoner",8001),("worker",8002)):
                 if conn.execute("SELECT 1 FROM models WHERE role=?",(role,)).fetchone(): continue
                 mid=str(uuid.uuid4())
-                conn.execute("INSERT INTO models VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                conn.execute("INSERT INTO models(id,name,role,backend,model_path,runtime_path,context_size,port,pool_id,status,pid,endpoint,last_error,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (mid,f"Auto {role} · {auto['name']}",role,"llama.cpp",auto["path"],str(runtime),8192,port,None,"STOPPED",None,None,None,stamp()))
                 created.append({"id":mid,"name":auto["name"],"model_path":auto["path"],"role":role})
         if include_available:
@@ -451,7 +555,7 @@ def discover_local_models(include_available=False):
                 if entry["too_small"] or entry["registered"]: continue
                 if conn.execute("SELECT 1 FROM models WHERE model_path=? COLLATE NOCASE",(entry["path"],)).fetchone(): continue
                 mid=str(uuid.uuid4())
-                conn.execute("INSERT INTO models VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                conn.execute("INSERT INTO models(id,name,role,backend,model_path,runtime_path,context_size,port,pool_id,status,pid,endpoint,last_error,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (mid,f"Available · {entry['name']}","available","llama.cpp",entry["path"],str(runtime or ""),8192,0,None,"STOPPED",None,None,None,stamp()))
                 created.append({"id":mid,"name":entry["name"],"model_path":entry["path"],"role":"available","quantization":entry["quantization"]})
     skipped=[entry for entry in entries if entry["too_small"]]
@@ -2221,6 +2325,10 @@ class Handler(SimpleHTTPRequestHandler):
                 item["runnable"]=item["role"] in RUNNABLE_MODEL_ROLES
                 item["quantization"]=detect_quantization(item["model_path"])
                 item["log_available"]=runtime_log_path(item["id"]).exists()
+                try: item["size_bytes"]=Path(item["model_path"]).stat().st_size
+                except OSError: item["size_bytes"]=None
+                fresh=model_gguf_metadata(item["id"],item["model_path"],item["gguf_parsed_at"])
+                if fresh: item.update(fresh)
                 models.append(item)
             return self.json(models)
         if self.path=="/api/models/files":
@@ -2524,7 +2632,7 @@ class Handler(SimpleHTTPRequestHandler):
             required=("name","role","backend","model_path","runtime_path")
             if any(not str(body.get(k,"")).strip() for k in required): return self.json({"error":"nom, rôle, backend et chemins requis"},400)
             mid=str(uuid.uuid4()); port=int(body.get("port",8001)); context=int(body.get("context_size",32768))
-            with db() as conn: conn.execute("INSERT INTO models VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            with db() as conn: conn.execute("INSERT INTO models(id,name,role,backend,model_path,runtime_path,context_size,port,pool_id,status,pid,endpoint,last_error,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
               (mid,body["name"],body["role"],body["backend"],body["model_path"],body["runtime_path"],context,port,None,"STOPPED",None,None,None,stamp()))
             return self.json({"id":mid},201)
         if self.path=="/api/models/autoload":
