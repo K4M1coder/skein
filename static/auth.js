@@ -42,6 +42,7 @@
     if (can("settings.manage")) domainSection("admin-policy", t("executionPolicyPlane"), t("executionSettings"), "rbac-settings");
     if (can("email.manage")) domainSection("admin-email", t("emailPlane"), t("outboundEmailServer"), "smtp-settings");
     if (can("server_stats.read")) domainSection("admin-stats", t("statisticsPlane"), t("privacySafeStatistics"), "privacy-stats");
+    if (can("settings.manage")) domainSection("admin-logs", t("systemLogPlane"), t("systemLogIntro"), "system-log");
     document.querySelector("main").prepend(fragment);
     if (can("users.manage")) {
       const [users, profiles] = await Promise.all([request("/api/users"), request("/api/rbac/profiles")]);
@@ -80,7 +81,7 @@
       if(administrationAccess) await renderAdmin(session);
       window.skeinNavigation.init(session);
       await window.skeinWorkflowTemplates.init(session);
-      const script=document.createElement("script"); script.src="/app.js?v=24"; document.body.appendChild(script);
+      const script=document.createElement("script"); script.src="/app.js?v=25"; document.body.appendChild(script);
       // The model manager depends on app.js helpers, so it must load after it.
       script.onload=()=>{const manager=document.createElement("script"); manager.src="/model-manager.js?v=1"; document.body.appendChild(manager);};
     } catch (error) { showLogin(); }

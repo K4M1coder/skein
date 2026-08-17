@@ -191,6 +191,37 @@ async function loadPoolTelemetry(){
   }catch(error){if(target)target.innerHTML=`<div class="event">${esc(error.message)}</div>`}
 }
 if(can('server_stats.read')||can('settings.manage')||can('models.manage')){loadPoolTelemetry();setInterval(loadPoolTelemetry,5000)}
+
+let logRequestSeq=0;
+const LOG_LEVEL_COLORS={ERROR:'var(--danger)',CRITICAL:'var(--danger)',WARNING:'var(--amber)',INFO:'var(--blue)',DEBUG:'var(--muted)'};
+function formatLogBytes(bytes){if(bytes>=1048576)return(bytes/1048576).toFixed(2)+' MB';if(bytes>=1024)return(bytes/1024).toFixed(1)+' KB';return bytes+' B'}
+// Manual refresh, not polled: an operator reading a log shouldn't have their scroll
+// position and read progress yanked out from under them every few seconds.
+async function loadSystemLog(){
+  let target=$('#system-log'); if(!target) return;
+  if(!target.dataset.wired){
+    target.dataset.wired='1';
+    target.innerHTML=`<div class="log-controls"><select id="log-level"><option value="">${tr('allLevels')}</option>${['DEBUG','INFO','WARNING','ERROR','CRITICAL'].map(level=>`<option value="${level}">${level}</option>`).join('')}</select><input id="log-search" type="search" placeholder="${tr('logSearchPlaceholder')}"><select id="log-limit"><option value="200">200</option><option value="500" selected>500</option><option value="2000">2000</option></select><button id="log-refresh" class="outline">${tr('refresh')}</button></div><div id="log-records" class="log-viewer"></div><div class="log-files-head">${tr('logFiles')}</div><ul id="log-files" class="log-files"></ul>`;
+    $('#log-refresh').onclick=()=>loadSystemLog();
+    $('#log-level').onchange=()=>loadSystemLog();
+    $('#log-limit').onchange=()=>loadSystemLog();
+    $('#log-search').onkeydown=event=>{if(event.key==='Enter'){event.preventDefault();loadSystemLog()}};
+  }
+  let params=new URLSearchParams({limit:$('#log-limit').value});
+  let level=$('#log-level').value,search=$('#log-search').value.trim();
+  if(level)params.set('level',level);
+  if(search)params.set('q',search);
+  let seq=++logRequestSeq;
+  try{
+    let data=await api(`/api/admin/logs?${params}`);
+    if(seq!==logRequestSeq)return;
+    let recordsEl=$('#log-records');
+    recordsEl.innerHTML=data.records.length?data.records.map(r=>`<div class="log-line" style="color:${LOG_LEVEL_COLORS[r.level]||'var(--text)'}"><span class="log-time">${esc(r.timestamp||'')}</span><b class="log-level">${esc(r.level||'')}</b><span class="log-logger">${esc(r.logger||'')}</span><span class="log-message">${esc(r.message)}</span></div>`).join(''):`<p class="log-empty">${tr('noLogRecords')}</p>`;
+    recordsEl.scrollTop=recordsEl.scrollHeight;
+    $('#log-files').innerHTML=data.files.map(f=>`<li><a href="/api/admin/logs/download?file=${encodeURIComponent(f.name)}" download><b>${esc(f.name)}</b></a><small>${formatLogBytes(f.size_bytes)}</small></li>`).join('');
+  }catch(error){if(seq===logRequestSeq)$('#log-records').innerHTML=`<div class="event">${esc(error.message)}</div>`}
+}
+if(can('settings.manage'))loadSystemLog();
 $('#show-model-form').onclick=()=>$('#model-form').classList.toggle('hidden');$('#model-form').onsubmit=async e=>{e.preventDefault();let data=Object.fromEntries(new FormData(e.target));data.context_size=Number(data.context_size);data.port=Number(data.port);try{await api('/api/models',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});e.target.classList.add('hidden');loadModels()}catch(err){showError(err,tr('modelSave'))}};
 $('#discover-models').onclick=async()=>{let button=$('#discover-models');button.disabled=true;try{
   let result=await jsonPost('/api/models/discover');

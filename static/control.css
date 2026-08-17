@@ -40,3 +40,18 @@
 .model-field{display:flex;flex-direction:column;gap:4px;min-width:0}
 .model-field span{color:var(--muted);font:9px monospace;letter-spacing:.05em;text-transform:uppercase}
 .model-specs{color:var(--muted);overflow-wrap:anywhere}.model-actions{display:flex;gap:7px}.model-actions button{background:transparent;border:1px solid var(--line);color:var(--text);padding:7px;cursor:pointer}.state-RUNNING,.state-STARTING{color:var(--lime)}.state-ERROR{color:#ff6b6b}@media(max-width:980px){.model-form,.model-row{grid-template-columns:1fr}.model-row>*{min-width:0}.model-row small{overflow-wrap:anywhere}.metrics{grid-template-columns:repeat(3,1fr)}}
+.log-controls{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+.log-controls select,.log-controls input{font:11px monospace}
+.log-controls input[type=search]{flex:1;min-width:180px}
+.log-viewer{max-height:440px;overflow-y:auto;background:#0d100e;border-radius:6px;padding:8px}
+.log-line{display:flex;gap:8px;padding:2px 4px;border-radius:3px;font:11px/1.5 monospace}
+.log-line:hover{background:#ffffff08}
+.log-time{color:var(--muted);flex-shrink:0;white-space:nowrap}
+.log-level{width:62px;flex-shrink:0;font-size:9px;letter-spacing:.04em}
+.log-logger{color:var(--muted);flex-shrink:0;white-space:nowrap}
+.log-message{white-space:pre-wrap;overflow-wrap:anywhere;flex:1;min-width:0;color:var(--text)}
+.log-empty{margin:0;padding:24px 0;text-align:center;color:var(--muted);font-size:11px}
+.log-files-head{margin:14px 0 6px;color:var(--muted);font:10.5px monospace;letter-spacing:.04em;text-transform:uppercase}
+.log-files{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:8px 18px}
+.log-files li{display:flex;align-items:center;gap:6px;font:11px monospace}
+.log-files li small{color:var(--muted)}

@@ -25,6 +25,7 @@
     { key: "stats", icon: "activity", nav: "statistics", permissions: ["server_stats.read"] },
     { key: "models", icon: "package", nav: "models", permissions: ["models.manage"] },
     { key: "hardware", icon: "cpu", nav: "hardware", permissions: ["server_stats.read", "settings.manage", "models.manage"] },
+    { key: "logs", icon: "terminal", nav: "systemLog", permissions: ["settings.manage"] },
   ];
   const domainSections = {
     access: () => [document.querySelector(".admin-access")],
@@ -33,6 +34,7 @@
     stats: () => [document.querySelector(".admin-stats")],
     hardware: () => [document.querySelector(".hardware")],
     models: () => [document.querySelector(".runtime-gate"), document.querySelector(".model-control"), document.querySelector(".model-files"), document.querySelector(".model-hub")],
+    logs: () => [document.querySelector(".admin-logs")],
   };
   const isAdminView = view => typeof view === "string" && view.startsWith("admin-");
   const domainKey = view => view.slice("admin-".length);
