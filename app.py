@@ -76,6 +76,55 @@ logger_workflow = logger.getChild("workflow")
 logger_settings = logger.getChild("settings")
 logger_system = logger.getChild("system")
 
+LOG_FILE = LOG_DIR / "skein.log"
+LOG_LEVEL_NAMES = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+LOG_LINE_PATTERN = re.compile(r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) (?P<level>[A-Z]+)\s+(?P<logger>\S+): (?P<message>.*)$")
+
+
+def parse_log_records(text):
+    """One record per logged call; a traceback's continuation lines (from logger.exception)
+    have no timestamp of their own, so they fold into the message of the record above them
+    instead of appearing as unreadable orphan rows in the viewer."""
+    records = []
+    for raw_line in text.splitlines():
+        match = LOG_LINE_PATTERN.match(raw_line)
+        if match: records.append(match.groupdict())
+        elif records: records[-1]["message"] += "\n" + raw_line
+        else: records.append({"timestamp": None, "level": None, "logger": None, "message": raw_line})
+    return records
+
+
+def read_log_records(limit=500, level=None, search=None):
+    try: text = LOG_FILE.read_text("utf-8", "replace")
+    except OSError: return []
+    records = parse_log_records(text)
+    if level: records = [r for r in records if r["level"] == level]
+    if search:
+        needle = search.lower()
+        records = [r for r in records if needle in r["message"].lower() or needle in (r["logger"] or "").lower()]
+    return records[-limit:]
+
+
+def log_files_summary():
+    """The active file plus any RotatingFileHandler backups (skein.log.1, .2, ...), oldest
+    last, so the viewer can show how much history exists and offer each one for download."""
+    if not LOG_DIR.exists(): return []
+    files = [LOG_FILE] + sorted(LOG_DIR.glob("skein.log.*"), key=lambda p: int(p.suffix[1:]) if p.suffix[1:].isdigit() else 0)
+    summary = []
+    for path in files:
+        try: stat = path.stat()
+        except OSError: continue
+        summary.append({"name": path.name, "size_bytes": stat.st_size, "modified_at": round(stat.st_mtime, 3)})
+    return summary
+
+
+def log_file_path(name):
+    """Confine downloads to the log directory's own rotated files; reject anything else,
+    the same traversal posture used for weight-file deletion elsewhere in this file."""
+    if not re.fullmatch(r"skein\.log(\.\d+)?", str(name)): return None
+    path = LOG_DIR / name
+    return path if path.is_file() else None
+
 
 def init_db():
     global DB_PATH
@@ -2276,28 +2325,36 @@ class Handler(SimpleHTTPRequestHandler):
         instrumentation at each route, and turns an unhandled exception into a clean 500 JSON
         response instead of a dead connection (previously nothing wrapped do_GET/POST/DELETE,
         so a bug there crashed the connection with a bare traceback on stderr)."""
-        start=time.perf_counter(); status_box={"code":200}
+        start=time.perf_counter(); status_box={"code":200}; disconnected=False
         if not hasattr(self,"_original_send_response"): self._original_send_response=self.send_response
         def send_response(code,*a,**kw):
             status_box["code"]=code; return self._original_send_response(code,*a,**kw)
         self.send_response=send_response
         try:
             handler()
+        except (ConnectionAbortedError,ConnectionResetError,BrokenPipeError):
+            # The client went away mid-response (closed tab, navigated on, a network blip) --
+            # routine, not a bug: keep it out of ERROR and don't try writing to a dead socket.
+            disconnected=True
         except Exception:
             logger_http.exception(f"{method} {self.path} raised an unhandled exception")
             status_box["code"]=500
             try: self.json({"error":"Internal server error"},500)
             except Exception: pass
         finally:
-            duration_ms=(time.perf_counter()-start)*1000; code=status_box["code"]
-            try: user=self.current_user()
-            except Exception: user=None
-            who=user["username"] if user else "anonymous"
-            line=f"{method} {self.path} {code} {duration_ms:.1f}ms user={who}"
-            if code>=500: logger_http.error(line)
-            elif code>=400: logger_http.warning(line)
-            elif method=="GET": logger_http.debug(line)  # frequent UI polling; keep default INFO quiet
-            else: logger_http.info(line)
+            duration_ms=(time.perf_counter()-start)*1000
+            if disconnected:
+                logger_http.info(f"{method} {self.path}: client disconnected after {duration_ms:.1f}ms")
+            else:
+                code=status_box["code"]
+                try: user=self.current_user()
+                except Exception: user=None
+                who=user["username"] if user else "anonymous"
+                line=f"{method} {self.path} {code} {duration_ms:.1f}ms user={who}"
+                if code>=500: logger_http.error(line)
+                elif code>=400: logger_http.warning(line)
+                elif method=="GET": logger_http.debug(line)  # frequent UI polling; keep default INFO quiet
+                else: logger_http.info(line)
     def json(self,data,status=200):
         raw=json.dumps(data,ensure_ascii=False).encode(); self.send_response(status)
         self.send_header("Content-Type","application/json; charset=utf-8"); self.send_header("Content-Length",str(len(raw))); self.end_headers(); self.wfile.write(raw)
@@ -2366,6 +2423,7 @@ class Handler(SimpleHTTPRequestHandler):
             if self.path in ("/api/users","/api/rbac/profiles"): user=self.authorize("users.manage")
             elif self.path=="/api/admin/email": user=self.authorize("email.manage")
             elif self.path=="/api/admin/settings": user=self.authorize("settings.manage")
+            elif urlparse(self.path).path.startswith("/api/admin/logs"): user=self.authorize("settings.manage")
             elif urlparse(self.path).path.startswith("/api/models"): user=self.authorize("models.manage")
             elif self.path.startswith("/api/workflow-templates"): user=self.authorize("workflow_templates.read")
             elif self.path=="/api/hardware" or urlparse(self.path).path=="/api/hardware/telemetry": user=self.authorize_any("server_stats.read","settings.manage","models.manage")
@@ -2396,6 +2454,20 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path=="/api/admin/settings": return self.json({"users_can_choose_execution_mode":setting_bool("users_can_choose_execution_mode")})
         if self.path=="/api/admin/email":
             config=smtp_configuration(); return self.json(config)
+        if urlparse(self.path).path=="/api/admin/logs":
+            query=parse_qs(urlparse(self.path).query)
+            level=(query.get("level") or [""])[0].strip().upper() or None
+            search=(query.get("q") or [""])[0].strip() or None
+            try: limit=max(1,min(5000,int((query.get("limit") or [500])[0])))
+            except ValueError: return self.json({"error":"limit must be an integer"},400)
+            if level and level not in LOG_LEVEL_NAMES: return self.json({"error":f"Unknown level '{level}'","action":f"Choose one of: {', '.join(LOG_LEVEL_NAMES)}."},400)
+            return self.json({"records":read_log_records(limit,level,search),"level_options":LOG_LEVEL_NAMES,
+                              "files":log_files_summary(),"path":str(LOG_FILE)})
+        if urlparse(self.path).path=="/api/admin/logs/download":
+            name=(parse_qs(urlparse(self.path).query).get("file") or ["skein.log"])[0]
+            path=log_file_path(name)
+            if not path: return self.json({"error":"Unknown log file"},404)
+            return self.file(path,path.name)
         if self.path=="/api/server-stats": return self.json(privacy_safe_server_stats())
         if self.path=="/api/sandbox/capabilities": return self.json({"mode":EXECUTION_MODE,"runtimes":sandbox_capabilities()})
         if self.path=="/api/execution-mode": return self.json({"mode":EXECUTION_MODE,"warning":"Local mode runs on the host without isolation." if EXECUTION_MODE=="local" else None})
