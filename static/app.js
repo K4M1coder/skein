@@ -15,6 +15,28 @@ async function refreshHealth(){try{let health=await api('/api/health'),mode=heal
 
 let pools=[];
 const fmt=v=>v===null||v===undefined?'N/A':Math.round(v);
+function formatParamCount(n){if(n>=1e9)return(n/1e9).toFixed(2)+'B';if(n>=1e6)return(n/1e6).toFixed(1)+'M';return String(n)}
+// Facts that stay visible once a model is registered, since the file picker that showed
+// size/quant up front disappears the moment a weight becomes a managed row: file size from
+// a live stat(), plus architecture/context/parameter facts read once from the GGUF header
+// itself and cached server-side (see model_gguf_metadata in app.py).
+function modelSpecsLine(model){
+  let bits=[];
+  if(model.size_bytes)bits.push((model.size_bytes/1073741824).toFixed(2)+' GB');
+  if(model.total_params){
+    let total=formatParamCount(model.total_params);
+    bits.push(model.active_params&&model.active_params<model.total_params
+      ?`${formatParamCount(model.active_params)} ${tr('modelParamsActive')} / ${total} ${tr('modelParamsTotal')}`
+      :`${total} ${tr('modelParamsTotal')}`);
+  }else if(model.size_bytes){
+    bits.push(tr('modelParamsUnavailable'));
+  }
+  let ctx=[`${Number(model.context_size).toLocaleString()} tok (${tr('modelContextConfigured')})`];
+  if(model.trained_context_length&&model.trained_context_length!==model.context_size)
+    ctx.push(`${Number(model.trained_context_length).toLocaleString()} tok (${tr('modelContextTrained')})`);
+  bits.push(ctx.join(' · '));
+  return bits.join(' · ');
+}
 const gpuDrafts=new Map();
 const VRAM_ESTIMATE_COLORS=['var(--blue)','var(--amber)','var(--lime)','var(--danger)'];
 // Per-process VRAM is not measurable here (Windows GeForce/WDDM exposes no per-process
@@ -66,7 +88,7 @@ function renderModels(rows){
   let signature=JSON.stringify(rows.map(m=>[m.id,m.name,m.role,m.pool_id,m.status,m.last_error,m.running]))+JSON.stringify([...modelDrafts])+JSON.stringify(pools.map(p=>p.id));
   if(signature===modelListSignature)return;
   modelListSignature=signature;
-  $('#model-list').innerHTML=rows.map(model=>{let draft=modelDraft(model),dirty=draft.role!==model.role||draft.pool_id!==(model.pool_id||'');let mismatchDomain=poolRoleMismatch(draft.role,draft.pool_id);return `<div class="model-row${dirty?' dirty':''}"><div><strong>${esc(model.name)}</strong>${model.quantization?` <span class="quant">${esc(model.quantization)}</span>`:''}<br><small>${esc(model.model_path)}</small></div><select data-role-for="${model.id}">${MODEL_ROLES.map(role=>`<option value="${role}" ${role===draft.role?'selected':''}>${role}</option>`).join('')}</select><b class="state-${esc(model.status)}">${esc(model.status)}</b><select data-pool-for="${model.id}"><option value="">${tr('unassigned')}</option>${pools.map(pool=>`<option value="${pool.id}" ${pool.id===draft.pool_id?'selected':''}>${esc(pool.name)}</option>`).join('')}</select><div class="model-actions"><button data-save-model="${model.id}">${tr('save')}</button><button data-start="${model.id}">${tr('load')}</button><button data-stop="${model.id}">${tr('unload')}</button>${model.log_available?`<button class="outline" data-model-log="${model.id}">${tr('runtimeLog')}</button>`:''}<button class="outline" data-unregister="${model.id}">${tr('unregister')}</button></div>${model.last_error?`<small class="model-error">${esc(model.last_error)}</small>`:''}${mismatchDomain?`<small class="model-warning">${tr('modelPoolMismatch').replace('{role}',esc(draft.role)).replace('{domain}',esc(mismatchDomain))}</small>`:''}</div>`}).join('')||`<div class="event">${tr('noModels')}</div>`;
+  $('#model-list').innerHTML=rows.map(model=>{let draft=modelDraft(model),dirty=draft.role!==model.role||draft.pool_id!==(model.pool_id||'');let mismatchDomain=poolRoleMismatch(draft.role,draft.pool_id);return `<div class="model-row${dirty?' dirty':''}"><div><strong>${esc(model.name)}</strong>${model.quantization?` <span class="quant">${esc(model.quantization)}</span>`:''}<br><small>${esc(model.model_path)}</small><br><small class="model-specs">${esc(modelSpecsLine(model))}</small></div><label class="model-field"><span>${tr('role')}</span><select data-role-for="${model.id}">${MODEL_ROLES.map(role=>`<option value="${role}" ${role===draft.role?'selected':''}>${role}</option>`).join('')}</select></label><b class="state-${esc(model.status)}">${esc(model.status)}</b><label class="model-field"><span>${tr('pool')}</span><select data-pool-for="${model.id}"><option value="">${tr('unassigned')}</option>${pools.map(pool=>`<option value="${pool.id}" ${pool.id===draft.pool_id?'selected':''}>${esc(pool.name)}</option>`).join('')}</select></label><div class="model-actions"><button data-save-model="${model.id}">${tr('save')}</button><button data-start="${model.id}">${tr('load')}</button><button data-stop="${model.id}">${tr('unload')}</button>${model.log_available?`<button class="outline" data-model-log="${model.id}">${tr('runtimeLog')}</button>`:''}<button class="outline" data-unregister="${model.id}">${tr('unregister')}</button></div>${model.last_error?`<small class="model-error">${esc(model.last_error)}</small>`:''}${mismatchDomain?`<small class="model-warning">${tr('modelPoolMismatch').replace('{role}',esc(draft.role)).replace('{domain}',esc(mismatchDomain))}</small>`:''}</div>`}).join('')||`<div class="event">${tr('noModels')}</div>`;
   document.querySelectorAll('[data-role-for]').forEach(select=>select.onchange=()=>rememberDraft(select.dataset.roleFor,'role',select.value));
   document.querySelectorAll('[data-pool-for]').forEach(select=>select.onchange=()=>rememberDraft(select.dataset.poolFor,'pool_id',select.value));
   let payload=id=>{let draft=modelDrafts.get(id)||{};return {role:$(`[data-role-for="${id}"]`)?.value??draft.role,pool_id:($(`[data-pool-for="${id}"]`)?.value??draft.pool_id)||null}};
