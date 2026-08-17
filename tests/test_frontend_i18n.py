@@ -112,6 +112,28 @@ class FrontendLocalizationTest(unittest.TestCase):
         self.assertIn("data-runtime-chart", feature_source)
         self.assertIn("runtimeCharts.forEach", feature_source)
 
+    def test_a_reasoner_model_pointed_at_a_worker_pool_is_flagged(self):
+        """role and pool_id are independent fields (workflow tier vs. GPU pool), so a
+        mismatch (a reasoner-role model assigned to a worker-domain pool) is never
+        rejected — it can be exactly what an operator wants — but it is easy to create by
+        accident and was previously invisible, so it must be flagged for review."""
+        feature_source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("poolRoleMismatch", feature_source)
+        self.assertIn("ROLE_EXPECTED_DOMAIN", feature_source)
+        self.assertIn("modelPoolMismatch", feature_source)
+        styles = (ROOT / "static" / "model-manager.css").read_text(encoding="utf-8")
+        self.assertIn(".model-warning", styles)
+
+    def test_model_pool_select_survives_the_hardware_fetch_race(self):
+        """loadModels() and loadHardware() start together, and /api/models usually answers
+        first since /api/hardware waits on nvidia-smi — so the pool <option> list is empty
+        on renderModels()'s very first call. The render-skip signature must track the pools
+        array too, or a model's pool select renders permanently blank (regression:
+        confirmed live — a correctly-persisted pool_id still showed as "Unassigned" because
+        no other change ever bumped the signature afterward)."""
+        feature_source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("JSON.stringify(pools.map(p=>p.id))", feature_source)
+
     def test_legacy_dom_translation_scanner_is_removed(self):
         self.assertNotIn("TreeWalker", self.catalog_source)
         self.assertNotIn("MutationObserver", self.catalog_source)

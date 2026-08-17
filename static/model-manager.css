@@ -4,6 +4,7 @@
 .model-row.dirty{border-color:var(--lime)}
 .model-row .quant{padding:1px 6px;border:1px solid var(--line);font:10px monospace;color:var(--muted)}
 .model-error{grid-column:1/-1;color:#ff6b6b;overflow-wrap:anywhere}
+.model-warning{grid-column:1/-1;color:var(--amber);overflow-wrap:anywhere}
 .model-roots{margin:10px 0;border:1px solid var(--line);background:var(--panel);padding:12px}
 .model-roots summary{cursor:pointer;font:12px monospace}
 .model-roots form{display:grid;gap:8px;margin-top:12px}

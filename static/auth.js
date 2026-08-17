@@ -80,7 +80,7 @@
       if(administrationAccess) await renderAdmin(session);
       window.skeinNavigation.init(session);
       await window.skeinWorkflowTemplates.init(session);
-      const script=document.createElement("script"); script.src="/app.js?v=21"; document.body.appendChild(script);
+      const script=document.createElement("script"); script.src="/app.js?v=23"; document.body.appendChild(script);
       // The model manager depends on app.js helpers, so it must load after it.
       script.onload=()=>{const manager=document.createElement("script"); manager.src="/model-manager.js?v=1"; document.body.appendChild(manager);};
     } catch (error) { showLogin(); }
