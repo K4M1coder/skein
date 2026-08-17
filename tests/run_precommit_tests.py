@@ -13,6 +13,7 @@ SUITES = (
     "tests.test_workflow_resilience",
     "tests.test_smoke",
     "tests.test_auth",
+    "tests.test_logging",
 )
 
 
