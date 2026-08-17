@@ -2,6 +2,7 @@
 import importlib
 import json
 import os
+import struct
 import tempfile
 import threading
 import unittest
@@ -28,6 +29,42 @@ def write_weights(name, megabytes=2):
     path = MODEL_ROOT / name
     path.write_bytes(b"GGUF" + b"\0" * (megabytes * 1048576))
     return path
+
+
+def _gguf_string(value):
+    encoded = value.encode("utf-8")
+    return struct.pack("<Q", len(encoded)) + encoded
+
+
+def build_gguf(path, architecture, scalars=None, tensors=None):
+    """A minimal real GGUF header (magic, version, kv metadata, tensor shapes) — no weight
+    payload bytes, since parse_gguf_metadata never reads past the tensor-shape section."""
+    scalars = scalars or {}
+    tensors = tensors or []
+    kv = {"general.architecture": ("str", architecture)}
+    kv.update(scalars)
+    buf = bytearray(b"GGUF")
+    buf += struct.pack("<I", 3)
+    buf += struct.pack("<Q", len(tensors))
+    buf += struct.pack("<Q", len(kv))
+    for key, (kind, value) in kv.items():
+        buf += _gguf_string(key)
+        if kind == "str":
+            buf += struct.pack("<I", 8) + _gguf_string(value)
+        elif kind == "u32":
+            buf += struct.pack("<I", 4) + struct.pack("<I", value)
+        elif kind == "u64":
+            buf += struct.pack("<I", 10) + struct.pack("<Q", value)
+        else:
+            raise ValueError(f"unsupported scalar kind {kind}")
+    for name, dims in tensors:
+        buf += _gguf_string(name)
+        buf += struct.pack("<I", len(dims))
+        for dim in dims:
+            buf += struct.pack("<Q", dim)
+        buf += struct.pack("<I", 0)  # ggml_type, irrelevant to element counting
+        buf += struct.pack("<Q", 0)  # tensor data offset, unused since no payload is written
+    path.write_bytes(bytes(buf))
 
 
 class ModelManagerTest(unittest.TestCase):
@@ -290,6 +327,52 @@ class ModelManagerTest(unittest.TestCase):
             self.assertIn("running", model)
             self.assertIn("runnable", model)
             self.assertIn("log_available", model)
+
+    # GGUF header metadata: size, context, and parameter counts stay visible after registration -----
+
+    def test_gguf_metadata_is_parsed_from_tensor_shapes_and_cached(self):
+        path = MODEL_ROOT / "Synth-Dense-Q4_0.gguf"
+        build_gguf(path, "synthdense", scalars={"synthdense.context_length": ("u32", 8192)},
+                   tensors=[("blk.0.attn.weight", [4096, 4096]), ("blk.0.ffn.weight", [4096, 11008])])
+        model = self.register(path)
+        status, models = self.call("/api/models")
+        self.assertEqual(status, 200)
+        row = next(m for m in models if m["id"] == model["id"])
+        expected_total = 4096 * 4096 + 4096 * 11008
+        self.assertEqual(row["architecture"], "synthdense")
+        self.assertEqual(row["trained_context_length"], 8192)
+        self.assertEqual(row["total_params"], expected_total)
+        self.assertIsNone(row["active_params"])
+        self.assertGreater(row["size_bytes"], 0)
+        with app.db() as conn:
+            cached = conn.execute("SELECT gguf_parsed_at, total_params FROM models WHERE id=?", (model["id"],)).fetchone()
+        self.assertIsNotNone(cached["gguf_parsed_at"])
+        self.assertEqual(cached["total_params"], expected_total)
+
+    def test_moe_model_reports_active_and_total_params_separately(self):
+        path = MODEL_ROOT / "Synth-MoE-Q4_0.gguf"
+        build_gguf(path, "synthmoe", scalars={
+            "synthmoe.context_length": ("u32", 4096),
+            "synthmoe.expert_count": ("u32", 8),
+            "synthmoe.expert_used_count": ("u32", 2),
+        }, tensors=[("blk.0.attn.weight", [1000, 1000]), ("blk.0.ffn_gate_exps.weight", [8, 1000, 1000])])
+        model = self.register(path)
+        status, models = self.call("/api/models")
+        self.assertEqual(status, 200)
+        row = next(m for m in models if m["id"] == model["id"])
+        shared, expert_pool = 1000 * 1000, 8 * 1000 * 1000
+        self.assertEqual(row["expert_count"], 8)
+        self.assertEqual(row["expert_used_count"], 2)
+        self.assertEqual(row["total_params"], shared + expert_pool)
+        self.assertAlmostEqual(row["active_params"], shared + expert_pool * (2 / 8), delta=1)
+
+    def test_a_placeholder_weight_without_a_real_header_reports_no_params(self):
+        model = self.register(self.small)
+        status, models = self.call("/api/models")
+        self.assertEqual(status, 200)
+        row = next(m for m in models if m["id"] == model["id"])
+        self.assertFalse(row["total_params"])
+        self.assertGreater(row["size_bytes"], 0)
 
 
 if __name__ == "__main__":
