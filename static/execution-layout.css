@@ -51,6 +51,9 @@
 .runtime-counters { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin-top: 14px; }
 .runtime-counters b { display: block; font: 600 13px ui-monospace, monospace; color: var(--text); }
 .runtime-counters span { display: block; padding: 7px; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); font-size: 9px; }
+.runtime-chart { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
+.runtime-chart:empty { display: none; }
+.runtime-chart .telemetry-empty { grid-column: 1 / -1; margin: 0; padding: 14px 0; font-size: 10px; }
 .runtime-recap { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin-top: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
 .runtime-recap div { min-width: 0; }
 .runtime-recap b { display: block; overflow: hidden; color: var(--lime); font: 600 12px ui-monospace, monospace; text-overflow: ellipsis; white-space: nowrap; }

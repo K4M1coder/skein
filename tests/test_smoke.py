@@ -140,6 +140,20 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(workers_metrics["assigned_gpus"], 0)
         self.assertEqual(workers_metrics["running_models"], 1)
 
+    def test_pool_metrics_list_the_models_configured_for_them(self):
+        """A pool card only showed anonymous numbers; an operator glancing at it could not
+        tell which model those numbers belonged to without leaving the page."""
+        status, created = self.request("/api/models", {"name": "Pool model list test", "role": "worker",
+          "backend": "llama.cpp", "model_path": "Z:/missing/model.gguf",
+          "runtime_path": "Z:/missing/llama-server.exe", "context_size": 8192, "port": 18097})
+        self.assertEqual(status, 201)
+        self.request(f"/api/models/{created['id']}/configure", {"role": "worker", "pool_id": "workers"})
+        _, hardware = self.request("/api/hardware")
+        workers = next(pool for pool in hardware["pool_metrics"] if pool["pool_id"] == "workers")
+        self.assertIn({"name": "Pool model list test", "role": "worker", "status": "STOPPED"}, workers["models"])
+        reasoner = next(pool for pool in hardware["pool_metrics"] if pool["pool_id"] == "reasoner")
+        self.assertNotIn("Pool model list test", [model["name"] for model in reasoner["models"]])
+
     def test_a_gpu_can_serve_every_pool_at_once(self):
         """The common single-GPU setup: one card runs reasoner, worker, and retrieval
         together. Each pool must report the card's full telemetry, not a zero-sum split."""

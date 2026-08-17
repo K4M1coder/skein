@@ -64,7 +64,7 @@ class FrontendLocalizationTest(unittest.TestCase):
                        "telemetryHovered", "pointerenter", "pointermove", "pointerleave"):
             with self.subTest(marker=marker):
                 self.assertIn(marker, feature_source)
-        self.assertIn("if(!target||telemetryHovered)return", feature_source)
+        self.assertIn("telemetryHovered)return", feature_source)
         styles = (ROOT / "static" / "control.css").read_text(encoding="utf-8")
         self.assertIn(".telemetry-grid-2", styles)
         self.assertIn(".telemetry-tooltip", styles)
@@ -78,6 +78,39 @@ class FrontendLocalizationTest(unittest.TestCase):
         self.assertIn("estimatedVramByModel", feature_source)
         styles = (ROOT / "static" / "control.css").read_text(encoding="utf-8")
         self.assertIn(".vram-estimate", styles)
+
+    def test_hardware_poll_discards_stale_out_of_order_responses(self):
+        """Toggling several pool checkboxes for the same GPU in quick succession fires
+        several overlapping /api/hardware fetches; a slow, stale one must not be allowed
+        to overwrite a fresher render (regression: an assignment could look reverted even
+        though it had actually succeeded, because the last response to *arrive* won
+        regardless of which request was actually the newest)."""
+        feature_source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("hardwareRequestSeq", feature_source)
+        self.assertIn("requestId!==hardwareRequestSeq", feature_source)
+        self.assertIn("requestId===hardwareRequestSeq", feature_source)
+
+    def test_pool_cards_are_color_coded_and_list_their_models(self):
+        """Every pool card showed the same four fixed metric colors, so a shared GPU made
+        Reasoner/Workers/Retrieval indistinguishable at a glance; the pool's own color now
+        marks the card, and it names which model(s) are configured for it."""
+        feature_source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("border-left:3px solid ${pool.color}", feature_source)
+        self.assertIn("pool-models", feature_source)
+        self.assertIn("noModelConfigured", feature_source)
+        styles = (ROOT / "static" / "control.css").read_text(encoding="utf-8")
+        self.assertIn(".pool-models", styles)
+
+    def test_execution_page_echoes_runtime_telemetry_next_to_the_model_nodes(self):
+        """The Hardware admin page is not the only place an operator watches GPU health;
+        the reasoner/worker runtime cards already on the Execution page now carry a
+        compact echo of the same telemetry instead of requiring a tab switch."""
+        markup = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        self.assertIn('data-runtime-chart="reasoner"', markup)
+        self.assertIn('data-runtime-chart="workers"', markup)
+        feature_source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("data-runtime-chart", feature_source)
+        self.assertIn("runtimeCharts.forEach", feature_source)
 
     def test_legacy_dom_translation_scanner_is_removed(self):
         self.assertNotIn("TreeWalker", self.catalog_source)

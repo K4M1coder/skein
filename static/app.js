@@ -27,14 +27,21 @@ function renderVramEstimate(gpu){
   let rows=models.map((model,index)=>`<li><i style="background:${VRAM_ESTIMATE_COLORS[index%VRAM_ESTIMATE_COLORS.length]}"></i><span>${esc(model.name)}</span><small>${esc(model.role)}</small><b>≈ ${fmt(model.estimated_vram_mb)} MB</b></li>`).join('');
   return `<div class="vram-estimate"><div class="vram-estimate-head"><small>${tr('estimatedVramByModel')}</small><span class="info-dot" title="${esc(gpu.vram_estimation_method||'')}">?</span></div><div class="vram-estimate-bar">${bar}</div><ul class="vram-estimate-list">${rows}</ul></div>`;
 }
-async function loadHardware(){try{let h=await api('/api/hardware');pools=h.pools;$('#node').textContent=h.node.name+' · ONLINE';$('#node-stats').innerHTML=`<div class="stat"><b>${fmt(h.node.cpu_utilization)}%</b><span>CPU NODE</span></div><div class="stat"><b>${h.node.gpu_count}</b><span>${tr('detectedGpus')}</span></div><div class="stat"><b>${fmt(h.node.gpu_power_w)} W</b><span>${tr('gpuPower')}</span></div>`;$('#pool-legend').innerHTML=pools.map(pool=>`<span><i style="background:${pool.color}"></i>${esc(pool.name)} · ${pool.domain}</span>`).join('');$('#gpu-grid').innerHTML=h.gpus.map(gpu=>{let pct=gpu.memory_total_mb&&gpu.memory_used_mb!==null?gpu.memory_used_mb/gpu.memory_total_mb*100:0;
+let hardwareRequestSeq=0;
+async function loadHardware(){
+  // Toggling several checkboxes for the same GPU in quick succession fires several
+  // overlapping fetches; whichever response arrives last used to win regardless of which
+  // request was actually newest, so a slow, stale response could silently overwrite a
+  // fresher render and make an assignment look reverted even though it had succeeded.
+  let requestId=++hardwareRequestSeq;
+  try{let h=await api('/api/hardware');if(requestId!==hardwareRequestSeq)return;pools=h.pools;$('#node').textContent=h.node.name+' · ONLINE';$('#node-stats').innerHTML=`<div class="stat"><b>${fmt(h.node.cpu_utilization)}%</b><span>CPU NODE</span></div><div class="stat"><b>${h.node.gpu_count}</b><span>${tr('detectedGpus')}</span></div><div class="stat"><b>${fmt(h.node.gpu_power_w)} W</b><span>${tr('gpuPower')}</span></div>`;$('#pool-legend').innerHTML=pools.map(pool=>`<span><i style="background:${pool.color}"></i>${esc(pool.name)} · ${pool.domain}</span>`).join('');$('#gpu-grid').innerHTML=h.gpus.map(gpu=>{let pct=gpu.memory_total_mb&&gpu.memory_used_mb!==null?gpu.memory_used_mb/gpu.memory_total_mb*100:0;
   // A GPU can belong to several pools at once (one card serving reasoner, worker, and
   // retrieval together). The periodic 2.5s poll must never show a stale checkbox state
   // while a toggle is in flight, so each (gpu,pool) pair keeps its own pending draft.
   let assignedPools=new Set(gpu.pool_ids||[]);
   let checks=pools.map(pool=>{let key=gpu.id+'::'+pool.id,checked=gpuDrafts.has(key)?gpuDrafts.get(key):assignedPools.has(pool.id);return `<label class="gpu-pool-check"><input type="checkbox" data-gpu="${encodeURIComponent(gpu.id)}" data-pool="${pool.id}" ${checked?'checked':''}> ${esc(pool.name)}</label>`}).join('');
   let vramEstimate=renderVramEstimate(gpu);
-  return `<article class="gpu-card"><header><div><small>GPU ${gpu.index} · ${esc(gpu.vendor)} · ${esc(gpu.metrics_source)}</small><h3>${esc(gpu.name)}</h3></div><b>${fmt(gpu.utilization)}%</b></header><div class="meter"><i style="width:${pct}%"></i></div><small>${fmt(gpu.memory_used_mb)} / ${fmt(gpu.memory_total_mb)} MiB VRAM</small><div class="metrics"><div class="metric"><b>${fmt(gpu.temperature_c)}°</b><span>TEMP</span></div><div class="metric"><b>${fmt(gpu.power_w)} W</b><span>POWER</span></div><div class="metric"><b>${fmt(gpu.utilization)}%</b><span>LOAD</span></div></div>${vramEstimate}<div class="gpu-pools">${checks}</div></article>`}).join('')||`<div class="event">${tr('noGpu')}</div>`;document.querySelectorAll('[data-gpu][data-pool]').forEach(box=>box.onchange=async()=>{let gpuId=decodeURIComponent(box.dataset.gpu),poolId=box.dataset.pool,checked=box.checked,key=gpuId+'::'+poolId;gpuDrafts.set(key,checked);try{await api('/api/gpus/'+box.dataset.gpu+'/assign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pool_id:poolId,assigned:checked})})}catch(error){showError(error,tr('hardwareControlPlane'))}finally{gpuDrafts.delete(key);await loadHardware()}})}catch(e){$('#node').textContent='TELEMETRY ERROR'}}
+  return `<article class="gpu-card"><header><div><small>GPU ${gpu.index} · ${esc(gpu.vendor)} · ${esc(gpu.metrics_source)}</small><h3>${esc(gpu.name)}</h3></div><b>${fmt(gpu.utilization)}%</b></header><div class="meter"><i style="width:${pct}%"></i></div><small>${fmt(gpu.memory_used_mb)} / ${fmt(gpu.memory_total_mb)} MiB VRAM</small><div class="metrics"><div class="metric"><b>${fmt(gpu.temperature_c)}°</b><span>TEMP</span></div><div class="metric"><b>${fmt(gpu.power_w)} W</b><span>POWER</span></div><div class="metric"><b>${fmt(gpu.utilization)}%</b><span>LOAD</span></div></div>${vramEstimate}<div class="gpu-pools">${checks}</div></article>`}).join('')||`<div class="event">${tr('noGpu')}</div>`;document.querySelectorAll('[data-gpu][data-pool]').forEach(box=>box.onchange=async()=>{let gpuId=decodeURIComponent(box.dataset.gpu),poolId=box.dataset.pool,checked=box.checked,key=gpuId+'::'+poolId;gpuDrafts.set(key,checked);try{await api('/api/gpus/'+box.dataset.gpu+'/assign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pool_id:poolId,assigned:checked})})}catch(error){showError(error,tr('hardwareControlPlane'))}finally{gpuDrafts.delete(key);await loadHardware()}})}catch(e){if(requestId===hardwareRequestSeq)$('#node').textContent='TELEMETRY ERROR'}}
 const MODEL_ROLES=['available','reasoner','worker','embedding','reranker'];
 const modelDrafts=new Map();let modelListSignature=null,modelActionBusy=false;
 const jsonPost=(path,body)=>api(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
@@ -115,21 +122,37 @@ function wireMetricCharts(root){
   });
 }
 async function loadPoolTelemetry(){
-  let target=$('#pool-telemetry'); if(!target||telemetryHovered)return;
+  let target=$('#pool-telemetry'),runtimeCharts=[...document.querySelectorAll('[data-runtime-chart]')];
+  if((!target&&!runtimeCharts.length)||telemetryHovered)return;
   try{
     let data=await api('/api/hardware/telemetry?window=900'),current=new Map(data.current.pool_metrics.map(item=>[item.pool_id,item])),byPool=new Map();
     data.history.forEach(item=>{if(!byPool.has(item.pool_id))byPool.set(item.pool_id,[]);byPool.get(item.pool_id).push(item)});
-    target.innerHTML=data.current.pools.map(pool=>{
-      let latest=current.get(pool.id)||{},points=(byPool.get(pool.id)||[]).map(point=>({...point,memory_pct:point.memory_total_mb?100*point.memory_used_mb/point.memory_total_mb:null}));
-      return `<article class="pool-chart"><p class="eyebrow">${esc(pool.domain.toUpperCase())}</p><h3>${esc(pool.name)}</h3><div class="summary"><span><b>${latest.assigned_gpus||0}</b> ${tr('assignedGpus')}</span><span><b>${fmt(latest.power_w)} W</b> ${tr('telemetryPower')}</span><span><b>${fmt(latest.utilization)}%</b> ${tr('telemetryGpuLoad')}</span></div>${!latest.assigned_gpus&&latest.running_models?`<p class="pool-warning">${tr('poolRunningWithoutGpu').replace('{count}',latest.running_models)}</p>`:''}<div class="telemetry-grid-2">`
+    let pointsFor=poolId=>(byPool.get(poolId)||[]).map(point=>({...point,memory_pct:point.memory_total_mb?100*point.memory_used_mb/point.memory_total_mb:null}));
+    if(target)target.innerHTML=data.current.pools.map(pool=>{
+      let latest=current.get(pool.id)||{},points=pointsFor(pool.id);
+      let models=latest.models||[];
+      // The four metrics use one fixed color per metric type (comparable across pools);
+      // the pool's own color instead marks the card itself, so Reasoner/Workers/Retrieval
+      // are still visually distinct at a glance even when their shared-GPU values match.
+      let modelsList=models.length?`<ul class="pool-models">${models.map(model=>`<li><b class="state-${esc(model.status)}">${esc(model.status)}</b><span>${esc(model.name)}</span><small>${esc(model.role)}</small></li>`).join('')}</ul>`:`<p class="pool-models-empty">${tr('noModelConfigured')}</p>`;
+      return `<article class="pool-chart" style="border-left:3px solid ${pool.color}"><p class="eyebrow">${esc(pool.domain.toUpperCase())}</p><h3>${esc(pool.name)}</h3><div class="summary"><span><b>${latest.assigned_gpus||0}</b> ${tr('assignedGpus')}</span><span><b>${fmt(latest.power_w)} W</b> ${tr('telemetryPower')}</span><span><b>${fmt(latest.utilization)}%</b> ${tr('telemetryGpuLoad')}</span></div>${!latest.assigned_gpus&&latest.running_models?`<p class="pool-warning">${tr('poolRunningWithoutGpu').replace('{count}',latest.running_models)}</p>`:''}<div class="pool-models-head">${tr('models')}</div>${modelsList}<div class="telemetry-grid-2">`
         +renderMetricChart(points,{valueKey:'power_w',color:'var(--blue)',unit:' W',domain:'auto',label:tr('telemetryPower')})
         +renderMetricChart(points,{valueKey:'utilization',color:'var(--lime)',unit:'%',domain:[0,100],label:tr('telemetryGpuLoad')})
         +renderMetricChart(points,{valueKey:'memory_pct',color:'var(--amber)',unit:'%',domain:[0,100],label:tr('telemetryMemory')})
         +renderMetricChart(points,{valueKey:'temperature_c',color:'var(--danger)',unit:'°C',domain:[20,100],label:tr('telemetryTemperature')})
         +`</div></article>`;
     }).join('')||`<div class="event">${tr('noPools')}</div>`;
-    wireMetricCharts(target);
-  }catch(error){target.innerHTML=`<div class="event">${esc(error.message)}</div>`}
+    // Compact echo of the same two key metrics next to the reasoner/worker runtime cards
+    // already on the Execution page, so a live health check doesn't require a tab switch.
+    runtimeCharts.forEach(container=>{
+      let poolId=container.dataset.runtimeChart,points=pointsFor(poolId);
+      container.innerHTML=points.length
+        ?renderMetricChart(points,{valueKey:'power_w',color:'var(--blue)',unit:' W',domain:'auto',label:tr('telemetryPower')})
+          +renderMetricChart(points,{valueKey:'utilization',color:'var(--lime)',unit:'%',domain:[0,100],label:tr('telemetryGpuLoad')})
+        :`<p class="telemetry-empty">${tr('telemetryUnavailable')}</p>`;
+    });
+    wireMetricCharts(document);
+  }catch(error){if(target)target.innerHTML=`<div class="event">${esc(error.message)}</div>`}
 }
 if(can('server_stats.read')||can('settings.manage')||can('models.manage')){loadPoolTelemetry();setInterval(loadPoolTelemetry,5000)}
 $('#show-model-form').onclick=()=>$('#model-form').classList.toggle('hidden');$('#model-form').onsubmit=async e=>{e.preventDefault();let data=Object.fromEntries(new FormData(e.target));data.context_size=Number(data.context_size);data.port=Number(data.port);try{await api('/api/models',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});e.target.classList.add('hidden');loadModels()}catch(err){showError(err,tr('modelSave'))}};

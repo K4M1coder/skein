@@ -541,6 +541,9 @@ def hardware_snapshot():
           "SELECT pool_id, COUNT(*) AS count FROM models WHERE status='RUNNING' AND pool_id IS NOT NULL GROUP BY pool_id")}
         running_models = [dict(r) for r in conn.execute(
           "SELECT id,name,role,pool_id,model_path,context_size FROM models WHERE status='RUNNING'")]
+        models_by_pool = {}
+        for row in conn.execute("SELECT name,role,status,pool_id FROM models WHERE pool_id IS NOT NULL ORDER BY name"):
+            models_by_pool.setdefault(row["pool_id"], []).append({"name":row["name"],"role":row["role"],"status":row["status"]})
     for gpu in gpus: gpu["pool_ids"] = assignments.get(gpu["id"], [])
     gpus_by_pool = {}
     for gpu in gpus:
@@ -580,7 +583,8 @@ def hardware_snapshot():
           "gpu_ids":[gpu["id"] for gpu in members],
           # A model can run in this pool (its process is live, using whatever GPU the driver
           # picks) even though no GPU is assigned here; surface that gap instead of a silent 0.
-          "running_models":running_by_pool.get(pool["id"],0)})
+          "running_models":running_by_pool.get(pool["id"],0),
+          "models":models_by_pool.get(pool["id"],[])})
     return {"node":{"name":os.environ.get("COMPUTERNAME","local-node"),"cpu_utilization":cpu,
       "gpu_power_w":round(sum(g["power_w"] or 0 for g in gpus),1),"gpu_count":len(gpus)},
       "gpus":gpus,"pools":pools,"pool_metrics":pool_metrics,"timestamp":stamp()}
