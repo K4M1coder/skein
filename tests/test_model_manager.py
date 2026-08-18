@@ -349,6 +349,28 @@ class ModelManagerTest(unittest.TestCase):
         self.assertIsNotNone(cached["gguf_parsed_at"])
         self.assertEqual(cached["total_params"], expected_total)
 
+    def test_a_truncated_tensor_name_does_not_crash_the_model_list(self):
+        """A tensor-section string whose declared length runs past the header buffer must
+        degrade to partial results, the same way a truncated kv-metadata section already
+        does just above it in parse_gguf_metadata — not raise and take the whole /api/models
+        list down with a 500 for every registered model, not just this corrupt one."""
+        path = MODEL_ROOT / "Synth-Truncated-Q4_0.gguf"
+        buf = bytearray(b"GGUF")
+        buf += struct.pack("<I", 3)  # version
+        buf += struct.pack("<Q", 1)  # tensor_count
+        buf += struct.pack("<Q", 1)  # kv_count
+        buf += _gguf_string("general.architecture")
+        buf += struct.pack("<I", 8) + _gguf_string("synthtrunc")
+        buf += struct.pack("<Q", 10_000_000)  # tensor name claims far more bytes than follow
+        buf += b"short"
+        path.write_bytes(bytes(buf))
+        model = self.register(path)
+        status, models = self.call("/api/models")
+        self.assertEqual(status, 200)
+        row = next(m for m in models if m["id"] == model["id"])
+        self.assertEqual(row["architecture"], "synthtrunc")
+        self.assertIsNone(row["total_params"])
+
     def test_moe_model_reports_active_and_total_params_separately(self):
         path = MODEL_ROOT / "Synth-MoE-Q4_0.gguf"
         build_gguf(path, "synthmoe", scalars={

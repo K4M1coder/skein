@@ -42,6 +42,29 @@ class LoggingSetupTest(unittest.TestCase):
         app.configure_logging()
         self.assertEqual(len(app.logger.handlers), before)
 
+    def test_relocating_the_log_directory_moves_the_file_handler_and_future_writes(self):
+        """init_db() calls this when the default DB location is unwritable and it falls back
+        to another directory; LOG_DIR was already fixed at import time (before init_db can
+        run), so without an explicit relocation the log file would keep writing to a
+        directory unrelated to where the database ended up living."""
+        original_dir, original_file = app.LOG_DIR, app.LOG_FILE
+        new_dir = WORKSPACE / "relocated-db"
+        try:
+            app.relocate_log_directory(new_dir)
+            self.assertEqual(app.LOG_DIR, new_dir / "logs")
+            self.assertEqual(app.LOG_FILE, new_dir / "logs" / "skein.log")
+            file_handlers = [h for h in app.logger.handlers if isinstance(h, logging.handlers.RotatingFileHandler)]
+            self.assertEqual(len(file_handlers), 1, "the old file handler must be replaced, not stacked")
+            self.assertEqual(Path(file_handlers[0].baseFilename), (new_dir / "logs" / "skein.log").resolve())
+            marker = "distinctive-marker-after-relocation"
+            app.logger_system.info(marker)
+            for handler in app.logger.handlers:
+                if hasattr(handler, "flush"): handler.flush()
+            self.assertIn(marker, app.LOG_FILE.read_text("utf-8"))
+        finally:
+            app.relocate_log_directory(original_dir.parent)
+            self.assertEqual(app.LOG_DIR, original_dir); self.assertEqual(app.LOG_FILE, original_file)
+
     def test_rotation_actually_produces_a_backup_file_under_a_tiny_size_cap(self):
         # A dedicated small-cap logger proves RotatingFileHandler rolls over correctly,
         # independent of however much the shared app logger has already written this run.

@@ -132,9 +132,12 @@ class SmokeTest(unittest.TestCase):
 
         # A model can be RUNNING in a pool that has no GPU assigned to it (the runtime
         # started without CUDA_VISIBLE_DEVICES); the hardware snapshot must surface that
-        # gap instead of silently reporting the pool as empty.
+        # gap instead of silently reporting the pool as empty. Give it a real, live pid/image
+        # pair so the status-reconciliation hardware_snapshot() now applies recognizes it as
+        # genuinely running instead of correcting it back to STOPPED.
         with app.db() as conn:
-            conn.execute("UPDATE models SET status='RUNNING' WHERE id=?", (created["id"],))
+            conn.execute("UPDATE models SET status='RUNNING',pid=?,runtime_path=? WHERE id=?",
+                         (os.getpid(), Path(app.sys.executable).name, created["id"]))
         _, hardware_after = self.request("/api/hardware")
         workers_metrics = next(pool for pool in hardware_after["pool_metrics"] if pool["pool_id"] == "workers")
         self.assertEqual(workers_metrics["assigned_gpus"], 0)
@@ -153,6 +156,27 @@ class SmokeTest(unittest.TestCase):
         self.assertIn({"name": "Pool model list test", "role": "worker", "status": "STOPPED"}, workers["models"])
         reasoner = next(pool for pool in hardware["pool_metrics"] if pool["pool_id"] == "reasoner")
         self.assertNotIn("Pool model list test", [model["name"] for model in reasoner["models"]])
+
+    def test_a_crashed_runtime_is_reconciled_the_same_way_on_the_hardware_page(self):
+        """/api/models corrects a stale RUNNING status by checking the live process; that
+        correction must also reach hardware_snapshot() instead of the Hardware page still
+        showing a crashed runtime as RUNNING while the Models page already shows STOPPED."""
+        status, created = self.request("/api/models", {"name": "Crash desync test", "role": "worker",
+          "backend": "llama.cpp", "model_path": "Z:/missing/crashed-model.gguf",
+          "runtime_path": "Z:/missing/llama-server.exe", "context_size": 8192, "port": 18098})
+        self.assertEqual(status, 201)
+        mid = created["id"]
+        self.request(f"/api/models/{mid}/configure", {"role": "worker", "pool_id": "workers"})
+        with app.db() as conn:
+            conn.execute("UPDATE models SET status='RUNNING', pid=999999999, "
+                         "endpoint='http://127.0.0.1:59999/v1/chat/completions' WHERE id=?", (mid,))
+        _, models = self.request("/api/models")
+        row = next(m for m in models if m["id"] == mid)
+        self.assertEqual(row["status"], "STOPPED")
+        _, hardware = self.request("/api/hardware")
+        workers = next(pool for pool in hardware["pool_metrics"] if pool["pool_id"] == "workers")
+        self.assertEqual(workers["running_models"], 0)
+        self.assertIn({"name": "Crash desync test", "role": "worker", "status": "STOPPED"}, workers["models"])
 
     def test_a_gpu_can_serve_every_pool_at_once(self):
         """The common single-GPU setup: one card runs reasoner, worker, and retrieval
@@ -203,7 +227,11 @@ class SmokeTest(unittest.TestCase):
               "context_size": 8192, "port": 18099})
             self.assertEqual(status, 201)
             self.request(f"/api/models/{created['id']}/configure", {"role": "worker", "pool_id": "workers"})
-            with app.db() as conn: conn.execute("UPDATE models SET status='RUNNING' WHERE id=?", (created["id"],))
+            # A real, live pid/image pair so model_running()'s reconciliation recognizes this
+            # as genuinely running, the same convention used in test_model_manager.py.
+            with app.db() as conn:
+                conn.execute("UPDATE models SET status='RUNNING',pid=?,runtime_path=? WHERE id=?",
+                             (os.getpid(), Path(app.sys.executable).name, created["id"]))
             _, hardware = self.request("/api/hardware")
             gpu = next(row for row in hardware["gpus"] if row["id"] == fake_gpu["id"])
             self.assertEqual(len(gpu["estimated_models"]), 1)
@@ -211,7 +239,9 @@ class SmokeTest(unittest.TestCase):
             self.assertGreater(gpu["estimated_models"][0]["estimated_vram_mb"], 0)
             self.assertIn("estimate", gpu["vram_estimation_method"].lower())
             self.assertIn("nvidia-smi", gpu["vram_estimation_method"])
-            with app.db() as conn: conn.execute("UPDATE models SET status='STOPPED' WHERE id=?", (created["id"],))
+            # A real stop_model() clears pid too; leaving a still-alive pid behind would have
+            # the reconciliation correctly treat this as still running.
+            with app.db() as conn: conn.execute("UPDATE models SET status='STOPPED',pid=NULL WHERE id=?", (created["id"],))
             _, hardware = self.request("/api/hardware")
             gpu = next(row for row in hardware["gpus"] if row["id"] == fake_gpu["id"])
             self.assertEqual(gpu["estimated_models"], [])
@@ -240,7 +270,11 @@ class SmokeTest(unittest.TestCase):
               "backend": "llama.cpp", "model_path": str(weight), "runtime_path": "Z:/missing/llama-server.exe",
               "context_size": 4096, "port": 18098})
             self.assertEqual(status, 201)
-            with app.db() as conn: conn.execute("UPDATE models SET status='RUNNING' WHERE id=?", (created["id"],))
+            # A real, live pid/image pair so model_running()'s reconciliation recognizes this
+            # as genuinely running, the same convention used in test_model_manager.py.
+            with app.db() as conn:
+                conn.execute("UPDATE models SET status='RUNNING',pid=?,runtime_path=? WHERE id=?",
+                             (os.getpid(), Path(app.sys.executable).name, created["id"]))
 
             app.nvidia_gpus = lambda: [dict(gpu_a)]
             _, hardware = self.request("/api/hardware")

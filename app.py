@@ -40,6 +40,19 @@ def db():
 LOG_DIR = DB_PATH.parent / "logs"
 
 
+def _install_file_handler(root, log_dir, formatter):
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(log_dir / "skein.log",
+            maxBytes=int(os.getenv("SKEIN_LOG_MAX_BYTES", 5_000_000)),
+            backupCount=int(os.getenv("SKEIN_LOG_BACKUP_COUNT", 10)), encoding="utf-8")
+        file_handler.setLevel(getattr(logging, os.getenv("SKEIN_LOG_LEVEL", "INFO").upper(), logging.INFO))
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
+    except OSError as exc:
+        root.warning(f"Rotating log file unavailable ({exc}); logging to console only.")
+
+
 def configure_logging():
     """One rotating file (exhaustive: every action, error, and workflow/model lifecycle
     event) plus a quieter console echo, built on stdlib logging only per DEPENDENCY_POLICY.md.
@@ -55,17 +68,22 @@ def configure_logging():
     console.setLevel(getattr(logging, os.getenv("SKEIN_LOG_CONSOLE_LEVEL", "WARNING").upper(), logging.WARNING))
     console.setFormatter(formatter)
     root.addHandler(console)
-    try:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        file_handler = RotatingFileHandler(LOG_DIR / "skein.log",
-            maxBytes=int(os.getenv("SKEIN_LOG_MAX_BYTES", 5_000_000)),
-            backupCount=int(os.getenv("SKEIN_LOG_BACKUP_COUNT", 10)), encoding="utf-8")
-        file_handler.setLevel(getattr(logging, os.getenv("SKEIN_LOG_LEVEL", "INFO").upper(), logging.INFO))
-        file_handler.setFormatter(formatter)
-        root.addHandler(file_handler)
-    except OSError as exc:
-        root.warning(f"Rotating log file unavailable ({exc}); logging to console only.")
+    _install_file_handler(root, LOG_DIR, formatter)
     return root
+
+
+def relocate_log_directory(new_db_dir):
+    """Re-point the rotating file handler at <new_db_dir>/logs. init_db() calls this when the
+    default database location turns out to be unwritable and falls back to another directory;
+    LOG_DIR was already fixed at import time (before init_db can run), so without this the log
+    file would keep writing to a directory that no longer matches where the database lives."""
+    global LOG_DIR, LOG_FILE
+    LOG_DIR = new_db_dir / "logs"; LOG_FILE = LOG_DIR / "skein.log"
+    root = logging.getLogger("skein")
+    for handler in [h for h in root.handlers if isinstance(h, RotatingFileHandler)]:
+        root.removeHandler(handler); handler.close()
+    formatter = logging.Formatter("%(asctime)s %(levelname)-8s %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S")
+    _install_file_handler(root, LOG_DIR, formatter)
 
 
 logger = configure_logging()
@@ -201,6 +219,7 @@ def init_db():
         if os.getenv("SKEIN_DB_PATH"): raise
         DB_PATH = Path(os.getenv("LOCALAPPDATA", tempfile.gettempdir())) / "Skein" / "skein.db"
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        relocate_log_directory(DB_PATH.parent)
         with db() as conn: conn.executescript(schema)
     with db() as conn:
         columns={r[1] for r in conn.execute("PRAGMA table_info(workflows)")}
@@ -535,7 +554,7 @@ def parse_gguf_metadata(path):
             for dim in dims: count*=dim
             total_params+=count
             if "exps" in name or "experts" in name: expert_params+=count
-    except (struct.error,IndexError):
+    except (EOFError,struct.error,IndexError):
         total_params=None  # tensor section ran past the header prefix; size is unknowable
     result={
         "architecture":architecture,
@@ -732,13 +751,20 @@ def hardware_snapshot():
         for row in conn.execute("SELECT gpu_id, pool_id FROM gpu_assignments"):
             assignments.setdefault(row["gpu_id"], []).append(row["pool_id"])
         pools = [dict(r) for r in conn.execute("SELECT * FROM pools ORDER BY rowid")]
-        running_by_pool = {row["pool_id"]: row["count"] for row in conn.execute(
-          "SELECT pool_id, COUNT(*) AS count FROM models WHERE status='RUNNING' AND pool_id IS NOT NULL GROUP BY pool_id")}
-        running_models = [dict(r) for r in conn.execute(
-          "SELECT id,name,role,pool_id,model_path,context_size FROM models WHERE status='RUNNING'")]
-        models_by_pool = {}
-        for row in conn.execute("SELECT name,role,status,pool_id FROM models WHERE pool_id IS NOT NULL ORDER BY name"):
-            models_by_pool.setdefault(row["pool_id"], []).append({"name":row["name"],"role":row["role"],"status":row["status"]})
+        all_models = [dict(r) for r in conn.execute(
+          "SELECT id,name,role,pool_id,model_path,context_size,status,pid,runtime_path FROM models ORDER BY name")]
+    # The DB status column only changes on an explicit activate/stop; reconcile it against
+    # the live process here too, so a crashed runtime never shows RUNNING on this page while
+    # /api/models (which already does this same check) has already moved on to STOPPED.
+    for model in all_models: model["status"] = reconciled_model_status(model)
+    running_models = [model for model in all_models if model["status"]=="RUNNING"]
+    running_by_pool = {}
+    for model in running_models:
+        if model["pool_id"]: running_by_pool[model["pool_id"]] = running_by_pool.get(model["pool_id"], 0) + 1
+    models_by_pool = {}
+    for model in all_models:
+        if model["pool_id"]:
+            models_by_pool.setdefault(model["pool_id"], []).append({"name":model["name"],"role":model["role"],"status":model["status"]})
     for gpu in gpus: gpu["pool_ids"] = assignments.get(gpu["id"], [])
     gpus_by_pool = {}
     for gpu in gpus:
@@ -878,6 +904,17 @@ def model_running(model):
     if proc and proc.poll() is None: return True
     runtime_name=Path(model["runtime_path"]).name if model["runtime_path"] else None
     return process_alive(model["pid"], runtime_name)
+
+
+def reconciled_model_status(model):
+    """The DB status column only changes on an explicit action (activate/stop); a runtime
+    that crashed or was killed outside Skein must still be reported as stopped everywhere
+    the status is shown, not just wherever happens to call model_running() itself."""
+    running=model_running(model)
+    status=model["status"]
+    if running and status in ("STARTING","CONFIGURED","STOPPED"): return "RUNNING"
+    if not running and status in ("STARTING","RUNNING"): return "STOPPED"
+    return status
 
 
 def terminate_pid(pid, expected_name=None):
@@ -2326,6 +2363,7 @@ class Handler(SimpleHTTPRequestHandler):
         response instead of a dead connection (previously nothing wrapped do_GET/POST/DELETE,
         so a bug there crashed the connection with a bare traceback on stderr)."""
         start=time.perf_counter(); status_box={"code":200}; disconnected=False
+        self._current_user_cache=UNCHANGED  # one lookup per request; dispatch's own logging reuses it below
         if not hasattr(self,"_original_send_response"): self._original_send_response=self.send_response
         def send_response(code,*a,**kw):
             status_box["code"]=code; return self._original_send_response(code,*a,**kw)
@@ -2374,6 +2412,16 @@ class Handler(SimpleHTTPRequestHandler):
             if sep and key==name: return value
         return None
     def current_user(self):
+        """Memoized per request: dispatch()'s own logging in its finally block calls this
+        again purely to name the acting user, and without caching that repeated the same
+        sessions/users query on every single request, including hot UI-polling endpoints
+        that already call this once via authorize()."""
+        cached=getattr(self,"_current_user_cache",UNCHANGED)
+        if cached is not UNCHANGED: return cached
+        user=self._load_current_user()
+        self._current_user_cache=user
+        return user
+    def _load_current_user(self):
         if os.getenv("SKEIN_AUTH_DISABLED","0")=="1": return {"id":"test-admin","session_id":"test-session","username":"test-admin","role":"admin","active":1,"profiles":[{"id":"super_admin","name":"Super Administrator"}],"permissions":["users.manage","settings.manage","models.manage","workflows.execute","workflows.read_own","workflows.read_all","workflows.delete_own","workflows.delete_all","workflow_templates.read","workflow_templates.manage_own","workflow_templates.manage_all","server_stats.read"]}
         token=self.cookie("skein_session")
         if not token: return None
@@ -2470,22 +2518,16 @@ class Handler(SimpleHTTPRequestHandler):
             return self.file(path,path.name)
         if self.path=="/api/server-stats": return self.json(privacy_safe_server_stats())
         if self.path=="/api/sandbox/capabilities": return self.json({"mode":EXECUTION_MODE,"runtimes":sandbox_capabilities()})
-        if self.path=="/api/execution-mode": return self.json({"mode":EXECUTION_MODE,"warning":"Local mode runs on the host without isolation." if EXECUTION_MODE=="local" else None})
         if urlparse(self.path).path=="/api/hardware/telemetry":
             try: window=int((parse_qs(urlparse(self.path).query).get("window") or [900])[0])
             except ValueError: return self.json({"error":"Telemetry window must be an integer"},400)
             return self.json(pool_telemetry(window))
         if self.path=="/api/hardware": return self.json(hardware_snapshot())
-        if self.path=="/api/pools":
-            with db() as conn: rows=conn.execute("SELECT * FROM pools ORDER BY rowid").fetchall()
-            return self.json([dict(r) for r in rows])
         if self.path=="/api/models":
             with db() as conn: rows=conn.execute("SELECT * FROM models ORDER BY updated_at DESC").fetchall()
             models=[]
             for row in rows:
-                item=dict(row); item["running"]=model_running(row)
-                if item["running"] and item["status"] in ("STARTING","CONFIGURED","STOPPED"): item["status"]="RUNNING"
-                elif not item["running"] and item["status"] in ("STARTING","RUNNING"): item["status"]="STOPPED"
+                item=dict(row); item["running"]=model_running(row); item["status"]=reconciled_model_status(row)
                 item["runnable"]=item["role"] in RUNNABLE_MODEL_ROLES
                 item["quantization"]=detect_quantization(item["model_path"])
                 item["log_available"]=runtime_log_path(item["id"]).exists()
@@ -2525,8 +2567,6 @@ class Handler(SimpleHTTPRequestHandler):
             template_id=self.path.rsplit("/",1)[-1]; row=self.template_row(template_id)
             if not self.template_visible(user,row): return self.json({"error":"Workflow template not found"},404)
             return self.json(workflow_template_payload(row,user["id"],"workflow_templates.manage_all" in user["permissions"]))
-        if self.path=="/api/stack/status":
-            result,status=supervisor_call("status"); return self.json(result,status)
         if urlparse(self.path).path=="/api/workflows":
             if not any(p in user["permissions"] for p in ("workflows.read_own","workflows.read_all")): return self.deny(403,"Workflow read permission required")
             query=parse_qs(urlparse(self.path).query); requested_limit=int((query.get("limit") or [30])[0]); limit=max(1,min(requested_limit,1000))
@@ -2633,7 +2673,7 @@ class Handler(SimpleHTTPRequestHandler):
         elif self.path.startswith("/api/users") or self.path.startswith("/api/rbac"): user=self.authorize("users.manage")
         elif self.path.startswith("/api/admin/email"): user=self.authorize("email.manage")
         elif self.path.startswith(("/api/pools","/api/gpus","/api/stack","/api/admin")): user=self.authorize("settings.manage")
-        elif self.path=="/api/workflows" or self.path.endswith("/run") or self.path.endswith("/execute") or self.path.endswith("/command"): user=self.authorize("workflows.execute")
+        elif self.path=="/api/workflows" or self.path.endswith("/execute") or self.path.endswith("/command"): user=self.authorize("workflows.execute")
         else: user=self.authorize()
         if not user: return
         if self.path.startswith("/api/workflows/"):
@@ -2849,8 +2889,6 @@ class Handler(SimpleHTTPRequestHandler):
             return self.json(result,status)
         if self.path.startswith("/api/models/") and self.path.endswith("/stop"):
             result,status=stop_model(self.path.split("/")[-2]); return self.json(result,status)
-        if self.path.startswith("/api/workflows/") and self.path.endswith("/run"):
-            return self.json({"started":start_workflow(self.path.split("/")[-2])})
         return self.json({"error":"route inconnue"},404)
 
     def do_DELETE(self): self.dispatch("DELETE",self._handle_delete)
