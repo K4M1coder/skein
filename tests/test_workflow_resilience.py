@@ -116,6 +116,35 @@ class WorkflowResilienceTest(unittest.TestCase):
         self.assertEqual(status, "FAILED")
         self.assertLessEqual(tasks["branch_a1"]["attempts"], app.MAX_TASK_ATTEMPTS)
 
+    def test_valid_json_that_is_not_an_object_is_treated_as_a_malformed_answer(self):
+        """run_task calls .get() on whatever generate() returns, so a runtime replying with
+        a bare JSON string or list must produce an error result and one repair retry — not
+        an AttributeError escaping the client."""
+        class FakeResponse:
+            def __init__(self, payload): self.payload = json.dumps(payload).encode()
+            def read(self, *args): return self.payload
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+
+        calls = []
+
+        def fake_urlopen(request, timeout=None):
+            calls.append(request)
+            return FakeResponse({"choices": [{"message": {"content": '"a bare string, not an object"'}}], "usage": {}})
+
+        task = {"role": "executor", "title": "solo", "system_prompt": None, "output_format": "markdown", "output_schema": None}
+        original_urlopen, original_endpoints = app.urlopen, dict(app.ACTIVE_ENDPOINTS)
+        app.urlopen = fake_urlopen
+        app.ACTIVE_ENDPOINTS["worker"] = "http://127.0.0.1:9/v1/chat/completions"
+        try:
+            result = app.ModelClient("worker-general").generate(task, "objective", [])
+        finally:
+            app.urlopen = original_urlopen
+            app.ACTIVE_ENDPOINTS.clear(); app.ACTIVE_ENDPOINTS.update(original_endpoints)
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["mode"], "error")
+        self.assertEqual(len(calls), 2, "the malformed answer should trigger exactly one repair retry")
+
     def test_a_crashing_task_is_recorded_instead_of_killing_the_workflow(self):
         def explode(task, calls):
             if task["title"] == "branch_a1": raise RuntimeError("simulated driver crash")

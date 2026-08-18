@@ -1639,6 +1639,10 @@ def route(task):
     return "worker-general", score
 
 
+class MalformedModelResponse(ValueError):
+    """A runtime answered with JSON this client cannot use as a task result."""
+
+
 class ModelClient:
     def __init__(self, tier):
         self.tier = tier
@@ -1681,6 +1685,10 @@ class ModelClient:
                 response=json.load(res); content = response["choices"][0]["message"]["content"].strip()
             if content.startswith("```"): content = content.split("\n",1)[1].rsplit("```",1)[0]
             parsed = json.loads(content)
+            # Valid JSON that is not an object (a bare string, list, or number) would make
+            # every parsed.get() below raise out of this method, breaking its
+            # always-returns-a-dict contract; treat it as malformed and let the repair retry run.
+            if not isinstance(parsed, dict): raise MalformedModelResponse(f"model returned {type(parsed).__name__}, not an object")
             for key in ("assumptions","evidence","next_actions"):
                 value=parsed.get(key,[])
                 parsed[key]=value if isinstance(value,list) else ([value] if value else [])
@@ -1696,10 +1704,10 @@ class ModelClient:
               "total_tokens":int(usage.get("total_tokens") or prompt_tokens+completion_tokens),
               "inference_seconds":round(duration,3),"tokens_per_second":round(completion_tokens/duration,2)}
             return parsed
-        except (OSError, TimeoutError, KeyError, IndexError, json.JSONDecodeError) as exc:
+        except (OSError, TimeoutError, KeyError, IndexError, json.JSONDecodeError, MalformedModelResponse) as exc:
             # OSError covers URLError plus the raw socket errors (ConnectionResetError…) a
             # dying runtime produces mid-read; IndexError covers an empty choices array.
-            if isinstance(exc,json.JSONDecodeError) and not retry:
+            if isinstance(exc,(json.JSONDecodeError,MalformedModelResponse)) and not retry:
                 return self.generate(task,objective,dependency_results,True)
             return {"summary":"Inference server failure","confidence":0.0,
               "assumptions":[],"evidence":[],"next_actions":["Check the runtime and its endpoint"],
