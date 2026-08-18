@@ -81,7 +81,7 @@ Public registration requires a unique username, unique email address, and a pass
 - Verification codes contain six digits, expire after ten minutes, and are stored only as salted PBKDF2-SHA256 hashes.
 - Successful verification consumes the code atomically; it cannot be reused.
 - Sending a new code invalidates every previous code immediately.
-- Resends are limited to one per minute, invalid verification attempts are limited to five per code, and registration attempts are rate-limited per client address.
+- Resends are limited to one per minute, invalid verification attempts are limited to five per code, and registration attempts are rate-limited per client address. Each limit is enforced inside the transaction that consumes it, so parallel requests cannot overshoot it.
 - An authorized User Manager can approve a pending account manually. Manual approval invalidates all outstanding codes.
 - Pending accounts can only inspect their verification state, submit a code, request a resend, or sign out. Every workflow and administration endpoint rejects them.
 

@@ -23,11 +23,12 @@ Validation requires:
 - scores between zero and one;
 - an acyclic dependency graph;
 - exactly one terminal task using the `integrator` or `workflow-reporter` role;
+- at most one `workflow-reporter` task, with no task depending on it — the orchestrator holds the reporter back until every other step is terminal, so a task waiting on it would never be scheduled;
 - valid action configuration, output format, and output schema for every task and condition.
 
 Skein automatically appends a `workflow-reporter` LLM task to every non-chat template. It depends on every preceding task and receives their results plus workflow events and command/script execution logs. Its system prompt requires a factual Markdown audit covering chronological step outcomes, errors, logs, timing, tokens, power, uncertainty, anomalies, and recommendations. Templates tagged `chat`, including the system Simple chat template, deliberately omit this extra step.
 
-The reporter is operational metadata, not the user's deliverable. The workflow API therefore exposes the last completed non-reporter result as `final_output` and the reporter result separately as `execution_report`. The Execution and History views present both independently.
+The reporter is operational metadata, not the user's deliverable. The workflow API therefore exposes the last completed non-reporter result as `final_output` and the reporter result separately as `execution_report`. The Execution and History views present both independently. A reporter that fails on a transient backend error is retried like any other LLM task, and if it still fails the final workflow event carries `reporter_failed` so a missing report is visible rather than silent.
 
 A failed task does not cancel the whole graph. Failure propagates along dependency edges only: the transitive descendants of a failed task are marked `BLOCKED` and every independent branch still runs. The reporter depends on every task and therefore always executes last, receiving the completed results, the blocked ones with their unmet dependency, the workflow events, and the execution logs. Task status reflects whether the task produced usable content, not the confidence the model reported about itself.
 
