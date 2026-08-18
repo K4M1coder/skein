@@ -116,6 +116,13 @@
       navigation.querySelectorAll("[data-main-view]").forEach(button => button.onclick = () => activate(button.dataset.mainView));
       navigation.querySelectorAll("[data-admin-view]").forEach(button => button.onclick = () => activate(`admin-${button.dataset.adminView}`));
       lowerSection?.addEventListener("click", event => { if (event.target.closest(".run")) setTimeout(() => activate("history"), 0); });
+      // Every activation mirrors the view into location.hash, which means the browser's Back
+      // and Forward buttons produce history entries. Without this listener they only rewrite
+      // the URL and leave the interface on whatever view it was already showing.
+      addEventListener("hashchange", () => {
+        const requested = location.hash.slice(1);
+        if (requested && requested !== activeView) activate(requested);
+      });
       activate(location.hash.slice(1) || "execution");
     },
     show(view) { activate(view); },

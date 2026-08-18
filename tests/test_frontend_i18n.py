@@ -186,6 +186,14 @@ class FrontendLocalizationTest(unittest.TestCase):
         self.assertIn("${esc(user.permissions", auth)
         self.assertNotIn("<b>${user.username}</b>", auth)
 
+    def test_browser_history_buttons_drive_the_active_view(self):
+        """activate() mirrors the view into location.hash, so every navigation creates a
+        browser history entry. Without a hashchange listener, Back and Forward only rewrote
+        the URL and left the interface on the view it was already showing."""
+        navigation = (ROOT / "static" / "navigation.js").read_text(encoding="utf-8")
+        self.assertIn('addEventListener("hashchange"', navigation)
+        self.assertIn("requested !== activeView", navigation)
+
     def test_workflow_editor_has_live_graph_preview(self):
         markup = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
         manager = (ROOT / "static" / "workflow-templates.js").read_text(encoding="utf-8")
