@@ -402,6 +402,24 @@ class ModelManagerTest(unittest.TestCase):
         row = next(m for m in models if m["id"] == model["id"])
         self.assertIsNone(row["architecture"])
 
+    def test_auto_model_budget_accounts_for_two_concurrent_runtimes(self):
+        """discover_local_models registers the auto pick for the reasoner AND the worker,
+        so two instances of the same file load at once: a file that fits 80% of VRAM once
+        but not twice must not be picked (a 19 GB pick on a 24 GB card starts two runtimes
+        that can never both become READY)."""
+        entries = [
+            {"name": "huge", "path": "huge.gguf", "size_bytes": 19 * 1024**3, "too_small": False},
+            {"name": "medium", "path": "medium.gguf", "size_bytes": 8 * 1024**3, "too_small": False},
+            {"name": "tiny", "path": "tiny.gguf", "size_bytes": 1 * 1024**3, "too_small": False},
+        ]
+        original = app.nvidia_gpus
+        app.nvidia_gpus = lambda: [{"memory_total_mb": 24576}]
+        try:
+            picked = app.preferred_auto_model(entries)
+        finally:
+            app.nvidia_gpus = original
+        self.assertEqual(picked["name"], "medium")
+
     def test_moe_model_reports_active_and_total_params_separately(self):
         path = MODEL_ROOT / "Synth-MoE-Q4_0.gguf"
         build_gguf(path, "synthmoe", scalars={

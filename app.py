@@ -614,12 +614,15 @@ def model_file_entries(limit=MAX_SCANNED_MODEL_FILES):
 
 
 def preferred_auto_model(entries):
-    """Largest weight file that plausibly fits detected VRAM, else the smallest available."""
+    """Largest weight file whose two concurrent runtimes plausibly fit detected VRAM, else
+    the smallest available. The auto model is registered for the reasoner AND the worker,
+    so two instances of this same file load at once: each may claim at most half of the
+    usable budget, or autoload is guaranteed to over-commit the card."""
     usable=[entry for entry in entries if not entry["too_small"]]
     if not usable: return None
     vram_mb=sum(float(gpu.get("memory_total_mb") or 0) for gpu in nvidia_gpus())
     if vram_mb:
-        budget=vram_mb*1048576*.8
+        budget=vram_mb*1048576*.8/2
         fitting=[entry for entry in usable if entry["size_bytes"]<=budget]
         if fitting: return max(fitting, key=lambda entry: entry["size_bytes"])
     return min(usable, key=lambda entry: entry["size_bytes"])
@@ -1268,15 +1271,24 @@ def autoload_models():
       "action":"Use Discover models, or register a runtime and weight file manually.",
       "details":"\n".join(discovery.get("warnings") or [])},400
     started=[]
+    def rollback():
+        # A failure response must not leave half-loaded multi-GB runtimes running with no
+        # owner: stop what this call started (409 = it was already running before us).
+        for item in started:
+            if item["fresh"]: stop_model(item["id"])
     for role,row in selected.items():
         result,status=activate_model(row["id"])
-        if status not in (200,409): return result,status
-        started.append({"role":role,"id":row["id"],"endpoint":row["endpoint"] or result.get("endpoint")})
+        if status not in (200,409):
+            rollback()
+            return result,status
+        started.append({"role":role,"id":row["id"],"endpoint":row["endpoint"] or result.get("endpoint"),"fresh":status==200})
     deadline=time.time()+90
     while time.time()<deadline:
         if all(endpoint_ready(item["endpoint"]) for item in started): return {"status":"READY","models":started},200
         time.sleep(1)
-    return {"error":"Runtimes did not reach the READY state","models":started},503
+    rollback()
+    return {"error":"Runtimes did not reach the READY state","models":started,
+            "action":"Check the runtime logs; very large weights can exceed the startup window — load them manually from the Models plane."},503
 
 
 EVENT_LOG_LEVELS = {"task.failed": logging.ERROR, "workflow.failed": logging.ERROR,
