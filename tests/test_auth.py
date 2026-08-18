@@ -275,6 +275,42 @@ class AuthTest(unittest.TestCase):
             self.request(admin, f"/api/users/{admin_id}", {"profiles": ["user_manager"]})
         self.assertEqual(last_super_admin.exception.code, 409)
 
+    def test_an_extra_path_segment_cannot_smuggle_another_users_workflow(self):
+        """The ownership guard and the handlers used to read the id from opposite ends of
+        the path, so /api/workflows/<mine>/<theirs> passed the check on a workflow the
+        caller owns while the handler served someone else's objective, report, executions,
+        archive — and ran shell commands in their workspace."""
+        admin = self.client()
+        self.request(admin, "/api/auth/login", {"username": "admin", "password": "admin-test-password"})
+        for name in ("smuggle-victim", "smuggle-attacker"):
+            self.request(admin, "/api/users", {"username": name, "password": "smuggle-password", "profiles": ["workflow_operator"]})
+        victim, attacker = self.client(), self.client()
+        self.request(victim, "/api/auth/login", {"username": "smuggle-victim", "password": "smuggle-password"})
+        self.request(attacker, "/api/auth/login", {"username": "smuggle-attacker", "password": "smuggle-password"})
+        _, victim_workflow = self.request(victim, "/api/workflows", {"objective": "Victim confidential objective"})
+        _, own_workflow = self.request(attacker, "/api/workflows", {"objective": "Attacker's own workflow"})
+        victim_id, own_id = victim_workflow["id"], own_workflow["id"]
+
+        with self.assertRaises(HTTPError) as direct:
+            self.request(attacker, f"/api/workflows/{victim_id}")
+        self.assertEqual(direct.exception.code, 403)
+        for suffix in ("", "/report", "/executions", "/deliverable.zip"):
+            with self.subTest(route=suffix or "workflow"):
+                with self.assertRaises(HTTPError) as smuggled:
+                    self.request(attacker, f"/api/workflows/{own_id}/{victim_id}{suffix}")
+                self.assertEqual(smuggled.exception.code, 404)
+        with self.assertRaises(HTTPError) as smuggled_command:
+            self.request(attacker, f"/api/workflows/{own_id}/{victim_id}/command", {"command": "echo smuggled", "timeout": 5})
+        self.assertEqual(smuggled_command.exception.code, 404)
+
+        # The legitimate routes the guard protects must still answer.
+        for suffix in ("", "/executions"):
+            with self.subTest(own_route=suffix or "workflow"):
+                status, _ = self.request(attacker, f"/api/workflows/{own_id}{suffix}")
+                self.assertEqual(status, 200)
+        with attacker.open(Request(self.base + f"/api/workflows/{own_id}/report"), timeout=10) as report:
+            self.assertEqual(report.status, 200)  # Markdown, not JSON, so it bypasses self.request
+
     def test_user_creation_rejects_case_variant_duplicates(self):
         """Login matches usernames case-insensitively, so a case-variant duplicate would
         permanently shadow one of the two accounts behind the same login name."""

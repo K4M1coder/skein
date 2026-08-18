@@ -2442,6 +2442,19 @@ def privacy_safe_server_stats(limit=200):
 # and small, so anything larger is either a mistake or a pre-auth memory-exhaustion attempt.
 MAX_JSON_BODY_BYTES=2*1024*1024
 
+# The ownership guard and each handler used to pull the id out of the path independently —
+# the guard counting segments from the front, the handlers from the back. An extra segment
+# therefore passed the check on a workflow the caller owns while the handler served someone
+# else's: GET /api/workflows/<mine>/<theirs> returned their objective, results, and archive.
+# Both sides now read the same strict match, so a path carrying a stray segment is simply
+# not a route at all.
+WORKFLOW_ROUTE=re.compile(r"^/api/workflows/(?P<id>[^/]+)(?:/(?P<action>executions|report|deliverable\.zip|command))?$")
+ARTIFACT_ROUTE=re.compile(r"^/api/artifacts/(?P<id>[^/]+)(?:/(?P<action>preview|execute))?$")
+
+
+def route_match(pattern, path):
+    return pattern.match(urlparse(path).path)
+
 
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self,*args,**kwargs): super().__init__(*args,directory=str(STATIC),**kwargs)
@@ -2569,12 +2582,14 @@ class Handler(SimpleHTTPRequestHandler):
             if not user: return
             if self.path.startswith("/api/workflows/"):
                 if not any(p in user["permissions"] for p in ("workflows.read_own","workflows.read_all")): return self.deny(403,"Workflow read permission required")
-                wid=self.path.split("/")[3]
-                if not self.workflow_allowed(user,wid): return self.deny(403,"This workflow belongs to another user")
+                match=route_match(WORKFLOW_ROUTE,self.path)
+                if not match: return self.json({"error":"Unknown route"},404)
+                if not self.workflow_allowed(user,match["id"]): return self.deny(403,"This workflow belongs to another user")
             if self.path.startswith("/api/artifacts/") and user["role"]!="admin":
                 if not any(p in user["permissions"] for p in ("workflows.read_own","workflows.read_all")): return self.deny(403,"Workflow read permission required")
-                aid=self.path.split("/")[3]
-                with db() as conn: row=conn.execute("SELECT workflow_id FROM artifacts WHERE id=?",(aid,)).fetchone()
+                match=route_match(ARTIFACT_ROUTE,self.path)
+                if not match: return self.json({"error":"Unknown route"},404)
+                with db() as conn: row=conn.execute("SELECT workflow_id FROM artifacts WHERE id=?",(match["id"],)).fetchone()
                 if not row or not self.workflow_allowed(user,row["workflow_id"]): return self.deny(403,"Artifact access denied")
         # Authenticated like every other /api route: these expose the database path, model
         # endpoints, queue depths, and power draw — not anonymous-probe material.
@@ -2666,38 +2681,39 @@ class Handler(SimpleHTTPRequestHandler):
             with db() as conn:
                 rows=conn.execute("SELECT * FROM workflows ORDER BY created_at DESC LIMIT ?",(limit,)).fetchall() if "workflows.read_all" in user["permissions"] else conn.execute("SELECT * FROM workflows WHERE owner_id=? ORDER BY created_at DESC LIMIT ?",(user["id"],limit)).fetchall()
             return self.json([dict(r) for r in rows])
-        if self.path.startswith("/api/artifacts/"):
-            if self.path.endswith("/preview"):
-                aid=self.path.split("/")[-2]; preview=artifact_preview(aid)
-                return self.json(preview or {"error":"artifact introuvable"},200 if preview else 404)
-            aid=self.path.rsplit("/",1)[-1]
+        artifact_route=route_match(ARTIFACT_ROUTE,self.path) if self.path.startswith("/api/artifacts/") else None
+        if artifact_route and artifact_route["action"] in (None,"preview"):
+            aid=artifact_route["id"]
+            if artifact_route["action"]=="preview":
+                preview=artifact_preview(aid)
+                return self.json(preview or {"error":"Artifact not found"},200 if preview else 404)
             with db() as conn: row=conn.execute("SELECT * FROM artifacts WHERE id=?",(aid,)).fetchone()
-            if not row: return self.json({"error":"artifact introuvable"},404)
+            if not row: return self.json({"error":"Artifact not found"},404)
             path=Path(row["disk_path"])
-            if not path.is_file(): return self.json({"error":"fichier absent du disque"},410)
+            if not path.is_file(): return self.json({"error":"File missing from disk"},410)
             return self.file(path,row["relative_path"])
-        if self.path.startswith("/api/workflows/") and self.path.endswith("/executions"):
-            wid=self.path.split("/")[-2]
-            with db() as conn: rows=conn.execute("SELECT * FROM executions WHERE workflow_id=? ORDER BY created_at DESC LIMIT 100",(wid,)).fetchall()
-            return self.json([dict(r) for r in rows])
-        if self.path.startswith("/api/workflows/") and self.path.endswith("/deliverable.zip"):
-            wid=self.path.split("/")[-2]; data=workflow_data(wid)
-            if not data: return self.json({"error":"workflow introuvable"},404)
-            with db() as conn: rows=conn.execute("SELECT relative_path,disk_path FROM artifacts WHERE workflow_id=? ORDER BY created_at",(wid,)).fetchall()
-            if not rows: return self.json({"error":"aucun livrable fichier"},404)
-            buffer=io.BytesIO()
-            with zipfile.ZipFile(buffer,"w",zipfile.ZIP_DEFLATED) as archive:
-                added=set()
-                for row in rows:
-                    if row["relative_path"] in added or not Path(row["disk_path"]).is_file(): continue
-                    added.add(row["relative_path"]); archive.write(row["disk_path"],row["relative_path"])
-                archive.writestr("SKEIN-WORKFLOW-REPORT.md",workflow_report(wid) or "")
-            return self.binary(buffer.getvalue(),"application/zip",f"skein-{wid[:8]}-livrable.zip")
-        if self.path.startswith("/api/workflows/") and self.path.endswith("/report"):
-            wid=self.path.split("/")[-2]; report=workflow_report(wid)
-            return self.text(report or "Workflow introuvable","text/markdown; charset=utf-8",f"skein-{wid[:8]}.md",200 if report else 404)
-        if self.path.startswith("/api/workflows/"):
-            data=workflow_data(self.path.rsplit("/",1)[-1]); return self.json(data or {"error":"introuvable"},200 if data else 404)
+        workflow_route=route_match(WORKFLOW_ROUTE,self.path) if self.path.startswith("/api/workflows/") else None
+        if workflow_route and workflow_route["action"]!="command":
+            wid,action=workflow_route["id"],workflow_route["action"]
+            if action=="executions":
+                with db() as conn: rows=conn.execute("SELECT * FROM executions WHERE workflow_id=? ORDER BY created_at DESC LIMIT 100",(wid,)).fetchall()
+                return self.json([dict(r) for r in rows])
+            if action=="deliverable.zip":
+                if not workflow_data(wid): return self.json({"error":"Workflow not found"},404)
+                with db() as conn: rows=conn.execute("SELECT relative_path,disk_path FROM artifacts WHERE workflow_id=? ORDER BY created_at",(wid,)).fetchall()
+                if not rows: return self.json({"error":"This workflow produced no file deliverable"},404)
+                buffer=io.BytesIO()
+                with zipfile.ZipFile(buffer,"w",zipfile.ZIP_DEFLATED) as archive:
+                    added=set()
+                    for row in rows:
+                        if row["relative_path"] in added or not Path(row["disk_path"]).is_file(): continue
+                        added.add(row["relative_path"]); archive.write(row["disk_path"],row["relative_path"])
+                    archive.writestr("SKEIN-WORKFLOW-REPORT.md",workflow_report(wid) or "")
+                return self.binary(buffer.getvalue(),"application/zip",f"skein-{wid[:8]}-deliverable.zip")
+            if action=="report":
+                report=workflow_report(wid)
+                return self.text(report or "Workflow not found","text/markdown; charset=utf-8",f"skein-{wid[:8]}.md",200 if report else 404)
+            data=workflow_data(wid); return self.json(data or {"error":"Not found"},200 if data else 404)
         return super().do_GET()
     def upload_model_weight(self):
         """Stream a .gguf upload straight to disk; never buffer multi-gigabyte weights in memory."""
@@ -2791,12 +2807,15 @@ class Handler(SimpleHTTPRequestHandler):
         else: user=self.authorize()
         if not user: return
         if self.path.startswith("/api/workflows/"):
-            wid=self.path.split("/")[3]
-            if not self.workflow_allowed(user,wid): return self.deny(403,"This workflow belongs to another user")
-        if self.path.startswith("/api/artifacts/") and user["role"]!="admin":
-            aid=self.path.split("/")[3]
-            with db() as conn: artifact_owner=conn.execute("SELECT workflow_id FROM artifacts WHERE id=?",(aid,)).fetchone()
-            if not artifact_owner or not self.workflow_allowed(user,artifact_owner["workflow_id"]): return self.deny(403,"Artifact access denied")
+            match=route_match(WORKFLOW_ROUTE,self.path)
+            if not match: return self.json({"error":"Unknown route"},404)
+            if not self.workflow_allowed(user,match["id"]): return self.deny(403,"This workflow belongs to another user")
+        if self.path.startswith("/api/artifacts/"):
+            match=route_match(ARTIFACT_ROUTE,self.path)
+            if not match: return self.json({"error":"Unknown route"},404)
+            if user["role"]!="admin":
+                with db() as conn: artifact_owner=conn.execute("SELECT workflow_id FROM artifacts WHERE id=?",(match["id"],)).fetchone()
+                if not artifact_owner or not self.workflow_allowed(user,artifact_owner["workflow_id"]): return self.deny(403,"Artifact access denied")
         if self.path=="/api/workflow-templates/generate":
             result,status=generate_validated_workflow_template(str(body.get("objective","")).strip()); return self.json(result,status)
         if self.path=="/api/workflow-templates/select":
@@ -2950,11 +2969,13 @@ class Handler(SimpleHTTPRequestHandler):
             EXECUTION_MODE=mode
             logger_settings.info(f"execution mode set to {mode} by {user['username']}")
             return self.json({"mode":mode,"warning":"Unisolated local execution" if mode=="local" else None})
-        if self.path.startswith("/api/artifacts/") and self.path.endswith("/execute"):
-            aid=self.path.split("/")[-2]; result,status=execute_in_sandbox(aid,int(body.get("timeout",20)),EXECUTION_MODE)
+        artifact_route=route_match(ARTIFACT_ROUTE,self.path) if self.path.startswith("/api/artifacts/") else None
+        if artifact_route and artifact_route["action"]=="execute":
+            result,status=execute_in_sandbox(artifact_route["id"],int(body.get("timeout",20)),EXECUTION_MODE)
             return self.json(result,status)
-        if self.path.startswith("/api/workflows/") and self.path.endswith("/command"):
-            wid=self.path.split("/")[-2]; result,status=execute_command(wid,str(body.get("command","")),int(body.get("timeout",20)),EXECUTION_MODE)
+        workflow_route=route_match(WORKFLOW_ROUTE,self.path) if self.path.startswith("/api/workflows/") else None
+        if workflow_route and workflow_route["action"]=="command":
+            result,status=execute_command(workflow_route["id"],str(body.get("command","")),int(body.get("timeout",20)),EXECUTION_MODE)
             return self.json(result,status)
         if self.path=="/api/pools":
             name=str(body.get("name","")).strip(); domain=str(body.get("domain","worker")).strip()
