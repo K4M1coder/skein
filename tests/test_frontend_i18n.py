@@ -191,8 +191,12 @@ class FrontendLocalizationTest(unittest.TestCase):
         manager = (ROOT / "static" / "workflow-templates.js").read_text(encoding="utf-8")
         self.assertIn('id="workflow-editor-graph"', markup)
         self.assertIn('id="workflow-graph-panel"', markup)
-        self.assertIn('const drawGraph=', manager)
-        self.assertIn('graphCycleDetected', manager)
+        # One renderer owns graph drawing and validation: workflow-diagrams.js. The editor
+        # and the catalog both call it, so no second copy can drift out of sync.
+        diagrams = (ROOT / "static" / "workflow-diagrams.js").read_text(encoding="utf-8")
+        self.assertIn("graphCycleDetected", diagrams)
+        self.assertNotIn("const drawGraph=", manager)
+        self.assertIn('window.skeinWorkflowDiagrams.render($("#workflow-editor-graph")', manager)
         self.assertIn('addEventListener("input",updateEditorGraph)', manager)
 
 
