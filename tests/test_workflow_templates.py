@@ -100,6 +100,21 @@ class WorkflowTemplateTest(unittest.TestCase):
         error = json.load(caught.exception)["error"]
         self.assertIn("acyclic", error)
 
+    def test_a_task_depending_on_the_workflow_reporter_is_rejected(self):
+        """The orchestrator holds the workflow-reporter back until every other step is
+        terminal. A validated DAG where another task depends on the reporter would
+        therefore never schedule that task: orchestrate() spins forever, the parallel
+        slot is never released, and the workflow cannot even be deleted."""
+        payload = self.valid_template()
+        payload["tasks"] = [
+            {"key": "audit", "title": "Audit the run", "role": "workflow-reporter", "dependencies": [], "complexity": 0.3, "risk": 0.2, "criticality": 0.5},
+            {"key": "final", "title": "Deliver the result", "role": "integrator", "dependencies": ["audit"], "complexity": 0.4, "risk": 0.2, "criticality": 0.8},
+        ]
+        with self.assertRaises(HTTPError) as caught:
+            self.request("/api/workflow-templates", payload)
+        self.assertEqual(caught.exception.code, 400)
+        self.assertIn("workflow-reporter", json.load(caught.exception)["error"])
+
     def test_typed_actions_and_conditions_are_validated(self):
         payload = self.valid_template()
         payload["tasks"][0].update({

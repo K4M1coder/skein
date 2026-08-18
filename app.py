@@ -1447,6 +1447,12 @@ def validate_workflow_tasks(tasks):
     if len(terminals) != 1: errors.append("A workflow must have exactly one terminal task")
     elif tasks[keys.index(terminals[0])].get("role") not in ("integrator", "workflow-reporter"):
         errors.append("The terminal task must use the integrator or workflow-reporter role")
+    # The orchestrator holds the workflow-reporter back until every other step is terminal,
+    # so a task depending on it would wait forever and livelock the whole scheduler slot.
+    reporter_keys = [task.get("key") for task in tasks if task.get("role") == "workflow-reporter"]
+    if len(reporter_keys) > 1: errors.append("A workflow can hold at most one workflow-reporter task")
+    elif reporter_keys and reporter_keys[0] in referenced:
+        errors.append("No task may depend on the workflow-reporter: it always runs last")
     return {"valid": not errors, "errors": errors, "task_count": len(tasks), "terminal_task": terminals[0] if len(terminals) == 1 else None}
 
 
@@ -1665,7 +1671,9 @@ class ModelClient:
               "total_tokens":int(usage.get("total_tokens") or prompt_tokens+completion_tokens),
               "inference_seconds":round(duration,3),"tokens_per_second":round(completion_tokens/duration,2)}
             return parsed
-        except (URLError, TimeoutError, KeyError, json.JSONDecodeError) as exc:
+        except (OSError, TimeoutError, KeyError, IndexError, json.JSONDecodeError) as exc:
+            # OSError covers URLError plus the raw socket errors (ConnectionResetError…) a
+            # dying runtime produces mid-read; IndexError covers an empty choices array.
             if isinstance(exc,json.JSONDecodeError) and not retry:
                 return self.generate(task,objective,dependency_results,True)
             return {"summary":"Inference server failure","confidence":0.0,
@@ -1866,6 +1874,26 @@ def local_runtime_command(runtime,target):
     return None
 
 
+def run_local_captured(args,cwd,timeout_s):
+    """Local-mode execution with a whole-tree timeout. subprocess.run() only terminates the
+    direct child on timeout, so anything the command itself spawned (javac/java behind the
+    PowerShell wrapper, servers, ping -t) would keep running on the host — and a grandchild
+    holding the inherited pipes would even keep the caller blocked past the timeout."""
+    proc=subprocess.Popen(args,cwd=cwd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,
+      creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
+    try:
+        stdout,stderr=proc.communicate(timeout=timeout_s)
+        return proc.returncode,stdout,stderr,False
+    except subprocess.TimeoutExpired:
+        if os.name=="nt":
+            subprocess.run(["taskkill","/PID",str(proc.pid),"/T","/F"],capture_output=True,
+              creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
+        else: proc.kill()
+        try: stdout,stderr=proc.communicate(timeout=5)
+        except Exception: stdout,stderr="",""
+        return None,stdout or "",stderr or "",True
+
+
 def execute_in_sandbox(artifact_id,timeout=20,mode=None):
     mode=mode or EXECUTION_MODE
     with db() as conn: artifact=conn.execute("SELECT * FROM artifacts WHERE id=?",(artifact_id,)).fetchone()
@@ -1879,13 +1907,11 @@ def execute_in_sandbox(artifact_id,timeout=20,mode=None):
         target=Path(artifact["disk_path"]); command=local_runtime_command(runtime,target)
         if not command: result={"id":eid,"status":"UNAVAILABLE","runtime":runtime,"exit_code":None,"stdout":"","stderr":f"Runtime local indisponible: {runtime}","duration":0}
         else:
-            try:
-                proc=subprocess.run(command,cwd=target.parent,capture_output=True,text=True,timeout=max(1,min(int(timeout),60)),
-                  creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
-                result={"id":eid,"status":"PASS" if proc.returncode==0 else "FAIL","runtime":runtime,"exit_code":proc.returncode,
-                  "stdout":proc.stdout[-20000:],"stderr":proc.stderr[-20000:],"duration":round(time.time()-started,3)}
-            except subprocess.TimeoutExpired as exc: result={"id":eid,"status":"TIMEOUT","runtime":runtime,"exit_code":None,
-              "stdout":(exc.stdout or "")[-20000:] if isinstance(exc.stdout,str) else "","stderr":"Limite de temps dépassée","duration":round(time.time()-started,3)}
+            code,stdout,stderr,timed_out=run_local_captured(command,target.parent,max(1,min(int(timeout),60)))
+            if timed_out: result={"id":eid,"status":"TIMEOUT","runtime":runtime,"exit_code":None,
+              "stdout":stdout[-20000:],"stderr":"Limite de temps dépassée","duration":round(time.time()-started,3)}
+            else: result={"id":eid,"status":"PASS" if code==0 else "FAIL","runtime":runtime,"exit_code":code,
+              "stdout":stdout[-20000:],"stderr":stderr[-20000:],"duration":round(time.time()-started,3)}
     elif not docker_image_ready(cfg["image"]):
         result={"id":eid,"status":"UNAVAILABLE","runtime":runtime,"exit_code":None,"stdout":"","stderr":f"Image Docker absente: {cfg['image']}","duration":0}
     else:
@@ -1919,22 +1945,27 @@ def execute_command(wid,command,timeout=20,mode=None):
     mode=mode or EXECUTION_MODE; root=artifact_root(wid); eid=str(uuid.uuid4()); started=time.time(); resource_start=system_resource_snapshot()
     if not command or len(command)>4000: return {"error":"commande vide ou trop longue"},400
     if mode=="local":
-        args=["powershell","-NoProfile","-Command",command]; cwd=root; image="LOCAL"
+        image="LOCAL"
+        code,stdout,stderr,timed_out=run_local_captured(["powershell","-NoProfile","-Command",command],root,max(1,min(int(timeout),60)))
+        if timed_out: result={"id":eid,"status":"TIMEOUT","mode":mode,"exit_code":None,
+          "stdout":stdout[-20000:],"stderr":"Limite de temps dépassée","duration":round(time.time()-started,3)}
+        else: result={"id":eid,"status":"PASS" if code==0 else "FAIL","mode":mode,"exit_code":code,
+          "stdout":stdout[-20000:],"stderr":stderr[-20000:],"duration":round(time.time()-started,3)}
     else:
         image="alpine:3.20"
         if not docker_image_ready(image): return {"error":"image de terminal sandbox absente","image":image},503
         scratch=Path(tempfile.mkdtemp(prefix="skein-shell-")); shutil.copytree(root,scratch/"workspace",dirs_exist_ok=True)
         name="skein-shell-"+eid[:10]; args=[shutil.which("docker"),"run","--rm","--name",name,"--network","none","--cpus","1","--memory","256m",
-          "--pids-limit","64","--read-only","--tmpfs","/tmp:rw,nosuid,size=64m","-v",f"{scratch/'workspace'}:/workspace:rw","-w","/workspace",image,"sh","-lc",command]; cwd=ROOT
-    try:
-        proc=subprocess.run(args,cwd=cwd,capture_output=True,text=True,timeout=max(1,min(int(timeout),60)),creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
-        result={"id":eid,"status":"PASS" if proc.returncode==0 else "FAIL","mode":mode,"exit_code":proc.returncode,
-          "stdout":proc.stdout[-20000:],"stderr":proc.stderr[-20000:],"duration":round(time.time()-started,3)}
-    except subprocess.TimeoutExpired as exc:
-        if mode=="sandbox": subprocess.run([shutil.which("docker"),"rm","-f",name],capture_output=True,creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
-        result={"id":eid,"status":"TIMEOUT","mode":mode,"exit_code":None,"stdout":"","stderr":"Limite de temps dépassée","duration":round(time.time()-started,3)}
-    finally:
-        if mode=="sandbox": shutil.rmtree(scratch,ignore_errors=True)
+          "--pids-limit","64","--read-only","--tmpfs","/tmp:rw,nosuid,size=64m","-v",f"{scratch/'workspace'}:/workspace:rw","-w","/workspace",image,"sh","-lc",command]
+        try:
+            proc=subprocess.run(args,cwd=ROOT,capture_output=True,text=True,timeout=max(1,min(int(timeout),60)),creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
+            result={"id":eid,"status":"PASS" if proc.returncode==0 else "FAIL","mode":mode,"exit_code":proc.returncode,
+              "stdout":proc.stdout[-20000:],"stderr":proc.stderr[-20000:],"duration":round(time.time()-started,3)}
+        except subprocess.TimeoutExpired:
+            subprocess.run([shutil.which("docker"),"rm","-f",name],capture_output=True,creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
+            result={"id":eid,"status":"TIMEOUT","mode":mode,"exit_code":None,"stdout":"","stderr":"Limite de temps dépassée","duration":round(time.time()-started,3)}
+        finally:
+            shutil.rmtree(scratch,ignore_errors=True)
     result["resources"]=resource_window(resource_start,system_resource_snapshot(),float(result.get("duration") or 0),"local_machine" if mode=="local" else "docker_container_host_window")
     with db() as conn: conn.execute("INSERT INTO executions VALUES(?,?,?,?,?,?,?,?,?,?,?)",
       (eid,wid,"command",f"shell-{mode}",image,result["status"],result["exit_code"],result["stdout"],result["stderr"],result["duration"],stamp()))
@@ -2085,43 +2116,48 @@ def run_task(wid, tid, objective):
                      (model, score, stamp(), tid))
     emit(wid, "task.started", {"model": model, "routing_score": score}, tid)
     task_started=time.perf_counter(); power=PowerSampler().start()
-    condition_passed,condition_result=evaluate_task_condition(wid,task,objective,dependency_results)
-    if not condition_passed:
-        result={"summary":"Task skipped because its condition evaluated to false","deliverable":"Condition false; the task action was not executed.","files":[],"confidence":1.0,"assumptions":[],"evidence":[condition_result],"next_actions":[],"mode":"condition"}
-        usable=True
-    elif task["action_type"]=="command":
-        execution,_=execute_command(wid,json.loads(task["action_config"]).get("command",""),60,EXECUTION_MODE)
-        passed=execution.get("status")=="PASS"
-        result={"summary":f"Command {execution.get('status','FAILED')}","deliverable":execution.get("stdout") or execution.get("stderr") or "No output","files":[],"confidence":1.0 if passed else 0.0,"assumptions":[],"evidence":[f"Exit code: {execution.get('exit_code')}"],"next_actions":[] if passed else ["Inspect stderr and correct the command"],"mode":"command","execution":execution}
-        usable=passed
-    elif task["action_type"]=="script":
-        config=json.loads(task["action_config"]); extensions={"python":"py","node":"js","java":"java","php":"php"}; runtime=config.get("runtime"); path=config.get("path") or f"workflow-scripts/{task['position']+1:02d}-{task['id'][:8]}.{extensions.get(runtime,'txt')}"
-        artifacts=persist_artifacts(wid,tid,[{"path":path,"content":config.get("content","")}]); execution={"status":"FAIL","stderr":"Script artifact could not be created"}
-        if artifacts: execution,_=execute_in_sandbox(artifacts[0]["id"],60,EXECUTION_MODE)
-        passed=execution.get("status") in ("PASS","PREVIEW_READY")
-        result={"summary":f"{runtime} script {execution.get('status','FAILED')}","deliverable":execution.get("stdout") or execution.get("stderr") or "No output","files":[],"confidence":1.0 if passed else 0.0,"assumptions":[],"evidence":[f"Exit code: {execution.get('exit_code')}"],"next_actions":[] if passed else ["Inspect stderr and correct the script"],"mode":"script","execution":execution,"artifacts":artifacts}
-        usable=passed
-    else:
-        result = ModelClient(model).generate(task, objective, dependency_results)
-        if task["role"]=="workflow-reporter" and not result.get("error"):
-            result["deliverable"]=format_execution_report(result,dependency_results)
-            result["summary"]="Workflow execution report generated from task results, events, and execution logs"
-        usable=llm_result_usable(result)
-    confidence=parse_confidence(result.get("confidence"))
-    # A low or unknown confidence escalates to the reasoner; it never fails the task on its own.
-    if condition_passed and task["action_type"]=="llm" and model=="worker-general" and (not usable or (confidence is not None and confidence<.65)):
-        emit(wid, "task.escalated", {"from": model, "confidence": confidence, "usable": usable}, tid)
-        retried=ModelClient("reasoner-large").generate(task, objective, dependency_results)
-        if task["role"]=="workflow-reporter" and not retried.get("error"):
-            retried["deliverable"]=format_execution_report(retried,dependency_results)
-            retried["summary"]="Workflow execution report generated from task results, events, and execution logs"
-        retried_usable=llm_result_usable(retried)
-        if retried_usable or not usable:
-            model,result,usable,confidence="reasoner-large",retried,retried_usable,parse_confidence(retried.get("confidence"))
-    duration=max(.001,time.perf_counter()-task_started)
-    metrics=result.setdefault("metrics",{})
     scope="local_machine" if task["action_type"] in ("command","script") and EXECUTION_MODE=="local" else ("docker_container_host_window" if task["action_type"] in ("command","script") else "model_runtime")
-    metrics.update({"execution_seconds":round(duration,3),**power.stop(duration,scope)})
+    try:
+        condition_passed,condition_result=evaluate_task_condition(wid,task,objective,dependency_results)
+        if not condition_passed:
+            result={"summary":"Task skipped because its condition evaluated to false","deliverable":"Condition false; the task action was not executed.","files":[],"confidence":1.0,"assumptions":[],"evidence":[condition_result],"next_actions":[],"mode":"condition"}
+            usable=True
+        elif task["action_type"]=="command":
+            execution,_=execute_command(wid,json.loads(task["action_config"]).get("command",""),60,EXECUTION_MODE)
+            passed=execution.get("status")=="PASS"
+            result={"summary":f"Command {execution.get('status','FAILED')}","deliverable":execution.get("stdout") or execution.get("stderr") or "No output","files":[],"confidence":1.0 if passed else 0.0,"assumptions":[],"evidence":[f"Exit code: {execution.get('exit_code')}"],"next_actions":[] if passed else ["Inspect stderr and correct the command"],"mode":"command","execution":execution}
+            usable=passed
+        elif task["action_type"]=="script":
+            config=json.loads(task["action_config"]); extensions={"python":"py","node":"js","java":"java","php":"php"}; runtime=config.get("runtime"); path=config.get("path") or f"workflow-scripts/{task['position']+1:02d}-{task['id'][:8]}.{extensions.get(runtime,'txt')}"
+            artifacts=persist_artifacts(wid,tid,[{"path":path,"content":config.get("content","")}]); execution={"status":"FAIL","stderr":"Script artifact could not be created"}
+            if artifacts: execution,_=execute_in_sandbox(artifacts[0]["id"],60,EXECUTION_MODE)
+            passed=execution.get("status") in ("PASS","PREVIEW_READY")
+            result={"summary":f"{runtime} script {execution.get('status','FAILED')}","deliverable":execution.get("stdout") or execution.get("stderr") or "No output","files":[],"confidence":1.0 if passed else 0.0,"assumptions":[],"evidence":[f"Exit code: {execution.get('exit_code')}"],"next_actions":[] if passed else ["Inspect stderr and correct the script"],"mode":"script","execution":execution,"artifacts":artifacts}
+            usable=passed
+        else:
+            result = ModelClient(model).generate(task, objective, dependency_results)
+            if task["role"]=="workflow-reporter" and not result.get("error"):
+                result["deliverable"]=format_execution_report(result,dependency_results)
+                result["summary"]="Workflow execution report generated from task results, events, and execution logs"
+            usable=llm_result_usable(result)
+        confidence=parse_confidence(result.get("confidence"))
+        # A low or unknown confidence escalates to the reasoner; it never fails the task on its own.
+        if condition_passed and task["action_type"]=="llm" and model=="worker-general" and (not usable or (confidence is not None and confidence<.65)):
+            emit(wid, "task.escalated", {"from": model, "confidence": confidence, "usable": usable}, tid)
+            retried=ModelClient("reasoner-large").generate(task, objective, dependency_results)
+            if task["role"]=="workflow-reporter" and not retried.get("error"):
+                retried["deliverable"]=format_execution_report(retried,dependency_results)
+                retried["summary"]="Workflow execution report generated from task results, events, and execution logs"
+            retried_usable=llm_result_usable(retried)
+            if retried_usable or not usable:
+                model,result,usable,confidence="reasoner-large",retried,retried_usable,parse_confidence(retried.get("confidence"))
+        duration=max(.001,time.perf_counter()-task_started)
+    finally:
+        # every exit, including a crashing action, must stop the sampler thread — it
+        # would otherwise keep spawning an nvidia-smi subprocess twice a second forever
+        power_metrics=power.stop(max(.001,time.perf_counter()-task_started),scope)
+    metrics=result.setdefault("metrics",{})
+    metrics.update({"execution_seconds":round(duration,3),**power_metrics})
     if task["action_type"]!="script": result["artifacts"]=persist_artifacts(wid,tid,result.get("files",[])) if result.get("files") else []
     result["confidence"]=confidence
     status = "COMPLETED" if usable else "FAILED"
@@ -2156,9 +2192,15 @@ def orchestrate(wid):
                 tasks = conn.execute("SELECT * FROM tasks WHERE workflow_id=? ORDER BY position", (wid,)).fetchall()
             state = {t["id"]: t["status"] for t in tasks}
             reporter = next((t for t in tasks if t["role"]=="workflow-reporter"), None)
+            if reporter and any(reporter["id"] in json.loads(t["dependencies"]) for t in tasks):
+                # Rows predating the no-dependents-on-reporter validation: schedule the
+                # reporter as a plain step, or its dependents would wait forever.
+                reporter = None
             steps = [t for t in tasks if not (reporter and t["id"]==reporter["id"])]
 
-            retryable = [t for t in steps if t["status"]=="FAILED" and t["action_type"]=="llm" and t["attempts"]<MAX_TASK_ATTEMPTS]
+            # Over tasks, not steps: the reporter is an llm task facing the same transient
+            # backend errors as any other, and deserves the same second attempt.
+            retryable = [t for t in tasks if t["status"]=="FAILED" and t["action_type"]=="llm" and t["attempts"]<MAX_TASK_ATTEMPTS]
             if retryable:
                 with db() as conn:
                     conn.executemany("UPDATE tasks SET status='READY',finished_at=NULL WHERE id=?", [(t["id"],) for t in retryable])
@@ -2195,7 +2237,8 @@ def orchestrate(wid):
             unfinished = [t for t in steps if t["status"] in ("FAILED","BLOCKED")]
             status = "FAILED" if unfinished else "COMPLETED"
             emit(wid, "workflow.completed" if status=="COMPLETED" else "workflow.failed",
-                 {"completed_tasks":sum(1 for t in steps if t["status"]=="COMPLETED"),"unfinished_tasks":len(unfinished)})
+                 {"completed_tasks":sum(1 for t in steps if t["status"]=="COMPLETED"),"unfinished_tasks":len(unfinished),
+                  "reporter_failed":bool(reporter and reporter["status"]=="FAILED")})
             with db() as conn: conn.execute("UPDATE workflows SET status=?,updated_at=? WHERE id=?", (status,stamp(),wid))
             return
     finally:
@@ -2214,8 +2257,11 @@ def dispatch_workflows():
 def start_workflow(wid):
     with ACTIVE_LOCK:
         if wid in ACTIVE or wid in WORKFLOW_QUEUE: return False
+        # QUEUED must be written before the id becomes visible in the queue: once appended,
+        # a concurrent dispatch (another start, or an orchestrate winding down) can start
+        # orchestrate, and its RUNNING write must not be overwritten by a late QUEUED.
+        with db() as conn: conn.execute("UPDATE workflows SET status='QUEUED',updated_at=? WHERE id=?",(stamp(),wid))
         WORKFLOW_QUEUE.append(wid); position=len(WORKFLOW_QUEUE)
-    with db() as conn: conn.execute("UPDATE workflows SET status='QUEUED',updated_at=? WHERE id=?",(stamp(),wid))
     emit(wid,"workflow.queued",{"position":position,"parallel_limit":MAX_PARALLEL_WORKFLOWS})
     dispatch_workflows(); return True
 
