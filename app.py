@@ -1857,7 +1857,7 @@ def validate_artifact(path):
             return {"status":"PASS" if proc.returncode==0 else "FAIL","check":"JavaScript syntax","details":(proc.stderr or proc.stdout).strip()}
         if suffix in (".html",".htm"):
             text=path.read_text(encoding="utf-8").lower(); ok="<html" in text or "<!doctype" in text
-            return {"status":"PASS" if ok else "WARN","check":"HTML structure","details":"" if ok else "Balise html/doctype absente"}
+            return {"status":"PASS" if ok else "WARN","check":"HTML structure","details":"" if ok else "Missing html or doctype tag"}
         return {"status":"PASS","check":"file created","details":""}
     except Exception as exc: return {"status":"FAIL","check":"validation","details":str(exc)}
 
@@ -1922,23 +1922,23 @@ def run_local_captured(args,cwd,timeout_s):
 def execute_in_sandbox(artifact_id,timeout=20,mode=None):
     mode=mode or EXECUTION_MODE
     with db() as conn: artifact=conn.execute("SELECT * FROM artifacts WHERE id=?",(artifact_id,)).fetchone()
-    if not artifact: return {"error":"artifact introuvable"},404
+    if not artifact: return {"error":"Artifact not found"},404
     runtime=runtime_for(artifact["relative_path"])
-    if not runtime: return {"error":"runtime non supporté","extension":Path(artifact["relative_path"]).suffix},400
+    if not runtime: return {"error":"Unsupported runtime","extension":Path(artifact["relative_path"]).suffix},400
     eid=str(uuid.uuid4()); cfg=SANDBOXES[runtime]; started=time.time(); resource_start=system_resource_snapshot()
     if runtime=="html":
-        result={"id":eid,"status":"PREVIEW_READY","runtime":runtime,"exit_code":0,"stdout":"Aperçu isolé disponible","stderr":"","duration":0}
+        result={"id":eid,"status":"PREVIEW_READY","runtime":runtime,"exit_code":0,"stdout":"Isolated preview available","stderr":"","duration":0}
     elif mode=="local":
         target=Path(artifact["disk_path"]); command=local_runtime_command(runtime,target)
         if not command: result={"id":eid,"status":"UNAVAILABLE","runtime":runtime,"exit_code":None,"stdout":"","stderr":f"Runtime local indisponible: {runtime}","duration":0}
         else:
             code,stdout,stderr,timed_out=run_local_captured(command,target.parent,max(1,min(int(timeout),60)))
             if timed_out: result={"id":eid,"status":"TIMEOUT","runtime":runtime,"exit_code":None,
-              "stdout":stdout[-20000:],"stderr":"Limite de temps dépassée","duration":round(time.time()-started,3)}
+              "stdout":stdout[-20000:],"stderr":"Time limit exceeded","duration":round(time.time()-started,3)}
             else: result={"id":eid,"status":"PASS" if code==0 else "FAIL","runtime":runtime,"exit_code":code,
               "stdout":stdout[-20000:],"stderr":stderr[-20000:],"duration":round(time.time()-started,3)}
     elif not docker_image_ready(cfg["image"]):
-        result={"id":eid,"status":"UNAVAILABLE","runtime":runtime,"exit_code":None,"stdout":"","stderr":f"Image Docker absente: {cfg['image']}","duration":0}
+        result={"id":eid,"status":"UNAVAILABLE","runtime":runtime,"exit_code":None,"stdout":"","stderr":f"Docker image missing: {cfg['image']}","duration":0}
     else:
         source=Path(artifact["disk_path"]); workspace=artifact_root(artifact["workflow_id"])
         scratch=Path(tempfile.mkdtemp(prefix="skein-sandbox-")); shutil.copytree(workspace,scratch/"workspace",dirs_exist_ok=True)
@@ -1958,7 +1958,7 @@ def execute_in_sandbox(artifact_id,timeout=20,mode=None):
         except subprocess.TimeoutExpired as exc:
             subprocess.run([shutil.which("docker"),"rm","-f",name],capture_output=True,creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
             result={"id":eid,"status":"TIMEOUT","runtime":runtime,"exit_code":None,"stdout":(exc.stdout or "")[-20000:] if isinstance(exc.stdout,str) else "",
-              "stderr":"Limite de temps dépassée","duration":round(time.time()-started,3)}
+              "stderr":"Time limit exceeded","duration":round(time.time()-started,3)}
         finally: shutil.rmtree(scratch,ignore_errors=True)
     result["resources"]=resource_window(resource_start,system_resource_snapshot(),float(result.get("duration") or 0),"local_machine" if mode=="local" else "docker_container_host_window")
     with db() as conn: conn.execute("INSERT INTO executions VALUES(?,?,?,?,?,?,?,?,?,?,?)",
@@ -1968,17 +1968,17 @@ def execute_in_sandbox(artifact_id,timeout=20,mode=None):
 
 def execute_command(wid,command,timeout=20,mode=None):
     mode=mode or EXECUTION_MODE; root=artifact_root(wid); eid=str(uuid.uuid4()); started=time.time(); resource_start=system_resource_snapshot()
-    if not command or len(command)>4000: return {"error":"commande vide ou trop longue"},400
+    if not command or len(command)>4000: return {"error":"Command is empty or too long"},400
     if mode=="local":
         image="LOCAL"
         code,stdout,stderr,timed_out=run_local_captured(["powershell","-NoProfile","-Command",command],root,max(1,min(int(timeout),60)))
         if timed_out: result={"id":eid,"status":"TIMEOUT","mode":mode,"exit_code":None,
-          "stdout":stdout[-20000:],"stderr":"Limite de temps dépassée","duration":round(time.time()-started,3)}
+          "stdout":stdout[-20000:],"stderr":"Time limit exceeded","duration":round(time.time()-started,3)}
         else: result={"id":eid,"status":"PASS" if code==0 else "FAIL","mode":mode,"exit_code":code,
           "stdout":stdout[-20000:],"stderr":stderr[-20000:],"duration":round(time.time()-started,3)}
     else:
         image="alpine:3.20"
-        if not docker_image_ready(image): return {"error":"image de terminal sandbox absente","image":image},503
+        if not docker_image_ready(image): return {"error":"Sandbox terminal image missing","image":image},503
         scratch=Path(tempfile.mkdtemp(prefix="skein-shell-")); shutil.copytree(root,scratch/"workspace",dirs_exist_ok=True)
         name="skein-shell-"+eid[:10]; args=[shutil.which("docker"),"run","--rm","--name",name,"--network","none","--cpus","1","--memory","256m",
           "--pids-limit","64","--read-only","--tmpfs","/tmp:rw,nosuid,size=64m","-v",f"{scratch/'workspace'}:/workspace:rw","-w","/workspace",image,"sh","-lc",command]
@@ -1988,7 +1988,7 @@ def execute_command(wid,command,timeout=20,mode=None):
               "stdout":proc.stdout[-20000:],"stderr":proc.stderr[-20000:],"duration":round(time.time()-started,3)}
         except subprocess.TimeoutExpired:
             subprocess.run([shutil.which("docker"),"rm","-f",name],capture_output=True,creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
-            result={"id":eid,"status":"TIMEOUT","mode":mode,"exit_code":None,"stdout":"","stderr":"Limite de temps dépassée","duration":round(time.time()-started,3)}
+            result={"id":eid,"status":"TIMEOUT","mode":mode,"exit_code":None,"stdout":"","stderr":"Time limit exceeded","duration":round(time.time()-started,3)}
         finally:
             shutil.rmtree(scratch,ignore_errors=True)
     result["resources"]=resource_window(resource_start,system_resource_snapshot(),float(result.get("duration") or 0),"local_machine" if mode=="local" else "docker_container_host_window")
@@ -2002,10 +2002,15 @@ def artifact_preview(artifact_id):
         artifact=conn.execute("SELECT * FROM artifacts WHERE id=?",(artifact_id,)).fetchone()
         if not artifact: return None
         siblings=conn.execute("SELECT * FROM artifacts WHERE workflow_id=?",(artifact["workflow_id"],)).fetchall()
-    path=Path(artifact["disk_path"]); content=path.read_text(encoding="utf-8")
+    path=Path(artifact["disk_path"])
+    # A row whose file was removed (cleared history, manual deletion) must read as "no
+    # preview" like the download route reports it, not raise OSError into a 500. Undecodable
+    # bytes are replaced rather than fatal, since previewing is best effort.
+    try: content=path.read_text(encoding="utf-8",errors="replace")
+    except OSError: return None
     suffix=path.suffix.lower()
     if suffix in (".html",".htm"):
-        css="\n".join(Path(s["disk_path"]).read_text(encoding="utf-8") for s in siblings if Path(s["relative_path"]).suffix.lower()==".css" and Path(s["disk_path"]).is_file())
+        css="\n".join(Path(s["disk_path"]).read_text(encoding="utf-8",errors="replace") for s in siblings if Path(s["relative_path"]).suffix.lower()==".css" and Path(s["disk_path"]).is_file())
         content=content.replace("</head>",f"<style>{css}</style></head>") if "</head>" in content.lower() else f"<style>{css}</style>"+content
         return {"type":"html","content":content,"sandbox":"scripts disabled"}
     return {"type":"markdown" if suffix==".md" else "text","content":content,"language":suffix.lstrip(".")}
@@ -2735,7 +2740,7 @@ class Handler(SimpleHTTPRequestHandler):
         # anonymous client could make this pre-auth read allocate gigabytes of RAM.
         if length<0 or length>MAX_JSON_BODY_BYTES: return self.json({"error":"Request body exceeds the JSON size limit"},413)
         try: body=json.loads(self.rfile.read(length) or b"{}")
-        except json.JSONDecodeError: return self.json({"error":"JSON invalide"},400)
+        except json.JSONDecodeError: return self.json({"error":"Invalid JSON"},400)
         if self.path=="/api/auth/register":
             remote=self.client_address[0]
             if not consume_rate_limit("register",remote,5,600):
@@ -2979,7 +2984,7 @@ class Handler(SimpleHTTPRequestHandler):
             return self.json(result,status)
         if self.path=="/api/pools":
             name=str(body.get("name","")).strip(); domain=str(body.get("domain","worker")).strip()
-            if not name: return self.json({"error":"nom requis"},400)
+            if not name: return self.json({"error":"A name is required"},400)
             pid=str(uuid.uuid4()); color=str(body.get("color","#b9f45c"))
             with db() as conn: conn.execute("INSERT INTO pools VALUES(?,?,?,?)",(pid,name,domain,color))
             logger_settings.info(f"pool created id={pid} name={name!r} domain={domain}")
@@ -2991,9 +2996,9 @@ class Handler(SimpleHTTPRequestHandler):
             gpu_id=unquote(self.path[len("/api/gpus/"):-len("/assign")].rstrip("/"))
             pool_id=body.get("pool_id")
             assigned=bool(body.get("assigned",True))
-            if not pool_id: return self.json({"error":"pool_id requis"},400)
+            if not pool_id: return self.json({"error":"pool_id is required"},400)
             with db() as conn:
-                if not conn.execute("SELECT 1 FROM pools WHERE id=?",(pool_id,)).fetchone(): return self.json({"error":"pool introuvable"},404)
+                if not conn.execute("SELECT 1 FROM pools WHERE id=?",(pool_id,)).fetchone(): return self.json({"error":"Pool not found"},404)
                 if assigned:
                     conn.execute("INSERT INTO gpu_assignments(gpu_id,pool_id,updated_at) VALUES(?,?,?) ON CONFLICT(gpu_id,pool_id) DO UPDATE SET updated_at=excluded.updated_at",(gpu_id,pool_id,stamp()))
                 else:
@@ -3003,7 +3008,7 @@ class Handler(SimpleHTTPRequestHandler):
             return self.json({"gpu_id":gpu_id,"pool_ids":pool_ids})
         if self.path=="/api/models":
             required=("name","role","backend","model_path","runtime_path")
-            if any(not str(body.get(k,"")).strip() for k in required): return self.json({"error":"nom, rôle, backend et chemins requis"},400)
+            if any(not str(body.get(k,"")).strip() for k in required): return self.json({"error":"Name, role, backend, and paths are required"},400)
             mid=str(uuid.uuid4()); port=int(body.get("port",8001)); context=int(body.get("context_size",32768))
             with db() as conn: conn.execute("INSERT INTO models(id,name,role,backend,model_path,runtime_path,context_size,port,pool_id,status,pid,endpoint,last_error,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
               (mid,body["name"],body["role"],body["backend"],body["model_path"],body["runtime_path"],context,port,None,"STOPPED",None,None,None,stamp()))
