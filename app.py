@@ -1320,17 +1320,27 @@ EVENT_LOG_LEVELS = {"task.failed": logging.ERROR, "workflow.failed": logging.ERR
                     "task.blocked": logging.WARNING, "task.retried": logging.WARNING, "task.escalated": logging.WARNING}
 
 
+LOG_REDACTED_EVENT_FIELDS = {"objective"}
+
+
 def emit(wid, kind, payload=None, tid=None):
     """Every workflow/task lifecycle transition already lands here for the events table the
     UI reads; log it too (in a finally, so a DB hiccup on the insert still leaves a record)
-    rather than re-instrumenting orchestrate()/run_task() at each of their call sites."""
+    rather than re-instrumenting orchestrate()/run_task() at each of their call sites.
+
+    The events row keeps the full payload — it is only ever read back through the
+    workflow API, which enforces ownership. The log line does not: reading the log needs
+    settings.manage, which grants no cross-user workflow access, so user-written content
+    is replaced by its length there, the same way credentials never reach the log."""
     payload = payload or {}
     try:
         with db() as conn:
             conn.execute("INSERT INTO events(workflow_id,task_id,kind,payload,created_at) VALUES(?,?,?,?,?)",
                          (wid, tid, kind, json.dumps(payload, ensure_ascii=False), stamp()))
     finally:
-        detail = f" {json.dumps(payload, ensure_ascii=False)}" if payload else ""
+        loggable = {key: (f"<{len(str(value))} chars>" if key in LOG_REDACTED_EVENT_FIELDS else value)
+                    for key, value in payload.items()}
+        detail = f" {json.dumps(loggable, ensure_ascii=False)}" if loggable else ""
         logger_workflow.log(EVENT_LOG_LEVELS.get(kind, logging.INFO),
                             f"{kind} workflow={wid}" + (f" task={tid}" if tid else "") + detail)
 

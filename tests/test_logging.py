@@ -186,6 +186,20 @@ class AuthAndModelLifecycleLoggingTest(unittest.TestCase):
         self.assertIn("nonexistent-user", text)
         self.assertNotIn(secret_password, text)
 
+    def test_a_workflow_objective_is_not_written_to_the_log(self):
+        """Reading the log requires settings.manage, which grants no cross-user workflow
+        access. Logging the objective verbatim would hand every user's request text to a
+        Settings Manager who cannot read those workflows through the API."""
+        objective = "Refactor the ACME payroll importer before the audit"
+        wid = app.create_workflow(objective)
+        text = log_text()
+        self.assertIn(f"workflow.created workflow={wid}", text)
+        self.assertNotIn(objective, text)
+        self.assertIn(f"<{len(objective)} chars>", text)
+        with app.db() as conn:
+            payload = conn.execute("SELECT payload FROM events WHERE workflow_id=? AND kind='workflow.created'", (wid,)).fetchone()
+        self.assertEqual(json.loads(payload["payload"])["objective"], objective)
+
     def test_a_workflow_event_is_logged_via_the_emit_hook(self):
         wid = "logging-test-workflow"
         with app.db() as conn:
