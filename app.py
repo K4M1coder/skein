@@ -253,6 +253,10 @@ def init_db():
             conn.execute("UPDATE sessions SET storage_id=? WHERE token=?",(str(uuid.uuid4()),session["token"]))
         conn.execute("UPDATE users SET verified_at=created_at WHERE verified_at IS NULL AND email IS NULL")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_email_unique ON users(email) WHERE email IS NOT NULL")
+        # Login matches usernames case-insensitively, so uniqueness must be case-insensitive
+        # too: 'Admin' next to 'admin' would make one of the two accounts unreachable.
+        try: conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_username_nocase ON users(username COLLATE NOCASE)")
+        except sqlite3.IntegrityError: pass  # legacy rows already collide by case; the registration-time checks still guard new accounts
         conn.execute("INSERT OR IGNORE INTO pools VALUES('reasoner','Reasoner','reasoner','#78a7ff')")
         conn.execute("INSERT OR IGNORE INTO pools VALUES('workers','Workers','worker','#ffb44c')")
         conn.execute("INSERT OR IGNORE INTO pools VALUES('retrieval','Retrieval','service','#b9f45c')")
@@ -309,6 +313,12 @@ def password_valid(password,encoded):
         actual=hashlib.pbkdf2_hmac("sha256",password.encode(),bytes.fromhex(salt),int(rounds)).hex()
         return hmac.compare_digest(actual,digest)
     except (ValueError,TypeError): return False
+
+
+# Login verifies against this hash when the username does not exist, so the 401 takes the
+# same ~100 ms of PBKDF2 work either way and response timing stops revealing which
+# usernames are real.
+DUMMY_PASSWORD_HASH=password_hash(secrets.token_hex(16))
 
 
 def setting_bool(key,default=False):
@@ -372,25 +382,37 @@ def send_email(recipient,subject,text_body):
     finally: server.quit()
 
 
+class _ResendThrottled(Exception): pass
+
+
 def issue_verification_code(user_id,language="en",force=False):
     now=stamp()
-    with db() as conn:
-        user=conn.execute("SELECT id,username,email,verified_at,active FROM users WHERE id=?",(user_id,)).fetchone()
-        latest=conn.execute("SELECT created_at FROM email_verification_codes WHERE user_id=? ORDER BY created_at DESC LIMIT 1",(user_id,)).fetchone()
-    if not user or not user["active"]: return {"error":"Account not found or inactive"},404
-    if user["verified_at"]: return {"error":"Account is already verified"},409
-    if not user["email"]: return {"error":"No email address is associated with this account"},400
-    if latest and not force and now-latest["created_at"]<60: return {"error":"Please wait before requesting another code","retry_after_seconds":round(60-(now-latest["created_at"]))},429
-    code=f"{secrets.randbelow(1_000_000):06d}"; code_id=str(uuid.uuid4())
-    with db() as conn:
-        conn.execute("UPDATE email_verification_codes SET used_at=? WHERE user_id=? AND used_at IS NULL",(now,user_id))
-        conn.execute("INSERT INTO email_verification_codes VALUES(?,?,?,?,?,?,?)",(code_id,user_id,password_hash(code),now+600,None,0,now))
+    code=f"{secrets.randbelow(1_000_000):06d}"; code_id=str(uuid.uuid4()); code_hash=password_hash(code)
+    try:
+        with db() as conn:
+            user=conn.execute("SELECT id,username,email,verified_at,active FROM users WHERE id=?",(user_id,)).fetchone()
+            if not user or not user["active"]: return {"error":"Account not found or inactive"},404
+            if user["verified_at"]: return {"error":"Account is already verified"},409
+            if not user["email"]: return {"error":"No email address is associated with this account"},400
+            # The invalidation write takes the transaction's write lock, so concurrent
+            # resends serialize here and the throttle check below cannot race; a throttled
+            # request raises so the rollback restores the codes it just invalidated.
+            conn.execute("UPDATE email_verification_codes SET used_at=? WHERE user_id=? AND used_at IS NULL",(now,user_id))
+            latest=conn.execute("SELECT created_at FROM email_verification_codes WHERE user_id=? ORDER BY created_at DESC LIMIT 1",(user_id,)).fetchone()
+            if latest and not force and now-latest["created_at"]<60: raise _ResendThrottled(latest["created_at"])
+            conn.execute("INSERT INTO email_verification_codes VALUES(?,?,?,?,?,?,?)",(code_id,user_id,code_hash,now+600,None,0,now))
+    except _ResendThrottled as throttled:
+        return {"error":"Please wait before requesting another code","retry_after_seconds":round(60-(now-throttled.args[0]))},429
     french=str(language).lower().startswith("fr")
     subject="Votre code de vérification Skein" if french else "Your Skein verification code"
     body=(f"Bonjour {user['username']},\n\nVotre code Skein est : {code}\n\nIl expire dans 10 minutes et ne peut être utilisé qu'une seule fois."
       if french else f"Hello {user['username']},\n\nYour Skein code is: {code}\n\nIt expires in 10 minutes and can be used only once.")
     try: send_email(user["email"],subject,body)
-    except Exception as exc: return {"error":"Verification email could not be sent","details":str(exc),"registration_pending":True},503
+    except Exception as exc:
+        # SMTP internals (relay host, auth failures) are email.manage material; an
+        # unverified session only learns that delivery failed.
+        logger_auth.warning(f"verification email delivery failed for user {user_id}: {exc}")
+        return {"error":"Verification email could not be sent","registration_pending":True},503
     return {"sent":True,"expires_in_seconds":600,"resend_after_seconds":60,"email_hint":user["email"][:2]+"***@"+user["email"].split("@")[-1]},200
 
 
@@ -402,9 +424,12 @@ def verify_user_code(user_id,code):
     if current["expires_at"]<now:
         with db() as conn: conn.execute("UPDATE email_verification_codes SET used_at=? WHERE id=?",(now,current["id"]))
         return {"error":"Verification code expired"},410
-    if current["attempts"]>=5: return {"error":"Too many invalid attempts; request a new code"},429
+    # Claim an attempt slot atomically before checking the code: a read-then-increment
+    # would let N concurrent requests each see attempts<5 and overshoot the cap together.
+    with db() as conn:
+        claimed=conn.execute("UPDATE email_verification_codes SET attempts=attempts+1 WHERE id=? AND attempts<5 AND used_at IS NULL",(current["id"],)).rowcount
+    if not claimed: return {"error":"Too many invalid attempts; request a new code"},429
     if not password_valid(str(code).strip(),current["code_hash"]):
-        with db() as conn: conn.execute("UPDATE email_verification_codes SET attempts=attempts+1 WHERE id=?",(current["id"],))
         return {"error":"Invalid verification code","attempts_remaining":max(0,4-current["attempts"])},400
     with db() as conn:
         changed=conn.execute("UPDATE email_verification_codes SET used_at=? WHERE id=? AND used_at IS NULL",(now,current["id"])).rowcount
@@ -2413,6 +2438,11 @@ def privacy_safe_server_stats(limit=200):
       "requests":requests}
 
 
+# Weight uploads stream to disk through their own handler; every other POST body is JSON
+# and small, so anything larger is either a mistake or a pre-auth memory-exhaustion attempt.
+MAX_JSON_BODY_BYTES=2*1024*1024
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self,*args,**kwargs): super().__init__(*args,directory=str(STATIC),**kwargs)
     def log_message(self,fmt,*args): pass
@@ -2522,8 +2552,6 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Content-Length",str(len(raw))); self.end_headers(); self.wfile.write(raw)
     def do_GET(self): self.dispatch("GET",self._handle_get)
     def _handle_get(self):
-        if self.path=="/api/health": return self.json({"status":"ok","active":len(ACTIVE),"queued":len(WORKFLOW_QUEUE),"parallel_workflow_limit":MAX_PARALLEL_WORKFLOWS,"database":str(DB_PATH),"execution_mode":EXECUTION_MODE,"active_models":ACTIVE_ENDPOINTS,"backends":{"worker":bool(os.getenv("SKEIN_WORKER_URL") or ACTIVE_ENDPOINTS.get("worker")),"reasoner":bool(os.getenv("SKEIN_REASONER_URL") or ACTIVE_ENDPOINTS.get("reasoner"))}})
-        if self.path=="/api/runtime-overview": return self.json(runtime_overview())
         if self.path=="/api/auth/me":
             user=self.current_user()
             if not user: return self.deny()
@@ -2548,6 +2576,10 @@ class Handler(SimpleHTTPRequestHandler):
                 aid=self.path.split("/")[3]
                 with db() as conn: row=conn.execute("SELECT workflow_id FROM artifacts WHERE id=?",(aid,)).fetchone()
                 if not row or not self.workflow_allowed(user,row["workflow_id"]): return self.deny(403,"Artifact access denied")
+        # Authenticated like every other /api route: these expose the database path, model
+        # endpoints, queue depths, and power draw — not anonymous-probe material.
+        if self.path=="/api/health": return self.json({"status":"ok","active":len(ACTIVE),"queued":len(WORKFLOW_QUEUE),"parallel_workflow_limit":MAX_PARALLEL_WORKFLOWS,"database":str(DB_PATH),"execution_mode":EXECUTION_MODE,"active_models":ACTIVE_ENDPOINTS,"backends":{"worker":bool(os.getenv("SKEIN_WORKER_URL") or ACTIVE_ENDPOINTS.get("worker")),"reasoner":bool(os.getenv("SKEIN_REASONER_URL") or ACTIVE_ENDPOINTS.get("reasoner"))}})
+        if self.path=="/api/runtime-overview": return self.json(runtime_overview())
         if self.path=="/api/users":
             with db() as conn: rows=conn.execute("SELECT id,username,email,verified_at,role,active,created_at FROM users ORDER BY username").fetchall()
             result=[]
@@ -2681,7 +2713,12 @@ class Handler(SimpleHTTPRequestHandler):
     def _handle_post(self):
         global EXECUTION_MODE
         if urlparse(self.path).path=="/api/models/upload": return self.upload_model_weight()
-        try: body=json.loads(self.rfile.read(int(self.headers.get("Content-Length",0))) or b"{}")
+        try: length=int(self.headers.get("Content-Length",0))
+        except ValueError: return self.json({"error":"Invalid Content-Length header"},400)
+        # Weight uploads stream above; every other POST is JSON and small. Without a cap an
+        # anonymous client could make this pre-auth read allocate gigabytes of RAM.
+        if length<0 or length>MAX_JSON_BODY_BYTES: return self.json({"error":"Request body exceeds the JSON size limit"},413)
+        try: body=json.loads(self.rfile.read(length) or b"{}")
         except json.JSONDecodeError: return self.json({"error":"JSON invalide"},400)
         if self.path=="/api/auth/register":
             remote=self.client_address[0]
@@ -2693,6 +2730,10 @@ class Handler(SimpleHTTPRequestHandler):
             uid=str(uuid.uuid4()); created=stamp()
             try:
                 with db() as conn:
+                    # The UNIQUE indexes are BINARY on legacy databases, but login matches
+                    # NOCASE: a case-variant duplicate would shadow one of the two accounts.
+                    if conn.execute("SELECT 1 FROM users WHERE username=? COLLATE NOCASE OR (email IS NOT NULL AND email=? COLLATE NOCASE)",(username,email)).fetchone():
+                        raise sqlite3.IntegrityError("case-insensitive duplicate")
                     conn.execute("INSERT INTO users(id,username,password_hash,role,active,created_at,email,verified_at) VALUES(?,?,?,?,?,?,?,NULL)",(uid,username,password_hash(password),"user",1,created,email))
                     conn.execute("INSERT INTO user_profiles VALUES(?,?)",(uid,"workflow_operator"))
             except sqlite3.IntegrityError:
@@ -2706,8 +2747,20 @@ class Handler(SimpleHTTPRequestHandler):
             return self.json(response,201)
         if self.path=="/api/auth/login":
             username=str(body.get("username","")).strip(); password=str(body.get("password",""))
+            throttle_subject=f"{self.client_address[0]}|{username.lower()}"; now=stamp()
+            with db() as conn:
+                failures=conn.execute("SELECT COUNT(*) FROM auth_rate_limits WHERE action='login-failure' AND subject=? AND created_at>?",(throttle_subject,now-300)).fetchone()[0]
+            if failures>=5:
+                logger_auth.warning(f"login throttled username={username!r} from {self.client_address[0]}")
+                return self.json({"error":"Too many failed login attempts; try again in a few minutes","retry_after_seconds":300},429)
             with db() as conn: row=conn.execute("SELECT * FROM users WHERE username=? COLLATE NOCASE",(username,)).fetchone()
-            if not row or not row["active"] or not password_valid(password,row["password_hash"]):
+            # The dummy comparison keeps the 401 at the same PBKDF2 cost whether or not the
+            # username exists; only failures consume throttle quota, so normal logins never lock out.
+            password_ok=password_valid(password,row["password_hash"] if row else DUMMY_PASSWORD_HASH)
+            if not row or not row["active"] or not password_ok:
+                with db() as conn:
+                    conn.execute("DELETE FROM auth_rate_limits WHERE created_at<?",(now-86400,))
+                    conn.execute("INSERT INTO auth_rate_limits(action,subject,created_at) VALUES('login-failure',?,?)",(throttle_subject,now))
                 logger_auth.warning(f"login failed username={username!r} from {self.client_address[0]}")
                 return self.deny(401,"Invalid credentials")
             token=secrets.token_urlsafe(32)
@@ -2781,13 +2834,19 @@ class Handler(SimpleHTTPRequestHandler):
             if set(profiles)!=valid: return self.json({"error":"Unknown RBAC profile"},400)
             role="admin" if "super_admin" in profiles else "user"
             if len(username)<3 or len(password)<8: return self.json({"error":"Username must be at least 3 characters and password at least 8"},400)
+            # Same normalization and format rule as public registration, or the email
+            # uniqueness invariant the verification flow relies on breaks by case variation.
+            email=str(body.get("email") or "").strip().lower() or None
+            if email and not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+",email): return self.json({"error":"Invalid email address"},400)
             try:
                 uid=str(uuid.uuid4())
                 with db() as conn:
-                    created=stamp(); conn.execute("INSERT INTO users(id,username,password_hash,role,active,created_at,email,verified_at) VALUES(?,?,?,?,?,?,?,?)",(uid,username,password_hash(password),role,1,created,body.get("email") or None,created))
+                    if conn.execute("SELECT 1 FROM users WHERE username=? COLLATE NOCASE OR (email IS NOT NULL AND ? IS NOT NULL AND email=? COLLATE NOCASE)",(username,email,email)).fetchone():
+                        raise sqlite3.IntegrityError("case-insensitive duplicate")
+                    created=stamp(); conn.execute("INSERT INTO users(id,username,password_hash,role,active,created_at,email,verified_at) VALUES(?,?,?,?,?,?,?,?)",(uid,username,password_hash(password),role,1,created,email,created))
                     for profile in profiles: conn.execute("INSERT INTO user_profiles VALUES(?,?)",(uid,profile))
                 assigned,_=access_for_user(uid); return self.json({"id":uid,"username":username,"role":role,"active":1,"profiles":assigned},201)
-            except sqlite3.IntegrityError: return self.json({"error":"This username already exists"},409)
+            except sqlite3.IntegrityError: return self.json({"error":"This username or email already exists"},409)
         if self.path.startswith("/api/users/") and self.path.endswith("/approve"):
             if "users.verify" not in user["permissions"]: return self.deny(403,"Permission required: users.verify")
             uid=self.path.split("/")[-2]; now=stamp()
@@ -2802,9 +2861,7 @@ class Handler(SimpleHTTPRequestHandler):
             current_profiles,_=access_for_user(uid); current_ids={p["id"] for p in current_profiles}; requested_profiles=body.get("profiles")
             resulting_profiles=set(requested_profiles) if isinstance(requested_profiles,list) else current_ids
             resulting_active=(1 if body["active"] else 0) if "active" in body else existing["active"]
-            if "super_admin" in current_ids and existing["active"] and ("super_admin" not in resulting_profiles or not resulting_active):
-                with db() as conn: remaining=conn.execute("SELECT COUNT(DISTINCT u.id) FROM users u JOIN user_profiles up ON up.user_id=u.id WHERE up.profile_id='super_admin' AND u.active=1 AND u.id<>?",(uid,)).fetchone()[0]
-                if remaining==0: return self.json({"error":"At least one active Super Administrator is required"},409)
+            guard_last_admin="super_admin" in current_ids and existing["active"] and ("super_admin" not in resulting_profiles or not resulting_active)
             if requested_profiles is not None:
                 if not resulting_profiles: return self.json({"error":"At least one RBAC profile is required"},400)
                 with db() as conn: valid={r[0] for r in conn.execute("SELECT id FROM rbac_profiles WHERE id IN (%s)"%",".join("?"*len(resulting_profiles)),tuple(resulting_profiles)).fetchall()}
@@ -2816,7 +2873,18 @@ class Handler(SimpleHTTPRequestHandler):
                 fields.append("password_hash=?"); values.append(password_hash(str(body["password"])))
             if not fields and requested_profiles is None: return self.json({"error":"No changes supplied"},400)
             with db() as conn:
+                if guard_last_admin:
+                    # The no-op write takes this transaction's write lock before counting, so
+                    # two concurrent demotions serialize instead of both seeing one survivor.
+                    conn.execute("UPDATE users SET active=active WHERE id=?",(uid,))
+                    remaining=conn.execute("SELECT COUNT(DISTINCT u.id) FROM users u JOIN user_profiles up ON up.user_id=u.id WHERE up.profile_id='super_admin' AND u.active=1 AND u.id<>?",(uid,)).fetchone()[0]
+                    if remaining==0: return self.json({"error":"At least one active Super Administrator is required"},409)
                 if fields: conn.execute(f"UPDATE users SET {','.join(fields)} WHERE id=?",(*values,uid))
+                if body.get("password"):
+                    # A password reset is usually meant to evict whoever holds the old
+                    # credentials: stolen cookies must die with the password. The caller's
+                    # own session survives so self-service resets do not log the admin out.
+                    conn.execute("DELETE FROM sessions WHERE user_id=? AND token<>?",(uid,self.cookie("skein_session") or ""))
                 if requested_profiles is not None:
                     conn.execute("DELETE FROM user_profiles WHERE user_id=?",(uid,))
                     for profile in resulting_profiles: conn.execute("INSERT INTO user_profiles VALUES(?,?)",(uid,profile))

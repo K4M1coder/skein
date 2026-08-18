@@ -275,6 +275,63 @@ class AuthTest(unittest.TestCase):
             self.request(admin, f"/api/users/{admin_id}", {"profiles": ["user_manager"]})
         self.assertEqual(last_super_admin.exception.code, 409)
 
+    def test_user_creation_rejects_case_variant_duplicates(self):
+        """Login matches usernames case-insensitively, so a case-variant duplicate would
+        permanently shadow one of the two accounts behind the same login name."""
+        admin = self.client()
+        self.request(admin, "/api/auth/login", {"username": "admin", "password": "admin-test-password"})
+        self.request(admin, "/api/users", {"username": "case-owner", "password": "case-password", "profiles": ["workflow_operator"]})
+        with self.assertRaises(HTTPError) as duplicate:
+            self.request(admin, "/api/users", {"username": "Case-Owner", "password": "case-password-2", "profiles": ["workflow_operator"]})
+        self.assertEqual(duplicate.exception.code, 409)
+        variant = self.client()
+        status, session = self.request(variant, "/api/auth/login", {"username": "CASE-OWNER", "password": "case-password"})
+        self.assertEqual(status, 200)
+        self.assertEqual(session["user"]["username"], "case-owner")
+
+    def test_login_failures_are_throttled_per_account(self):
+        admin = self.client()
+        self.request(admin, "/api/auth/login", {"username": "admin", "password": "admin-test-password"})
+        self.request(admin, "/api/users", {"username": "throttle-target", "password": "throttle-password", "profiles": ["workflow_operator"]})
+        attacker = self.client()
+        for _ in range(5):
+            with self.assertRaises(HTTPError) as failed:
+                self.request(attacker, "/api/auth/login", {"username": "throttle-target", "password": "wrong-password"})
+            self.assertEqual(failed.exception.code, 401)
+        with self.assertRaises(HTTPError) as throttled:
+            self.request(attacker, "/api/auth/login", {"username": "throttle-target", "password": "throttle-password"})
+        self.assertEqual(throttled.exception.code, 429)
+        # Only failures consume quota: other accounts from the same address stay unaffected.
+        fresh = self.client()
+        status, _ = self.request(fresh, "/api/auth/login", {"username": "admin", "password": "admin-test-password"})
+        self.assertEqual(status, 200)
+
+    def test_password_reset_evicts_existing_sessions(self):
+        admin = self.client()
+        self.request(admin, "/api/auth/login", {"username": "admin", "password": "admin-test-password"})
+        _, created = self.request(admin, "/api/users", {"username": "reset-target", "password": "reset-password", "profiles": ["workflow_operator"]})
+        victim = self.client()
+        self.request(victim, "/api/auth/login", {"username": "reset-target", "password": "reset-password"})
+        status, _ = self.request(victim, "/api/auth/me")
+        self.assertEqual(status, 200)
+        self.request(admin, f"/api/users/{created['id']}", {"password": "reset-password-2"})
+        with self.assertRaises(HTTPError) as evicted:
+            self.request(victim, "/api/auth/me")
+        self.assertEqual(evicted.exception.code, 401)
+        status, _ = self.request(admin, "/api/auth/me")
+        self.assertEqual(status, 200)
+
+    def test_health_and_runtime_overview_require_a_session(self):
+        for path in ("/api/health", "/api/runtime-overview"):
+            with self.assertRaises(HTTPError) as denied:
+                self.request(self.client(), path)
+            self.assertEqual(denied.exception.code, 401)
+        admin = self.client()
+        self.request(admin, "/api/auth/login", {"username": "admin", "password": "admin-test-password"})
+        status, health = self.request(admin, "/api/health")
+        self.assertEqual(status, 200)
+        self.assertEqual(health["status"], "ok")
+
     def test_registration_email_code_lifecycle_and_manual_approval(self):
         delivered = []
         original_sender = app.send_email
