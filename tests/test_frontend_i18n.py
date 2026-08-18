@@ -175,6 +175,17 @@ class FrontendLocalizationTest(unittest.TestCase):
         self.assertNotIn('id="rbac-users"></div><div id="rbac-settings">', auth)
         self.assertIn(".sub-navigation", shell)
 
+    def test_admin_panels_escape_user_controlled_html(self):
+        """Usernames and emails are registered free text rendered into the access-control
+        panel: unescaped interpolation is stored XSS running in every user manager's session."""
+        auth = (ROOT / "static" / "auth.js").read_text(encoding="utf-8")
+        self.assertIn("const esc", auth)
+        self.assertIn("${esc(user.username)}", auth)
+        self.assertIn('${esc(user.email)||t("noEmail")}', auth)
+        self.assertIn("${esc(session.user.username)}", auth)
+        self.assertIn("${esc(user.permissions", auth)
+        self.assertNotIn("<b>${user.username}</b>", auth)
+
     def test_workflow_editor_has_live_graph_preview(self):
         markup = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
         manager = (ROOT / "static" / "workflow-templates.js").read_text(encoding="utf-8")
