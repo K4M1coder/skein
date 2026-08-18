@@ -186,6 +186,15 @@ class FrontendLocalizationTest(unittest.TestCase):
         self.assertIn("${esc(user.permissions", auth)
         self.assertNotIn("<b>${user.username}</b>", auth)
 
+    def test_every_local_asset_is_cache_busted(self):
+        """index.html is served without a version, so browsers keep a cached copy of any
+        asset whose URL never changes. A stylesheet or script shipped without ?v= silently
+        keeps serving the old file after an edit — auth.css did exactly that."""
+        markup = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        unversioned = [url for url in re.findall(r'(?:src|href)="(/[^"]+\.(?:css|js))"', markup)
+                       if "?v=" not in url]
+        self.assertEqual(unversioned, [], f"local assets served without a cache-busting version: {unversioned}")
+
     def test_browser_history_buttons_drive_the_active_view(self):
         """activate() mirrors the view into location.hash, so every navigation creates a
         browser history entry. Without a hashchange listener, Back and Forward only rewrote
