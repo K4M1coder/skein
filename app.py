@@ -530,9 +530,12 @@ def parse_gguf_metadata(path):
     except OSError: return None
     if buf[:4]!=b"GGUF": return None
     offset=4
-    (_version,)=struct.unpack_from('<I',buf,offset); offset+=4
-    (tensor_count,)=struct.unpack_from('<Q',buf,offset); offset+=8
-    (kv_count,)=struct.unpack_from('<Q',buf,offset); offset+=8
+    try:
+        (_version,)=struct.unpack_from('<I',buf,offset); offset+=4
+        (tensor_count,)=struct.unpack_from('<Q',buf,offset); offset+=8
+        (kv_count,)=struct.unpack_from('<Q',buf,offset); offset+=8
+    except struct.error:
+        return None  # valid magic but the fixed header itself is truncated
     metadata={}
     try:
         for _ in range(kv_count):
@@ -540,8 +543,8 @@ def parse_gguf_metadata(path):
             (value_type,)=struct.unpack_from('<I',buf,offset); offset+=4
             value,offset=_read_gguf_value(buf,offset,value_type)
             if not key.startswith("tokenizer."): metadata[key]=value  # skip huge vocab arrays
-    except (EOFError,struct.error,IndexError,UnicodeError):
-        pass  # keep whatever scalar metadata was read before the truncation
+    except (EOFError,struct.error,IndexError,UnicodeError,ValueError):
+        pass  # truncation or an unknown value type: keep whatever metadata was already read
     architecture=metadata.get("general.architecture")
     total_params=0; expert_params=0
     try:

@@ -371,6 +371,37 @@ class ModelManagerTest(unittest.TestCase):
         self.assertEqual(row["architecture"], "synthtrunc")
         self.assertIsNone(row["total_params"])
 
+    def test_a_truncated_fixed_header_does_not_crash_the_model_list(self):
+        """A file that carries the GGUF magic but is cut inside the fixed version/count
+        fields (an interrupted copy or download) must register as metadata-less, not raise
+        struct.error out of parse_gguf_metadata and turn every /api/models poll into a 500."""
+        path = MODEL_ROOT / "Synth-Header-Cut-Q4_0.gguf"
+        path.write_bytes(b"GGUF\x03\x00")
+        model = self.register(path)
+        status, models = self.call("/api/models")
+        self.assertEqual(status, 200)
+        row = next(m for m in models if m["id"] == model["id"])
+        self.assertIsNone(row["architecture"])
+        self.assertIsNone(row["total_params"])
+
+    def test_an_unknown_gguf_value_type_does_not_crash_the_model_list(self):
+        """A kv entry with a value type this parser does not know (corrupt file, or a newer
+        GGUF revision) must degrade to partial metadata like a truncated section does — not
+        let ValueError escape and take /api/models down."""
+        path = MODEL_ROOT / "Synth-Unknown-Type-Q4_0.gguf"
+        buf = bytearray(b"GGUF")
+        buf += struct.pack("<I", 3)  # version
+        buf += struct.pack("<Q", 0)  # tensor_count
+        buf += struct.pack("<Q", 1)  # kv_count
+        buf += _gguf_string("general.architecture")
+        buf += struct.pack("<I", 13)  # value type unknown to GGUF_SCALAR_FORMATS
+        path.write_bytes(bytes(buf))
+        model = self.register(path)
+        status, models = self.call("/api/models")
+        self.assertEqual(status, 200)
+        row = next(m for m in models if m["id"] == model["id"])
+        self.assertIsNone(row["architecture"])
+
     def test_moe_model_reports_active_and_total_params_separately(self):
         path = MODEL_ROOT / "Synth-MoE-Q4_0.gguf"
         build_gguf(path, "synthmoe", scalars={
