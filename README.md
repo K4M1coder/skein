@@ -97,6 +97,8 @@ $env:SKEIN_ADMIN_PASSWORD = "replace-with-a-long-password"
 
 If no environment variables are supplied, the development fallback is `admin` / `admin`. Sign in and replace this password immediately from Access Control. Passwords use PBKDF2-SHA256 with per-user salts; session cookies are HttpOnly and SameSite Strict.
 
+Sign-in is protected as well: five failed attempts for the same account from the same address within five minutes return `429` until the window passes, and a failed attempt costs the same PBKDF2 work whether or not the account exists, so response timing does not reveal which usernames are real. Usernames are unique case-insensitively, matching how sign-in resolves them. Resetting a password from Access Control invalidates that user's other sessions, so a stolen cookie dies with the password. When a session ends while the interface is open, the sign-in overlay reappears over the workspace instead of an error panel, and background polling stops until you sign in again.
+
 ## Start and stop
 
 Start the supervised frontend, backend, and model-process stack:

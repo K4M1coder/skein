@@ -7,9 +7,14 @@
   const gb = bytes => (bytes || bytes === 0 ? `${(bytes / 1073741824).toFixed(2)} GB` : "—");
 
   const api = async (path, options) => {
+    if (window.skeinSessionExpired) throw Object.assign(Error("session expired"), { silent: true });
     const response = await fetch(path, options);
     const data = await response.json().catch(() => ({}));
-    if (!response.ok) { const error = Error(data.error || response.status); error.data = data; throw error; }
+    if (!response.ok) {
+      const error = Error(data.error || response.status); error.data = data; error.status = response.status;
+      if (response.status === 401) { window.skeinAuth?.requireSignIn(); error.silent = true; }
+      throw error;
+    }
     return data;
   };
   const jsonPost = (path, body) => api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });

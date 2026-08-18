@@ -194,6 +194,36 @@ class FrontendLocalizationTest(unittest.TestCase):
         self.assertIn('addEventListener("hashchange"', navigation)
         self.assertIn("requested !== activeView", navigation)
 
+    def test_the_language_selector_is_scoped_not_duplicated_by_id(self):
+        """The sign-in overlay can now appear while the signed-in user bar is on the page,
+        and both carry a language selector: sharing one id would wire only the first."""
+        auth = (ROOT / "static" / "auth.js").read_text(encoding="utf-8")
+        self.assertIn('select class="language-choice"', auth)
+        self.assertNotIn('select id="language-choice"', auth)
+        self.assertIn("const wireLanguage = root =>", auth)
+        self.assertNotIn('document.querySelector("#language-choice")', auth)
+
+    def test_a_401_reopens_the_sign_in_overlay_over_an_opaque_backdrop(self):
+        """A session that ends mid-use used to surface as a generic incident panel over a
+        stale page. Every fetch wrapper must route 401 to the sign-in overlay instead, and
+        the overlay must hide the page behind it rather than dim it."""
+        auth = (ROOT / "static" / "auth.js").read_text(encoding="utf-8")
+        styles = (ROOT / "static" / "auth.css").read_text(encoding="utf-8")
+        self.assertIn("window.skeinAuth = { requireSignIn }", auth)
+        self.assertIn('showLogin(t("sessionExpired"))', auth)
+        self.assertIn('document.querySelector("#viewer-dialog")?.close()', auth)
+        self.assertIn(".auth-overlay{position:fixed;inset:0;z-index:10000;background:var(--bg)", styles)
+        self.assertIn(".auth-locked{overflow:hidden}", styles)
+        for name in ("app.js", "workflow-templates.js", "model-manager.js"):
+            with self.subTest(script=name):
+                source = (ROOT / "static" / name).read_text(encoding="utf-8")
+                self.assertIn("skeinAuth?.requireSignIn()", source)
+        # auth.js owns requireSignIn, so it calls it directly — but only outside /api/auth,
+        # where a 401 is the expected answer the sign-in form renders inline.
+        self.assertIn('response.status === 401 && !path.startsWith("/api/auth/")', auth)
+        self.assertIn("requireSignIn();", auth)
+        self.assertIn("if(error?.silent)return", (ROOT / "static" / "app.js").read_text(encoding="utf-8"))
+
     def test_workflow_editor_has_live_graph_preview(self):
         markup = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
         manager = (ROOT / "static" / "workflow-templates.js").read_text(encoding="utf-8")
